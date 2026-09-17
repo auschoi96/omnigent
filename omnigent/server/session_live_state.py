@@ -47,6 +47,8 @@ from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from omnigent.stores import ConversationStore
     from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -64,6 +66,12 @@ _store: ConversationStore | None = None
 # alongside ``_store`` by :func:`configure`; ``None`` disables the hook (the
 # runner process and unit tests that never configure it are unaffected).
 _scheduled_task_store: ScheduledTaskStore | None = None
+# Called (on the write worker, inside the run's ``workspace_scope``) the instant
+# a scheduled-task run is transitioned to terminal, so a managed-sandbox
+# automation can tear its sandbox down immediately. Wired by :func:`configure`;
+# ``None`` disables it. Kept a plain callback so this module stays ignorant of
+# hosts/sandboxes — app.py owns the teardown wiring.
+_on_scheduled_run_terminal: Callable[[str], None] | None = None
 # Single worker => writes apply in submission order (see module docstring).
 _executor: ThreadPoolExecutor | None = None
 # Last status seen per session, for dedupe — the value whose write was
@@ -93,6 +101,19 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+
+
+def set_scheduled_run_terminal_hook(hook: Callable[[str], None] | None) -> None:
+    """Wire the callback fired when a scheduled-task run reaches terminal.
+
+    Mirrors ``pending_elicitations.set_count_persist_hook``: set at server
+    startup (where the running loop is available), separate from
+    :func:`configure` so it can capture that loop. The hook runs on the write
+    worker inside the run's ``workspace_scope`` and is used to shut a
+    managed-sandbox automation's sandbox down immediately. ``None`` clears it.
+    """
+    global _on_scheduled_run_terminal
+    _on_scheduled_run_terminal = hook
 
 
 def conversation_store() -> ConversationStore | None:
@@ -244,6 +265,20 @@ def persist_scheduled_run_completion(
             error=error,
             error_code=error_code,
         )
+        # This call transitioned a still-running scheduled run, so it fires the
+        # terminal hook exactly once (a later edge finds no running run). Used to
+        # tear down a managed-sandbox automation's sandbox immediately. Runs
+        # inside the run's ``workspace_scope`` (contextvars copy); best-effort.
+        callback = _on_scheduled_run_terminal
+        if callback is not None:
+            try:
+                callback(conversation_id)
+            except Exception:  # noqa: BLE001
+                _logger.warning(
+                    "scheduled_run_terminal hook failed for %s",
+                    conversation_id,
+                    exc_info=True,
+                )
 
     submit("scheduled_run_completion", _transition)
 

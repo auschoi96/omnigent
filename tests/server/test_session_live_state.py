@@ -366,6 +366,36 @@ def test_scheduled_run_completion_runs_in_callers_workspace_scope() -> None:
     assert sched.lookup_workspaces == [4242]
 
 
+def test_scheduled_run_completion_fires_terminal_hook_once() -> None:
+    """Transitioning a running run fires the terminal hook with the conversation id."""
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"})
+    seen: list[str] = []
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    session_live_state.set_scheduled_run_terminal_hook(seen.append)
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(seen))
+    finally:
+        session_live_state.set_scheduled_run_terminal_hook(None)
+        session_live_state.configure(None)
+    assert seen == ["conv_1"]
+
+
+def test_scheduled_run_completion_terminal_hook_skipped_when_already_terminal() -> None:
+    """No running run (already terminal) → the terminal hook does not fire."""
+    sched = _FakeScheduledTaskStore({})  # conv_x has no running run
+    seen: list[str] = []
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    session_live_state.set_scheduled_run_terminal_hook(seen.append)
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_x", "succeeded")
+        _wait_until(lambda: sched.lookup_calls == ["conv_x"])
+    finally:
+        session_live_state.set_scheduled_run_terminal_hook(None)
+        session_live_state.configure(None)
+    assert seen == []
+
+
 @pytest.mark.asyncio
 async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
     """A stale persisted pending count can't light a phantom inbox badge.

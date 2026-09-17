@@ -1473,7 +1473,12 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+            from omnigent.server.scheduled.fire import (
+                FireDeps,
+                build_on_fire,
+                build_run_now,
+                build_sandbox_teardown_hook,
+            )
 
             fire_deps = FireDeps(
                 scheduled_task_store=scheduled_task_store,
@@ -1488,7 +1493,25 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                # Managed-sandbox execution target: provision a fresh sandbox per
+                # fire. ``managed_launches`` is created during app construction
+                # (before this lifespan runs), so it is already on state here.
+                sandbox_config=sandbox_config,
+                managed_launches=app_inst.state.managed_launches,
             )
+            # "Shut down immediately": when a managed-sandbox automation's run
+            # ends, tear its sandbox down rather than letting it idle out. The
+            # hook needs the running loop (to schedule the async teardown off the
+            # live-state write worker), so it is wired here, not at construction.
+            if sandbox_config is not None and sandbox_config.managed_launch_supported:
+                session_live_state.set_scheduled_run_terminal_hook(
+                    build_sandbox_teardown_hook(
+                        asyncio.get_running_loop(),
+                        conversation_store,
+                        host_store,
+                        sandbox_config,
+                    )
+                )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
             # preflight / in-flight guard) as the scheduler; it only differs in

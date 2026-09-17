@@ -28,6 +28,7 @@ import { WorkspacePicker } from "@/shell/WorkspacePicker";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
 import { sortAgentsForDisplay } from "@/lib/agentGrouping";
@@ -43,7 +44,11 @@ import {
   validateSchedule,
   type ScheduleModel,
 } from "@/lib/scheduleBuilder";
-import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
+import {
+  ScheduledTaskApiError,
+  type ScheduledTask,
+  type ScheduledTaskExecutionTarget,
+} from "@/lib/scheduledTasksApi";
 import { localTimezone } from "@/lib/timezones";
 
 // Agents hidden from the scheduled-task picker (mirrors NewChatDialog's set):
@@ -67,6 +72,11 @@ export function CreateScheduledTaskDialog({
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts } = useHosts({ enabled: open });
+  const info = useServerInfo();
+  // Gates the "new sandbox each run" option: only servers that can actually
+  // serve a managed launch advertise it (same flag New Chat's sandbox option
+  // gates on). "loading" → treat as disabled until /v1/info resolves.
+  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
@@ -192,6 +202,10 @@ export function CreateScheduledTaskDialog({
   // Optional pinned host/workspace. "" = unset (server resolves at fire time).
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
+  // When on, each fire runs in a FRESH managed sandbox (execution_target =
+  // "managed_sandbox") instead of a connected host; hides the host/workspace
+  // pickers. Only offered when the server advertises managed sandboxes.
+  const [sandboxMode, setSandboxMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
 
@@ -217,6 +231,7 @@ export function CreateScheduledTaskDialog({
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
         setWorkspace(editingTask.workspace ?? "");
+        setSandboxMode(editingTask.executionTarget === "managed_sandbox");
       } else {
         setName(initialName ?? "");
         setPrompt(initialPrompt ?? "");
@@ -228,6 +243,7 @@ export function CreateScheduledTaskDialog({
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
+        setSandboxMode(false);
       }
       setError(null);
     }
@@ -250,8 +266,9 @@ export function CreateScheduledTaskDialog({
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
 
   // A workspace is only valid with a host — mirror the server's pairing rule so
-  // the user gets inline feedback instead of a 400.
-  const workspaceWithoutHost = workspace.trim() !== "" && hostId === "";
+  // the user gets inline feedback instead of a 400. In sandbox mode there is no
+  // host/workspace pairing at all, so the rule doesn't apply.
+  const workspaceWithoutHost = !sandboxMode && workspace.trim() !== "" && hostId === "";
   // Block submit on an invalid schedule (bad interval, empty multi-select) so
   // the form never posts an RRULE the server's validate_rrule would 400.
   const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
@@ -274,6 +291,7 @@ export function CreateScheduledTaskDialog({
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
+    setSandboxMode(false);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -286,13 +304,21 @@ export function CreateScheduledTaskDialog({
   async function handleSubmit() {
     setError(null);
     try {
+      // A sandbox task runs hostless (fresh sandbox per fire), so host/workspace
+      // are omitted; the target switches back to connected_host when unset.
+      const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
+        ? "managed_sandbox"
+        : "connected_host";
       const input = {
         name: name.trim(),
         prompt: prompt.trim(),
         rrule: buildRRule(schedule),
         timezone: editingTask?.timezone ?? localTimezone(),
-        ...(hostId !== "" ? { hostId } : {}),
-        ...(hostId !== "" && workspace.trim() !== "" ? { workspace: workspace.trim() } : {}),
+        executionTarget,
+        ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
+        ...(!sandboxMode && hostId !== "" && workspace.trim() !== ""
+          ? { workspace: workspace.trim() }
+          : {}),
       };
       if (editingTask) {
         // Thread model/effort ONLY when the agent supports them. Each control's
@@ -362,8 +388,8 @@ export function CreateScheduledTaskDialog({
           <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
           <DialogDescription>
             {isEdit
-              ? "Update this recurring agent session. It fires on a connected host."
-              : "Runs an agent session on a recurring schedule. Fires on a connected host."}
+              ? "Update this recurring agent session."
+              : "Runs an agent session on a recurring schedule."}
           </DialogDescription>
         </DialogHeader>
 
@@ -499,42 +525,74 @@ export function CreateScheduledTaskDialog({
               intentionally has no visible control. It is still sent in the create
               payload so the schedule evaluates in the user's local zone. */}
 
+          {/* Run in a fresh managed sandbox each fire (execution_target =
+              managed_sandbox) instead of a connected host. Only offered when the
+              server advertises managed sandboxes. */}
+          {managedSandboxesEnabled && (
+            <div className="flex flex-col gap-1.5" data-testid="task-sandbox-field">
+              <label className="flex items-center gap-2 text-ui">
+                <input
+                  type="checkbox"
+                  checked={sandboxMode}
+                  data-testid="task-sandbox-toggle"
+                  onChange={(e) => {
+                    const on = e.target.checked;
+                    setSandboxMode(on);
+                    // A sandbox run is hostless; drop any pinned host/workspace so
+                    // the switch can't carry a stale pair the server would reject.
+                    if (on) {
+                      setHostId("");
+                      setWorkspace("");
+                    }
+                  }}
+                />
+                <span>Run in a new sandbox each time</span>
+              </label>
+              <p className="text-sm text-muted-foreground">
+                Provisions a fresh sandbox for each run and shuts it down when the run finishes. No
+                connected host needed.
+              </p>
+            </div>
+          )}
+
           {/* Optional host + workspace pin. Left unset, the server resolves the
               owner's connected host and its home directory at fire time. */}
-          <div className="flex flex-col gap-1.5" data-testid="task-host-field">
-            <Label htmlFor="task-host">Host (optional)</Label>
-            <Select
-              value={hostId === "" ? UNSET_HOST : hostId}
-              componentId="tasks.scheduled.host"
-              onValueChange={(v) => {
-                if (preservePinnedHost && v === UNSET_HOST) return;
-                const next = v === UNSET_HOST ? "" : v;
-                setHostId(next);
-                // Clearing the host invalidates any pinned workspace.
-                if (next === "") setWorkspace("");
-              }}
-              onOpenChange={handleSelectOpenChange}
-            >
-              <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value={UNSET_HOST} disabled={preservePinnedHost}>
-                  Resolve at fire time
-                </SelectItem>
-                {hostOptions.map((host) => (
-                  <SelectItem key={host.host_id} value={host.host_id}>
-                    {host.name} {host.status === "offline" ? "(offline)" : ""}
+          {!sandboxMode && (
+            <div className="flex flex-col gap-1.5" data-testid="task-host-field">
+              <Label htmlFor="task-host">Host (optional)</Label>
+              <Select
+                value={hostId === "" ? UNSET_HOST : hostId}
+                componentId="tasks.scheduled.host"
+                onValueChange={(v) => {
+                  if (preservePinnedHost && v === UNSET_HOST) return;
+                  const next = v === UNSET_HOST ? "" : v;
+                  setHostId(next);
+                  // Clearing the host invalidates any pinned workspace.
+                  if (next === "") setWorkspace("");
+                }}
+                onOpenChange={handleSelectOpenChange}
+              >
+                <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value={UNSET_HOST} disabled={preservePinnedHost}>
+                    Resolve at fire time
                   </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-sm text-muted-foreground">
-              Leave unset to run on your connected host when the task fires.
-            </p>
-          </div>
+                  {hostOptions.map((host) => (
+                    <SelectItem key={host.host_id} value={host.host_id}>
+                      {host.name} {host.status === "offline" ? "(offline)" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                Leave unset to run on your connected host when the task fires.
+              </p>
+            </div>
+          )}
 
-          {hostId !== "" && (
+          {!sandboxMode && hostId !== "" && (
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
               <p className="text-sm text-muted-foreground">

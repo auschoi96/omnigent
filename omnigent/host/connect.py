@@ -54,6 +54,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
+    HOST_IDENTITY_SUBPROTOCOL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -67,6 +68,7 @@ from omnigent.host.frames import (
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostIdentityFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
@@ -98,6 +100,7 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
+    host_subprotocol_has_async_capabilities,
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
@@ -1048,13 +1051,13 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
-        # This host's owning user, resolved once after the first accepted tunnel
-        # upgrade (GET /v1/me). Injected into every runner it spawns and published
-        # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
-        # resolved, or on a single-user server / managed host where it is absent.
+        # This host's owning user, supplied by a negotiated server over the
+        # authenticated tunnel. Injected into every runner and published to
+        # OMNIGENT_USER_ID so host/runner debug-log rows carry it.
         self._owner_user_id: str | None = None
-        # Attribution is advisory and must not delay registration. The task is
-        # daemon-owned so a tunnel flap neither cancels nor duplicates the call.
+        # Older servers cannot send the identity frame. Their best-effort
+        # /v1/me fallback remains detached from registration and is shared
+        # across reconnects.
         self._owner_user_id_task: asyncio.Task[None] | None = None
         # The fronting Databricks workspace id for this server, resolved once from
         # the server URL (its ?o= selector or the stored login record) — the same
@@ -4007,7 +4010,10 @@ class HostProcess:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
-                subprotocols=[Subprotocol(HOST_ASYNC_CAPABILITIES_SUBPROTOCOL)],
+                subprotocols=[
+                    Subprotocol(HOST_IDENTITY_SUBPROTOCOL),
+                    Subprotocol(HOST_ASYNC_CAPABILITIES_SUBPROTOCOL),
+                ],
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -4046,7 +4052,8 @@ class HostProcess:
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
-            self._start_owner_user_id_resolution()
+            if getattr(ws, "subprotocol", None) != HOST_IDENTITY_SUBPROTOCOL:
+                self._start_owner_user_id_resolution()
             await self._serve_frames(ws)
         except BaseException as exc:
             disconnect_error = exc
@@ -4189,8 +4196,8 @@ class HostProcess:
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
         """Register with negotiated readiness semantics, then service the connection."""
         self._start_capability_discovery()
-        async_capabilities = (
-            getattr(ws, "subprotocol", None) == HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
+        async_capabilities = host_subprotocol_has_async_capabilities(
+            getattr(ws, "subprotocol", None)
         )
         capabilities_pending = async_capabilities and not self._capabilities_initialized
         if not capabilities_pending and self._capability_init_task is not None:
@@ -4271,7 +4278,8 @@ class HostProcess:
                     # loop exits or reconnects, so handle them inline. Ordinary
                     # request frames run concurrently below; exceptions raised
                     # on those detached tasks are intentionally contained.
-                    self._raise_connection_error_from_raw(raw)
+                    if self._handle_connection_control_frame(raw):
+                        continue
                     # Each request frame is handled on its own task so a slow
                     # handler (a model-options CLI exec, a long git walk) can't
                     # head-of-line block the frames behind it — measured
@@ -4377,14 +4385,24 @@ class HostProcess:
             raise HostRetryableConnectionError(message)
         raise HostConnectError(message)
 
-    def _raise_connection_error_from_raw(self, raw: str) -> None:
-        """Handle connection-level frames before request-task dispatch."""
+    def _handle_connection_control_frame(self, raw: str) -> bool:
+        """Handle ordered connection metadata before request-task dispatch."""
         try:
             frame = decode_host_frame(raw)
         except ValueError:
-            return
+            return False
         if isinstance(frame, HostConnectionErrorFrame):
             self._raise_connection_error(frame)
+        if isinstance(frame, HostIdentityFrame):
+            if self._owner_user_id_task is not None and not self._owner_user_id_task.done():
+                self._owner_user_id_task.cancel()
+            self._owner_user_id = frame.user_id
+            if frame.user_id:
+                os.environ[USER_ID_ENV_VAR] = frame.user_id
+            else:
+                os.environ.pop(USER_ID_ENV_VAR, None)
+            return True
+        return False
 
     def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
         """Handle one inbound frame on its own task, off the receive loop.

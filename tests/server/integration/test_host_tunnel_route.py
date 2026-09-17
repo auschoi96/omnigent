@@ -14,9 +14,11 @@ from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
+    HOST_IDENTITY_SUBPROTOCOL,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostIdentityFrame,
     HostLaunchRunnerResultFrame,
     decode_host_frame,
     encode_host_frame,
@@ -78,8 +80,15 @@ async def _connect_route(
     await communicator.send_input({"type": "websocket.connect"})
     accepted = await communicator.receive_output(timeout=1.0)
     assert accepted["type"] == "websocket.accept", f"Expected {path} to accept; got {accepted!r}"
-    if subprotocols and HOST_ASYNC_CAPABILITIES_SUBPROTOCOL in subprotocols:
-        assert accepted.get("subprotocol") == HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
+    if subprotocols:
+        expected = (
+            HOST_IDENTITY_SUBPROTOCOL
+            if HOST_IDENTITY_SUBPROTOCOL in subprotocols
+            else HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
+            if HOST_ASYNC_CAPABILITIES_SUBPROTOCOL in subprotocols
+            else None
+        )
+        assert accepted.get("subprotocol") == expected
     return communicator
 
 
@@ -437,7 +446,7 @@ async def test_host_tunnel_negotiates_and_completes_async_capabilities(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:
     """The server opts in explicitly and unblocks capability waiters on update."""
-    app, registry, store = host_app
+    app, registry, _store = host_app
     comm = await _connect_route(
         app,
         _TUNNEL_PATH,
@@ -462,7 +471,7 @@ async def test_host_tunnel_negotiates_and_completes_async_capabilities(
     assert conn is not None
     assert conn.hello.capabilities_pending
     assert not conn.capabilities_ready.is_set()
-    assert store.get_host(_HOST_ID).configured_harnesses is None  # type: ignore[union-attr]
+    assert registry.capabilities_pending(_HOST_ID) is True
 
     await comm.send_input(
         {
@@ -470,6 +479,7 @@ async def test_host_tunnel_negotiates_and_completes_async_capabilities(
             "text": encode_host_frame(
                 HostHarnessReadinessFrame(
                     configured_harnesses={"claude-native": True},
+                    gateway_inference={"claude-native": True},
                     capabilities_pending=False,
                 )
             ),
@@ -477,7 +487,25 @@ async def test_host_tunnel_negotiates_and_completes_async_capabilities(
     )
     await asyncio.wait_for(conn.capabilities_ready.wait(), timeout=1.0)
     assert not conn.hello.capabilities_pending
-    assert store.get_host(_HOST_ID).configured_harnesses == {"claude-native": True}  # type: ignore[union-attr]
+    assert registry.capabilities_pending(_HOST_ID) is False
+    assert registry.gateway_inference(_HOST_ID) == {"claude-native": True}
+
+
+async def test_negotiated_identity_preserves_anonymous_single_user_mode(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """An auth-disabled server does not invent a user attribution value."""
+    app, registry, _store = host_app
+    comm = await _connect_route(
+        app,
+        _TUNNEL_PATH,
+        subprotocols=[HOST_IDENTITY_SUBPROTOCOL, HOST_ASYNC_CAPABILITIES_SUBPROTOCOL],
+    )
+    await _send_hello_and_wait(comm, registry)
+
+    identity_message = await comm.receive_output(timeout=1.0)
+    assert identity_message["type"] == "websocket.send"
+    assert decode_host_frame(identity_message["text"]) == HostIdentityFrame(user_id=None)
 
 
 async def test_host_tunnel_sets_offline_on_disconnect(
@@ -664,6 +692,23 @@ def _owned_app(
         prefix="/v1",
     )
     return app, registry, store
+
+
+async def test_negotiated_identity_uses_the_authenticated_tunnel_owner(db_uri: str) -> None:
+    """Multi-user hosts receive attribution on the existing authenticated tunnel."""
+    app, registry, _store = _owned_app(db_uri, authed_user="alice@example.com")
+    comm = await _connect_route(
+        app,
+        _TUNNEL_PATH,
+        subprotocols=[HOST_IDENTITY_SUBPROTOCOL, HOST_ASYNC_CAPABILITIES_SUBPROTOCOL],
+    )
+    await _send_hello_and_wait(comm, registry)
+
+    identity_message = await comm.receive_output(timeout=1.0)
+    assert identity_message["type"] == "websocket.send"
+    assert decode_host_frame(identity_message["text"]) == HostIdentityFrame(
+        user_id="alice@example.com"
+    )
 
 
 async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:

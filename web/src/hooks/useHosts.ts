@@ -20,8 +20,8 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
-  /** Startup readiness is still being discovered; explicit launches may wait. */
-  capabilities_pending?: boolean;
+  /** Startup readiness state; null/undefined means a legacy host. */
+  capabilities_pending?: boolean | null;
   /**
    * Whether each harness family's launch on this host resolves an
    * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
@@ -48,6 +48,12 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   // HostBadge) back into seeing them so it can label sandbox sessions.
   if (includeSandbox) return body.hosts;
   return body.hosts.filter((h) => !h.sandbox_provider);
+}
+
+async function fetchHostDetails(hostId: string): Promise<Host> {
+  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Host;
 }
 
 interface UseHostsOptions {
@@ -84,6 +90,17 @@ export function useHosts(options: UseHostsOptions = {}) {
     staleTime: refetchOnFocus ? 0 : 30_000,
     refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
+  });
+}
+
+/** Live capability state for one host, routed to the replica owning its tunnel. */
+export function useHostDetails(hostId: string | null, enabled = true) {
+  return useQuery({
+    queryKey: ["hosts", "detail", hostId],
+    queryFn: () => fetchHostDetails(hostId as string),
+    enabled: enabled && hostId !== null,
+    staleTime: 15_000,
+    refetchInterval: enabled && hostId !== null ? 60_000 : false,
   });
 }
 

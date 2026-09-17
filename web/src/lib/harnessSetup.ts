@@ -107,7 +107,8 @@ export function harnessUnconfiguredOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): boolean {
-  return harnessUnavailableReasonOnHost(harness, host) !== null;
+  const reason = harnessUnavailableReasonOnHost(harness, host);
+  return reason !== null && reason !== "pending";
 }
 
 /**

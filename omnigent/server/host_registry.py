@@ -180,6 +180,8 @@ class HostConnection:
         ``"host_a1b2c3d4..."``.
     :param ws: The live WebSocket to this host.
     :param hello: The hello frame the host sent on connect.
+    :param async_capabilities: Whether this tunnel negotiated early capability
+        discovery. Legacy tunnels have no meaningful pending state.
     :param owner: Authenticated user who established the tunnel,
         e.g. ``"alice@example.com"``. ``None`` when auth is
         disabled (single-user mode).
@@ -273,6 +275,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[str | None]
     connected_at: float
     last_frame_at: float
+    async_capabilities: bool = False
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -349,8 +352,7 @@ class HostRegistry:
         # host_id alone: the map describes the machine's local config, so the
         # same machine connected to two workspaces reports the same answer.
         # Kept across a host disconnect (a tunnel flap shouldn't blank a known
-        # answer) and lost with the process, which is the point — a restarted
-        # server re-learns it from the reconnect handshake.
+        # answer) and relearned from the handshake after a process restart.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
 
@@ -361,6 +363,8 @@ class HostRegistry:
         hello: HostHelloFrame,
         owner: str | None,
         workspace_id: int | None = None,
+        *,
+        async_capabilities: bool = False,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -384,6 +388,8 @@ class HostRegistry:
             (``0`` in single-tenant deployments); captured into the
             connection so ``send_text`` need not read request context
             from the sender loop.
+        :param async_capabilities: Whether the selected tunnel protocol carries
+            an authoritative pending/completed capability state.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
@@ -399,6 +405,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            async_capabilities=async_capabilities,
         )
         if not hello.capabilities_pending:
             conn.capabilities_ready.set()
@@ -510,10 +517,17 @@ class HostRegistry:
             return False
         return conn.hello.telemetry_opt_out
 
-    def capabilities_pending(self, host_id: str, workspace_id: int | None = None) -> bool:
-        """Return whether the live host is still publishing startup readiness."""
+    def capabilities_pending(self, host_id: str, workspace_id: int | None = None) -> bool | None:
+        """Return negotiated startup state, or ``None`` for legacy/remote hosts."""
         conn = self.get(host_id, workspace_id)
-        return conn is not None and conn.hello.capabilities_pending
+        if conn is None or not conn.async_capabilities:
+            return None
+        return conn.hello.capabilities_pending
+
+    def has_async_capabilities(self, host_id: str, workspace_id: int | None = None) -> bool:
+        """Return whether this replica owns a negotiated capability tunnel."""
+        conn = self.get(host_id, workspace_id)
+        return conn is not None and conn.async_capabilities
 
     def get_host_installation_id(
         self, host_id: str, workspace_id: int | None = None
@@ -560,8 +574,8 @@ class HostRegistry:
 
         :param host_id: Host identifier, in any accepted spelling.
         :returns: A copy of the reported map, or ``None`` when this replica has
-            never had a report from the host — unknown, which readers treat as
-            gateway-backed rather than unavailable.
+            never had a report from the host. Capability-aware callers use the
+            negotiated tunnel version to distinguish modern from legacy unknown.
         """
         with self._lock:
             reported = self._gateway_inference.get(_canonical_host_id(host_id))

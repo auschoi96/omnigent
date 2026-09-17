@@ -525,6 +525,26 @@ async def test_list_and_get_host_report_online_from_other_replica(
     )
 
 
+async def test_sharded_get_host_readdresses_to_the_tunnel_owner(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-scoped detail read never serves another replica's empty cache."""
+    app_b, registry_b, _hs, _cs = host_api_app
+    _comm = await _connect_host(app_b, registry_b)
+
+    app_a, registry_a, _store_a, _conv_a = _build_host_api_app(db_uri)
+    assert registry_a.get(_HOST_ID) is None
+    monkeypatch.setattr("omnigent.server.routes.hosts._deployment_is_sharded", lambda: True)
+
+    async with AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
+        response = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
 async def test_list_hosts_reports_offline_after_disconnect(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:

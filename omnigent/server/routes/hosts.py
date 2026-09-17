@@ -56,7 +56,11 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
+from omnigent.server.routes._host_launch import (
+    _deployment_is_sharded,
+    host_absent_error,
+    resolve_host_launch,
+)
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
@@ -656,11 +660,10 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    # Advisory live fields are exact on the tunnel-owning
+                    # replica. The new-chat flow refreshes its selected host
+                    # through the host-scoped endpoint below.
                     "capabilities_pending": host_registry.capabilities_pending(host.host_id),
-                    # Held in memory from the host's connect handshake, not the
-                    # hosts row. ``None`` means this replica has no report yet —
-                    # emitted as-is so a client can tell "unknown" from "not
-                    # gateway-backed".
                     "gateway_inference": host_registry.gateway_inference(host.host_id),
                     "interactive_shells": host_registry.interactive_shells(host.host_id),
                 }
@@ -677,6 +680,7 @@ def create_hosts_router(
         :returns: Host details dict — the ``list_hosts`` fields (including
             ``gateway_inference``, ``None`` when unreported) plus ``runners``.
         :raises HTTPException: 404 if the host does not exist.
+        :raises OmnigentError: If a live host's tunnel belongs to another replica.
         """
         # require_user: with an auth provider configured, an
         # unauthenticated caller must get 401 here — get_user_id would
@@ -689,6 +693,12 @@ def create_hosts_router(
             raise HTTPException(status_code=404, detail="host not found")
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
+        if (
+            _deployment_is_sharded()
+            and host_is_live(host)
+            and host_registry.get(host.host_id) is None
+        ):
+            raise host_absent_error(host, sharded=True)
 
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
@@ -703,8 +713,6 @@ def create_hosts_router(
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
             "capabilities_pending": host_registry.capabilities_pending(host.host_id),
-            # Same semantics as list_hosts: reported on connect and held in
-            # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],

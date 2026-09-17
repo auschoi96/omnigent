@@ -44,6 +44,19 @@ WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 # legacy wait-for-capabilities handshake for rolling upgrades.
 HOST_ASYNC_CAPABILITIES_SUBPROTOCOL = "omnigent.host-async-capabilities.v1"
 
+# Extends the v1 early-registration protocol with an authenticated server →
+# host identity frame. New hosts offer both versions so an older server can
+# select v1; only v2 lets the host skip its legacy /v1/me fallback.
+HOST_IDENTITY_SUBPROTOCOL = "omnigent.host-async-capabilities.v2"
+
+
+def host_subprotocol_has_async_capabilities(subprotocol: str | None) -> bool:
+    """Return whether *subprotocol* includes v1 early registration."""
+    return subprotocol in {
+        HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
+        HOST_IDENTITY_SUBPROTOCOL,
+    }
+
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
     """Build the canonical text of a workspace-missing launch refusal.
@@ -94,6 +107,7 @@ class HostFrameKind(str, Enum):
 
     HELLO = "host.hello"
     CONNECTION_ERROR = "host.connection_error"
+    IDENTITY = "host.identity"
     HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
@@ -193,6 +207,20 @@ class HostConnectionErrorFrame:
     stage: str
     error: str
     retryable: bool
+
+
+@dataclass
+class HostIdentityFrame:
+    """Server → host: authenticated owner for client-side log attribution.
+
+    Sent only on the negotiated identity protocol, immediately after
+    registration and before any request frame. ``None`` preserves anonymous
+    single-user behavior.
+
+    :param user_id: Authenticated tunnel owner, e.g. ``"alice@example.com"``.
+    """
+
+    user_id: str | None
 
 
 @dataclass
@@ -1093,6 +1121,7 @@ class HostImportLocalDoneFrame:
 HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
+    | HostIdentityFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
@@ -1192,6 +1221,13 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "stage": frame.stage,
                 "error": frame.error,
                 "retryable": frame.retryable,
+            }
+        )
+    if isinstance(frame, HostIdentityFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.IDENTITY.value,
+                "user_id": frame.user_id,
             }
         )
     if isinstance(frame, HostHarnessReadinessFrame):
@@ -1651,6 +1687,8 @@ def _decode_known_host_frame(
                 error=_required_str(msg, "error"),
                 retryable=_required_bool(msg, "retryable"),
             )
+        case HostFrameKind.IDENTITY:
+            return HostIdentityFrame(user_id=_optional_nullable_str(msg, "user_id"))
         case HostFrameKind.HARNESS_READINESS:
             return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:

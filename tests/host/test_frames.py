@@ -21,6 +21,7 @@ from omnigent.host.frames import (
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostIdentityFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
@@ -455,6 +456,13 @@ def test_connection_error_frame_round_trip() -> None:
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert decoded == original
+
+
+@pytest.mark.parametrize("user_id", ["alice@example.com", None])
+def test_identity_frame_round_trip(user_id: str | None) -> None:
+    """Authenticated and anonymous tunnel owners survive the wire."""
+    original = HostIdentityFrame(user_id=user_id)
+    assert decode_host_frame(encode_host_frame(original)) == original
 
 
 def test_harness_readiness_frame_round_trip() -> None:

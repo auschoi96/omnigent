@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useDetectedCredentials,
+  useHostDetails,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
@@ -278,6 +279,34 @@ describe("useHosts", () => {
 
     expect(result.current.error).toBeInstanceOf(Error);
     expect((result.current.error as Error).message).toContain("503");
+  });
+});
+
+describe("useHostDetails", () => {
+  it("fetches live state through the host-scoped endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        host_id: "host_1",
+        name: "Laptop",
+        owner: "alice",
+        status: "online",
+        capabilities_pending: true,
+        gateway_inference: null,
+      }),
+    );
+
+    const { result } = renderHook(() => useHostDetails("host_1"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host_1");
+    expect(result.current.data?.capabilities_pending).toBe(true);
+  });
+
+  it("does not fetch without a selected host", async () => {
+    renderHook(() => useHostDetails(null), { wrapper });
+    await Promise.resolve();
+
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 

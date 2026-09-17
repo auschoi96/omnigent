@@ -14,12 +14,14 @@ from typing import Any
 
 import pytest
 
+from omnigent.host.frames import HostHelloFrame
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._sessions.common import set_server_host_registry
 from omnigent.server.routing_backend import (
     RoutingBackends,
     backends_from_caps,
     gateway_backs_all,
+    reported_gateway_inference,
     route_with_fallback,
     routing_available,
     routing_sources,
@@ -86,8 +88,7 @@ def test_any_prefers_the_external_client() -> None:
 
 # ── gateway_backs_all: both families must be backed ─────────────────────────
 #
-# The map is read from the live host registry — reported on the host's connect
-# handshake, never persisted — so these set it up the way the tunnel does.
+# The map is read from the live host registry on the tunnel-owning replica.
 
 
 @pytest.fixture()
@@ -141,6 +142,35 @@ def test_gateway_backs_all_without_a_registry() -> None:
     # read degrades to unknown rather than raising.
     set_server_host_registry(None)
     assert gateway_backs_all(SimpleNamespace(host_id=_HOST_ID), ("claude-native",)) is True
+
+
+def test_reported_gateway_snapshot_reads_the_live_registry(
+    host_registry: HostRegistry,
+) -> None:
+    host_registry.record_gateway_inference(_HOST_ID, {"claude-native": True})
+    host = SimpleNamespace(host_id=_HOST_ID)
+    assert reported_gateway_inference(host) == {"claude-native": True}
+    assert gateway_backs_all(host, ("claude-native",)) is True
+
+
+@pytest.mark.parametrize("capabilities_pending", [True, False])
+def test_modern_host_unknown_gateway_state_fails_closed(
+    capabilities_pending: bool,
+    host_registry: HostRegistry,
+) -> None:
+    host_registry.register(
+        _HOST_ID,
+        SimpleNamespace(),  # type: ignore[arg-type]
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="test-host",
+            capabilities_pending=capabilities_pending,
+        ),
+        owner="local",
+        async_capabilities=True,
+    )
+    assert gateway_backs_all(SimpleNamespace(host_id=_HOST_ID), ("claude-native",)) is False
 
 
 # ── backends_from_caps: explicit pair wins, else derive by type ──────────────

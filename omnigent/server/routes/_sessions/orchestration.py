@@ -8018,6 +8018,10 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
 
     readiness = getattr(host, "configured_harnesses", None) if host is not None else None
     if not readiness:
+        from omnigent.server.routing_backend import host_has_async_capabilities
+
+        if host_has_async_capabilities(host):
+            return []
         return list(AUTO_NATIVE_ROUTING_HARNESSES)
     return [
         harness
@@ -8039,10 +8043,20 @@ def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -
     :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
     :returns: The not-backed ids, in the order given.
     """
-    from omnigent.gateway_inference import not_gateway_backed
-    from omnigent.server.routing_backend import reported_gateway_inference
+    from omnigent.gateway_inference import gateway_inference_state, not_gateway_backed
+    from omnigent.server.routing_backend import (
+        host_has_async_capabilities,
+        reported_gateway_inference,
+    )
 
-    return not_gateway_backed(reported_gateway_inference(host), harnesses)
+    gateway = reported_gateway_inference(host)
+    if host_has_async_capabilities(host):
+        return [
+            harness
+            for harness in harnesses
+            if gateway_inference_state(gateway, harness) is not True
+        ]
+    return not_gateway_backed(gateway, harnesses)
 
 
 def _gateway_backed(host: Host | None, harnesses: Sequence[str]) -> bool:
@@ -8259,8 +8273,8 @@ async def _reject_ungatewayed_model_routing(
             "The selected host is still checking harness capabilities; retry shortly.",
             code=ErrorCode.INVALID_INPUT,
         )
-    # The completion frame persists the authoritative map. Re-read after the
-    # wait so routing never consumes the temporary unknown snapshot.
+    # The completion frame refreshes the authoritative live snapshot. Re-read
+    # after the wait so routing never consumes its temporary unknown state.
     host = await _routing_host_for_create(body, request, user_id)
     if not _ungatewayed_native_harnesses(host, (harness,)):
         return
@@ -8405,7 +8419,14 @@ async def _wait_for_initial_host_capabilities(
     deadline = loop.time() + _INITIAL_HOST_CAPABILITY_WAIT_S
     while True:
         conn = host_registry.get(host.host_id)
-        if conn is None or not conn.hello.capabilities_pending:
+        if conn is None:
+            # A host-keyed create can still miss after a sharding rebalance.
+            # Preserve the standard wrong-replica/offline classification so
+            # clients can re-address instead of receiving a false probe delay.
+            from omnigent.server.routes._host_launch import host_absent_error
+
+            raise host_absent_error(host)
+        if not conn.hello.capabilities_pending:
             return True
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -8679,8 +8700,8 @@ async def _resolve_native_smart_routing(
             None,
             "Host harness capabilities are still being checked; retry shortly.",
         )
-    # The completion frame persists the authoritative map. Re-read after the
-    # wait so routing never consumes the temporary unknown snapshot.
+    # The completion frame refreshes the authoritative live snapshot. Re-read
+    # after the wait so routing never consumes its temporary unknown state.
     host = await _routing_host_for_create(body, request, user_id)
     # Both arms must be gateway-backed before the WORKSPACE router may choose
     # between them: an arm off the gateway cannot run its picks, and the pick is

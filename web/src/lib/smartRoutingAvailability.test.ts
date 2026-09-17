@@ -224,6 +224,24 @@ describe("hostBacksHarnessWithGateway", () => {
       ),
     ).toBe(false);
   });
+
+  it("fails closed after a modern host completes with an unknown family", () => {
+    expect(
+      hostBacksHarnessWithGateway(
+        { gateway_inference: { "claude-native": true }, capabilities_pending: false },
+        "codex-native",
+      ),
+    ).toBe(false);
+  });
+
+  it("accepts only an explicit true from a modern host", () => {
+    expect(
+      hostBacksHarnessWithGateway(
+        { gateway_inference: { "codex-native": true }, capabilities_pending: false },
+        "codex-native",
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("smartRoutingDroppedMessage", () => {

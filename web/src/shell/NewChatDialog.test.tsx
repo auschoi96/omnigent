@@ -44,6 +44,7 @@ import type { ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
+  useHostDetails,
   useHostModelOptions,
   fetchHosts,
   useHosts,
@@ -167,6 +168,7 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
+  useHostDetails: vi.fn(),
   useHostModelOptions: vi.fn(),
   fetchHosts: vi.fn(async () => []),
   // The setup dialog mounts these; default to inert so tests that don't
@@ -271,6 +273,7 @@ const authenticatedFetchMock = vi.mocked(authenticatedFetch);
 const getCurrentUserIdMock = vi.mocked(getCurrentUserId);
 const resolveIdentityMock = vi.mocked(resolveIdentity);
 const useHostsMock = vi.mocked(useHosts);
+const useHostDetailsMock = vi.mocked(useHostDetails);
 const SUCCESS_QUERY_STATE = {
   status: "success",
   fetchStatus: "idle",
@@ -1096,6 +1099,17 @@ function mockHosts(
     data: hosts,
     ...queryState,
   } as unknown as ReturnType<typeof useHosts>);
+  useHostDetailsMock.mockImplementation(
+    (hostId, enabled = true) =>
+      (hostId === null || !enabled
+        ? DISABLED_QUERY_RESULT
+        : hosts === undefined
+          ? PENDING_QUERY_STATE
+          : {
+              ...SUCCESS_QUERY_STATE,
+              data: hosts.find((candidate) => candidate.host_id === hostId),
+            }) as ReturnType<typeof useHostDetails>,
+  );
 }
 
 function mockAgents(
@@ -1131,6 +1145,7 @@ function setupLandingMocks() {
   resolveIdentityMock.mockReset();
   resolveIdentityMock.mockResolvedValue(null);
   useHostsMock.mockReset();
+  useHostDetailsMock.mockReset();
   useConversationsMock.mockReset();
   useConversationsMock.mockReturnValue({ data: undefined });
   useProjectsMock.mockReset();
@@ -7385,6 +7400,53 @@ describe("NewChatLandingScreen smart routing", () => {
     closePrimaryPicker();
     openAgentModels("a2");
     expect(selectedPickerModel()).toBeTruthy();
+  });
+
+  it("preserves a routing pick while capabilities refresh and waits before create", async () => {
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
+
+    // The cross-replica list may remain stale while the selected-host detail
+    // request is still reaching the tunnel owner.
+    useHostDetailsMock.mockReturnValue(PENDING_QUERY_STATE as ReturnType<typeof useHostDetails>);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled());
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
+    ).toMatchObject({ routing: "on" });
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-agent-checking-a1")).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-agent-checking-a2")).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-agent-warning-a1")).toBeNull();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-a1"), { key: "Escape" });
+    openAgentModels("a1");
+    expect(selectedPickerModel()).toHaveTextContent("Smart Routing");
+    closePrimaryPicker();
+
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": true },
+        gateway_inference: { "claude-native": true, "codex-native": true },
+        capabilities_pending: false,
+      },
+    ]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it now" },
+    });
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    openAgentModels("a1");
+    expect(selectedPickerModel()).toHaveTextContent("Smart Routing");
   });
 
   it("disables effort choices while Smart Routing owns effort", () => {

@@ -160,6 +160,15 @@ describe("harnessUnconfiguredOnHost", () => {
     expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: false }))).toBe(true);
     expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: true }))).toBe(false);
   });
+
+  it("keeps pending harnesses visible without showing a setup failure", () => {
+    expect(
+      harnessUnconfiguredOnHost("codex", {
+        ...hostWith(null),
+        capabilities_pending: true,
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("harnessInstallableOnHost", () => {

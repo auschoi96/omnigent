@@ -117,14 +117,18 @@ export function hostBacksHarnessWithGateway(
   host:
     | {
         gateway_inference?: Record<string, boolean> | null;
-        capabilities_pending?: boolean;
+        capabilities_pending?: boolean | null;
       }
     | null
     | undefined,
   harness: string,
 ): boolean {
-  if (host?.capabilities_pending) return false;
-  return host?.gateway_inference?.[harness] !== false;
+  if (host?.capabilities_pending === true) return false;
+  const reported = host?.gateway_inference?.[harness];
+  if (reported !== undefined) return reported;
+  // A modern host completed discovery but couldn't produce this family, so
+  // fail closed. Legacy hosts have no pending marker and retain compatibility.
+  return host?.capabilities_pending == null;
 }
 
 /** Display name for an arm, e.g. ``"Codex"``; the raw id if it isn't native. */

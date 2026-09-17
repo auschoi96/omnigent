@@ -32,6 +32,7 @@ from omnigent.host.connect import (
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
+    HOST_IDENTITY_SUBPROTOCOL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -40,6 +41,7 @@ from omnigent.host.frames import (
     HostDetectCredentialsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostIdentityFrame,
     HostImportLocalByIdFrame,
     HostImportLocalFrame,
     HostInstallHarnessFrame,
@@ -2212,10 +2214,12 @@ async def test_run_cancels_inflight_capability_discovery_on_shutdown(
     assert host._capability_init_task is None
 
 
+@pytest.mark.parametrize("subprotocol", [None, HOST_ASYNC_CAPABILITIES_SUBPROTOCOL])
 async def test_owner_lookup_does_not_delay_registration(
     monkeypatch: pytest.MonkeyPatch,
+    subprotocol: str | None,
 ) -> None:
-    """Best-effort /v1/me attribution runs behind the host hello."""
+    """Legacy and v1 /v1/me attribution runs behind the host hello."""
     import websockets.asyncio.client as ws_client
 
     host = _make_host_process()
@@ -2223,6 +2227,7 @@ async def test_owner_lookup_does_not_delay_registration(
     lookup_started = asyncio.Event()
     lookup_release = asyncio.Event()
     tunnel = _BlockingTunnel()
+    tunnel.subprotocol = subprotocol
 
     async def _blocked_lookup() -> None:
         lookup_started.set()
@@ -2259,6 +2264,85 @@ async def test_owner_lookup_does_not_delay_registration(
             await _cancel(connect_task)
         if host._owner_user_id_task is not None and not host._owner_user_id_task.done():
             await _cancel(host._owner_user_id_task)
+
+
+async def test_negotiated_identity_skips_me_and_precedes_request_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tunnel identity is installed before a following launch is dispatched."""
+    import websockets.asyncio.client as ws_client
+
+    host = _make_host_process()
+    host._capabilities_initialized = True
+    monkeypatch.delenv("OMNIGENT_USER_ID", raising=False)
+    lookup_calls = 0
+    dispatched = asyncio.Event()
+    observed: list[tuple[str | None, object]] = []
+
+    async def _unexpected_lookup() -> None:
+        nonlocal lookup_calls
+        lookup_calls += 1
+
+    class _NegotiatedTunnel:
+        subprotocol = HOST_IDENTITY_SUBPROTOCOL
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+            self.incoming: asyncio.Queue[str] = asyncio.Queue()
+
+        async def send(self, data: str) -> None:
+            self.sent.append(data)
+
+        async def recv(self) -> str:
+            return await self.incoming.get()
+
+    tunnel = _NegotiatedTunnel()
+    tunnel.incoming.put_nowait(encode_host_frame(HostIdentityFrame(user_id="alice@example.com")))
+    tunnel.incoming.put_nowait(
+        encode_host_frame(
+            HostLaunchRunnerFrame(
+                request_id="req_after_identity",
+                binding_token="token",
+                workspace="/tmp",
+                harness="claude-native",
+            )
+        )
+    )
+
+    class _AcceptedTunnel:
+        async def __aenter__(self) -> _NegotiatedTunnel:
+            return tunnel
+
+        async def __aexit__(self, *exc_info: object) -> bool:
+            return False
+
+    def _capture_request(_ws: object, raw: str) -> None:
+        observed.append((host._owner_user_id, decode_host_frame(raw)))
+        dispatched.set()
+
+    monkeypatch.setattr(host, "_ensure_owner_user_id", _unexpected_lookup)
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr(host, "_start_frame_task", _capture_request)
+    monkeypatch.setattr(ws_client, "connect", lambda url, **kwargs: _AcceptedTunnel())
+
+    connect_task = asyncio.create_task(host._connect_and_serve())
+    try:
+        await asyncio.wait_for(dispatched.wait(), timeout=1.0)
+        assert lookup_calls == 0
+        assert host._owner_user_id == "alice@example.com"
+        assert observed == [
+            (
+                "alice@example.com",
+                HostLaunchRunnerFrame(
+                    request_id="req_after_identity",
+                    binding_token="token",
+                    workspace="/tmp",
+                    harness="claude-native",
+                ),
+            )
+        ]
+    finally:
+        await _cancel(connect_task)
 
 
 async def test_owner_lookup_is_shared_and_retried_after_an_empty_result(

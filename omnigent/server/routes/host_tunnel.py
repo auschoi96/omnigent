@@ -30,6 +30,7 @@ from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
+    HOST_IDENTITY_SUBPROTOCOL,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -37,6 +38,7 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
+    HostIdentityFrame,
     HostImportLocalDoneFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
@@ -53,6 +55,7 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
+    host_subprotocol_has_async_capabilities,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -253,10 +256,16 @@ def create_host_tunnel_router(
                 return
 
         requested_subprotocols = ws.scope.get("subprotocols") or []
-        selected_subprotocol = (
-            HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
-            if HOST_ASYNC_CAPABILITIES_SUBPROTOCOL in requested_subprotocols
-            else None
+        selected_subprotocol = next(
+            (
+                candidate
+                for candidate in (
+                    HOST_IDENTITY_SUBPROTOCOL,
+                    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
+                )
+                if candidate in requested_subprotocols
+            ),
+            None,
         )
         await ws.accept(subprotocol=selected_subprotocol)
         conn: HostConnection | None = None
@@ -301,11 +310,27 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
+                async_capabilities=host_subprotocol_has_async_capabilities(selected_subprotocol),
             )
-            # Delivered on the handshake, never persisted: a replica that just
-            # started learns the host's gateway backing here, so a server
-            # restart converges as soon as each host reconnects.
+            # Delivered on the handshake, never persisted: host-scoped reads
+            # reach this registry through the same host-id slice key.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            if selected_subprotocol == HOST_IDENTITY_SUBPROTOCOL:
+                # Authentication already resolved the owner before the upgrade.
+                # Return it on the existing tunnel before any request frame, so
+                # client-side logs need no separate GET /v1/me round trip.
+                host_registry.send_text(
+                    conn,
+                    encode_host_frame(
+                        HostIdentityFrame(
+                            user_id=(
+                                tunnel_owner
+                                if managed_token is not None or auth_provider is not None
+                                else None
+                            )
+                        )
+                    ),
+                )
             stage = "connected"
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",

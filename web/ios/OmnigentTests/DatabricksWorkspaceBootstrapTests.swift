@@ -197,6 +197,22 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     XCTAssertTrue(store.events.isEmpty)
   }
 
+  func testCancellationReturnsToSetupWithoutAnErrorMessage() {
+    XCTAssertNil(OmnigentWebView.Coordinator.workspaceErrorMessage(CancellationError()))
+    XCTAssertNil(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(DatabricksSessionError.cancelled))
+  }
+
+  func testConfigurationAndSessionFailuresStillHaveMessages() {
+    for error: Error in [
+      DatabricksOAuthError.invalidClientID, DatabricksSessionError.missingCookie,
+      DatabricksSessionError.networkUnavailable, DatabricksSessionError.rejected(403),
+    ] {
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(error), error.localizedDescription)
+    }
+  }
+
   private func window() throws -> UIWindow {
     let scene = try XCTUnwrap(
       UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)

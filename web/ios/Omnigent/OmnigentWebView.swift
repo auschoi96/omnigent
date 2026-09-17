@@ -6,7 +6,8 @@ struct OmnigentWebView: UIViewRepresentable {
   let initialURL: URL
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
-  let loadFailed: (URL, String) -> Void
+  /// A nil message returns to setup after cancellation without showing an error.
+  let loadFailed: (URL, String?) -> Void
   let loadSucceeded: () -> Void
   /// Compose and push the current server-picker payload to the SPA.
   let pushServerPicker: () -> Void
@@ -581,6 +582,11 @@ struct OmnigentWebView: UIViewRepresentable {
       }
     }
 
+    static func workspaceErrorMessage(_ error: Error) -> String? {
+      if error is CancellationError || error as? DatabricksSessionError == .cancelled { return nil }
+      return error.localizedDescription
+    }
+
     private func showWorkspaceFailure(_ error: Error) {
       navigationID = UUID()
       effectiveOrigin = nil
@@ -597,7 +603,7 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.cancelAuthentication = nil
         parent.model.isLoading = false
         parent.model.cancelServerSwitcherWatchdog()
-        parent.loadFailed(parent.initialURL, error.localizedDescription)
+        parent.loadFailed(parent.initialURL, Self.workspaceErrorMessage(error))
       }
     }
 

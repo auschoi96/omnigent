@@ -57,7 +57,9 @@ export function harnessUnavailableReasonOnHost(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): string | null {
-  if (!harness || !host?.configured_harnesses) return null;
+  if (!harness || !host) return null;
+  if (host.capabilities_pending) return "pending";
+  if (!host.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
   if (availability === false) {
     if (isCodexHarness(harness)) return "binary-missing";
@@ -118,6 +120,7 @@ export function harnessUnconfiguredOnHost(
  * flag-off path renders byte-for-byte the original text.
  */
 export function harnessWarningBadgeText(reason: string | null, collapsed = false): string {
+  if (reason === "pending") return "checking";
   if (collapsed) return "needs setup";
   if (reason === "binary-missing") return "binary missing";
   if (reason === "needs-auth") return "needs auth";

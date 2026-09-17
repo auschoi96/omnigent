@@ -31,6 +31,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -698,6 +699,39 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert host._runners == {}
 
 
+async def test_handle_launch_does_not_trust_completed_advisory_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch rechecks the binary even when startup reported it ready."""
+    host = _make_host_process()
+    host._configured_harnesses = {"codex-native": True}
+    host._capabilities_initialized = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    probes: list[str] = []
+
+    def _removed_binary(harness: str) -> bool:
+        probes.append(harness)
+        return False
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _removed_binary)
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_stale_advisory",
+            binding_token="token_stale",
+            workspace=str(workspace),
+            harness="codex-native",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert probes == ["codex-native"]
+    assert host._runners == {}
+
+
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -864,6 +898,41 @@ async def test_handle_launch_without_harness_skips_check(
     _cleanup_host(host)
 
 
+async def test_unresolved_launch_joins_new_server_capability_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new server cannot bypass discovery by sending ``harness=None``."""
+    host = _make_host_process()
+    discovery_started = asyncio.Event()
+    discovery_release = asyncio.Event()
+
+    async def _discover() -> None:
+        discovery_started.set()
+        await discovery_release.wait()
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    launch_task = asyncio.create_task(
+        host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_unresolved_barrier",
+                binding_token="token_barrier",
+                workspace="/missing-after-barrier",
+                require_capability_barrier=True,
+            )
+        )
+    )
+    await asyncio.wait_for(discovery_started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    assert not launch_task.done()
+
+    discovery_release.set()
+    result = await asyncio.wait_for(launch_task, timeout=1.0)
+
+    assert result.status == "failed"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
+
+
 async def test_handle_launch_prints_exact_runner_log_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -992,6 +1061,7 @@ class _BlockingTunnel:
         self.first_send = asyncio.Event()
         self.second_send = asyncio.Event()
         self.disconnect = asyncio.Event()
+        self.subprotocol: str | None = None
 
     async def send(self, data: str) -> None:
         self.sent.append(data)
@@ -1003,6 +1073,14 @@ class _BlockingTunnel:
     async def recv(self) -> str:
         await self.disconnect.wait()
         raise ConnectionError("test disconnect")
+
+
+class _AsyncCapabilitiesTunnel(_BlockingTunnel):
+    """Blocking tunnel whose server negotiated early host registration."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.subprotocol = HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
 
 
 async def _cancel(task: asyncio.Task[None]) -> None:
@@ -1602,6 +1680,116 @@ async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     assert hello.gateway_inference == {"claude-native": True}
 
 
+async def test_negotiated_capability_discovery_registers_then_publishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new server gets fail-closed hello immediately and one ordered update."""
+    host = _make_host_process()
+    discovery_release = asyncio.Event()
+    discovery_started = asyncio.Event()
+
+    async def _discover() -> None:
+        discovery_started.set()
+        await discovery_release.wait()
+        host._replace_capabilities(
+            {"claude-native": True, "codex-native": "needs-auth"},
+            {"claude-native": True, "codex-native": True},
+        )
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    tunnel = _AsyncCapabilitiesTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(discovery_started.wait(), tunnel.first_send.wait()),
+            timeout=1.0,
+        )
+        hello = decode_host_frame(tunnel.sent[0])
+        assert isinstance(hello, HostHelloFrame)
+        assert hello.capabilities_pending
+        assert hello.configured_harnesses is None
+        assert hello.gateway_inference is None
+
+        discovery_release.set()
+        await asyncio.wait_for(tunnel.second_send.wait(), timeout=1.0)
+        update = decode_host_frame(tunnel.sent[1])
+        assert update == HostHarnessReadinessFrame(
+            configured_harnesses={
+                "claude-native": True,
+                "codex-native": "needs-auth",
+            },
+            gateway_inference={"claude-native": True, "codex-native": True},
+            capabilities_pending=False,
+        )
+    finally:
+        await _cancel(serve_task)
+
+
+async def test_retired_host_does_not_publish_early_hello() -> None:
+    """A daemon that lost its registry record cannot register afterward."""
+
+    class _LostLifecycle:
+        target = "test-server"
+
+        def still_owner(self) -> bool:
+            return False
+
+    host = _make_host_process()
+    host._lifecycle_lock = _LostLifecycle()  # type: ignore[assignment]
+    tunnel = _AsyncCapabilitiesTunnel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    assert host._lifecycle_lost.is_set()
+    assert tunnel.sent == []
+    if host._capability_init_task is not None:
+        await _cancel(host._capability_init_task)
+
+
+async def test_retired_host_does_not_publish_delayed_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership is rechecked between early hello and the delayed update."""
+
+    class _RetiredAfterHello:
+        target = "test-server"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def still_owner(self) -> bool:
+            self.calls += 1
+            return self.calls == 1
+
+    host = _make_host_process()
+    lifecycle = _RetiredAfterHello()
+    host._lifecycle_lock = lifecycle  # type: ignore[assignment]
+    discovery_release = asyncio.Event()
+
+    async def _discover() -> None:
+        await discovery_release.wait()
+        host._replace_capabilities({"codex-native": True}, {"codex-native": True})
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    tunnel = _AsyncCapabilitiesTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        discovery_release.set()
+        for _ in range(100):
+            if lifecycle.calls >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert lifecycle.calls >= 2
+        assert host._lifecycle_lost.is_set()
+        assert len(tunnel.sent) == 1
+    finally:
+        await _cancel(serve_task)
+
+
 @pytest.mark.parametrize(
     ("configured", "gateway"),
     [
@@ -2022,6 +2210,128 @@ async def test_run_cancels_inflight_capability_discovery_on_shutdown(
 
     assert discovery_cancelled.is_set()
     assert host._capability_init_task is None
+
+
+async def test_owner_lookup_does_not_delay_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Best-effort /v1/me attribution runs behind the host hello."""
+    import websockets.asyncio.client as ws_client
+
+    host = _make_host_process()
+    host._capabilities_initialized = True
+    lookup_started = asyncio.Event()
+    lookup_release = asyncio.Event()
+    tunnel = _BlockingTunnel()
+
+    async def _blocked_lookup() -> None:
+        lookup_started.set()
+        await lookup_release.wait()
+
+    class _AcceptedTunnel:
+        async def __aenter__(self) -> _BlockingTunnel:
+            return tunnel
+
+        async def __aexit__(self, *exc_info: object) -> bool:
+            return False
+
+    monkeypatch.setattr(host, "_ensure_owner_user_id", _blocked_lookup)
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr(ws_client, "connect", lambda url, **kwargs: _AcceptedTunnel())
+
+    connect_task = asyncio.create_task(host._connect_and_serve())
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(lookup_started.wait(), tunnel.first_send.wait()),
+            timeout=1.0,
+        )
+        lookup_task = host._owner_user_id_task
+        assert lookup_task is not None
+        assert not lookup_task.done()
+        assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+
+        await _cancel(connect_task)
+        assert not lookup_task.cancelled()
+        lookup_release.set()
+        await lookup_task
+    finally:
+        if not connect_task.done():
+            await _cancel(connect_task)
+        if host._owner_user_id_task is not None and not host._owner_user_id_task.done():
+            await _cancel(host._owner_user_id_task)
+
+
+async def test_owner_lookup_is_shared_and_retried_after_an_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live lookup is shared; a later reconnect may retry no-attribution results."""
+    host = _make_host_process()
+    release = asyncio.Event()
+    calls = 0
+
+    async def _lookup() -> None:
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        if calls == 2:
+            host._owner_user_id = "user-123"
+
+    monkeypatch.setattr(host, "_ensure_owner_user_id", _lookup)
+    host._start_owner_user_id_resolution()
+    first = host._owner_user_id_task
+    host._start_owner_user_id_resolution()
+    assert host._owner_user_id_task is first
+    assert calls == 0
+
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    assert first is not None
+    await first
+
+    release.clear()
+    host._start_owner_user_id_resolution()
+    second = host._owner_user_id_task
+    assert second is not None and second is not first
+    release.set()
+    await second
+
+    assert calls == 2
+    assert host._owner_user_id == "user-123"
+    host._start_owner_user_id_resolution()
+    assert host._owner_user_id_task is second
+
+
+async def test_run_cancels_inflight_owner_lookup_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon teardown owns and drains the background attribution lookup."""
+    host = _host()
+    host._zygote_disabled = True
+    host._capabilities_initialized = True
+    lookup_started = asyncio.Event()
+    lookup_cancelled = asyncio.Event()
+
+    async def _lookup() -> None:
+        lookup_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            lookup_cancelled.set()
+
+    async def _connect_and_serve() -> None:
+        host._start_owner_user_id_resolution()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host, "_ensure_owner_user_id", _lookup)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda: 0)
+    run_task = asyncio.create_task(host.run())
+    await asyncio.wait_for(lookup_started.wait(), timeout=1.0)
+    await _cancel(run_task)
+
+    assert lookup_cancelled.is_set()
+    assert host._owner_user_id_task is None
 
 
 async def test_capability_probe_failure_does_not_block_registration(

@@ -656,6 +656,7 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    "capabilities_pending": host_registry.capabilities_pending(host.host_id),
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -701,6 +702,7 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "capabilities_pending": host_registry.capabilities_pending(host.host_id),
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
@@ -969,6 +971,7 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                require_capability_barrier=True,
             )
         )
         try:

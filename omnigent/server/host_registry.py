@@ -260,6 +260,9 @@ class HostConnection:
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
+    :param capabilities_ready: Set once a negotiated early-registration host
+        has published its initial readiness snapshot, or when this connection
+        is replaced/removed so waiters can re-resolve the current generation.
     """
 
     workspace_id: int
@@ -319,6 +322,7 @@ class HostConnection:
     pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
         default_factory=dict,
     )
+    capabilities_ready: asyncio.Event = field(default_factory=asyncio.Event)
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
     # Each item is a ("session", dict) or ("done", dict) tuple.
@@ -396,6 +400,8 @@ class HostRegistry:
             connected_at=now,
             last_frame_at=now,
         )
+        if not hello.capabilities_pending:
+            conn.capabilities_ready.set()
         with self._lock:
             key = (ws_id, host_id)
             old = self._hosts.get(key)
@@ -405,6 +411,7 @@ class HostRegistry:
                     ws_id,
                     host_id,
                 )
+                old.capabilities_ready.set()
                 old.outbound_queue.put_nowait(None)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -446,6 +453,7 @@ class HostRegistry:
             removed = self._hosts.pop(key)
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
+        removed.capabilities_ready.set()
         removed.outbound_queue.put_nowait(None)
         return True
 
@@ -501,6 +509,11 @@ class HostRegistry:
         if conn is None:
             return False
         return conn.hello.telemetry_opt_out
+
+    def capabilities_pending(self, host_id: str, workspace_id: int | None = None) -> bool:
+        """Return whether the live host is still publishing startup readiness."""
+        conn = self.get(host_id, workspace_id)
+        return conn is not None and conn.hello.capabilities_pending
 
     def get_host_installation_id(
         self, host_id: str, workspace_id: int | None = None

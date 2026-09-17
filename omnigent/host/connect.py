@@ -27,6 +27,7 @@ from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
 import httpx
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
+from websockets.typing import Subprotocol
 
 from omnigent._platform import (
     IS_POSIX,
@@ -44,11 +45,15 @@ from omnigent.debug_logging import (
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HarnessAvailability,
+)
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -1048,6 +1053,9 @@ class HostProcess:
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
         # resolved, or on a single-user server / managed host where it is absent.
         self._owner_user_id: str | None = None
+        # Attribution is advisory and must not delay registration. The task is
+        # daemon-owned so a tunnel flap neither cancels nor duplicates the call.
+        self._owner_user_id_task: asyncio.Task[None] | None = None
         # The fronting Databricks workspace id for this server, resolved once from
         # the server URL (its ?o= selector or the stored login record) — the same
         # resolution the display URL uses, no extra network. Published to
@@ -1765,6 +1773,16 @@ class HostProcess:
         #
         # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
         # CLI, which inline would stall the keepalive pong and every other frame.
+        if frame.harness is None and frame.require_capability_barrier:
+            self._start_capability_discovery()
+            if self._capability_init_task is not None:
+                try:
+                    await asyncio.shield(self._capability_init_task)
+                except Exception:  # noqa: BLE001 — completion, not success, is the barrier
+                    _logger.warning(
+                        "Capability discovery failed before an unresolved launch",
+                        exc_info=True,
+                    )
         if frame.harness is not None and not await asyncio.to_thread(
             harness_is_configured, frame.harness
         ):
@@ -3620,6 +3638,18 @@ class HostProcess:
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
 
+    async def _lifecycle_is_current(self) -> bool:
+        """Recheck daemon ownership before publishing connection state."""
+        if self._lifecycle_lost.is_set():
+            return False
+        if self._lifecycle_lock is None:
+            return True
+        if await asyncio.to_thread(self._lifecycle_lock.still_owner):
+            return True
+        self._lifecycle_lost.set()
+        self._abort_live_tunnel()
+        return False
+
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -3870,6 +3900,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._capability_init_task
                 self._capability_init_task = None
+            if self._owner_user_id_task is not None:
+                self._owner_user_id_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._owner_user_id_task
+                self._owner_user_id_task = None
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3972,6 +4007,7 @@ class HostProcess:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
+                subprotocols=[Subprotocol(HOST_ASYNC_CAPABILITIES_SUBPROTOCOL)],
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -4010,7 +4046,7 @@ class HostProcess:
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
-            await self._ensure_owner_user_id()
+            self._start_owner_user_id_resolution()
             await self._serve_frames(ws)
         except BaseException as exc:
             disconnect_error = exc
@@ -4034,6 +4070,16 @@ class HostProcess:
             # ``async with`` this replaced; the manual enter is only so the
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
+
+    def _start_owner_user_id_resolution(self) -> None:
+        """Resolve best-effort attribution without delaying host registration."""
+        if self._owner_user_id is not None:
+            return
+        if self._owner_user_id_task is None or self._owner_user_id_task.done():
+            self._owner_user_id_task = asyncio.create_task(
+                self._ensure_owner_user_id(),
+                name="host-owner-user-id",
+            )
 
     async def _ensure_owner_user_id(self) -> None:
         """Resolve this host's owning user once and publish it for attribution.
@@ -4141,9 +4187,13 @@ class HostProcess:
         return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
-        """Wait for bounded startup discovery, register, then service the connection."""
+        """Register with negotiated readiness semantics, then service the connection."""
         self._start_capability_discovery()
-        if self._capability_init_task is not None:
+        async_capabilities = (
+            getattr(ws, "subprotocol", None) == HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
+        )
+        capabilities_pending = async_capabilities and not self._capabilities_initialized
+        if not capabilities_pending and self._capability_init_task is not None:
             await asyncio.shield(self._capability_init_task)
         _tel_opt_out = False
         try:
@@ -4160,14 +4210,17 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
+        if not await self._lifecycle_is_current():
+            raise asyncio.CancelledError
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
-            configured_harnesses=self._configured_harnesses,
-            gateway_inference=self._gateway_inference,
+            configured_harnesses=None if capabilities_pending else self._configured_harnesses,
+            gateway_inference=None if capabilities_pending else self._gateway_inference,
             interactive_shells=self._interactive_shells,
+            capabilities_pending=capabilities_pending,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
         )
@@ -4177,7 +4230,15 @@ class HostProcess:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
         self._ws = ws
-        readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
+        readiness_task = asyncio.create_task(
+            self._harness_readiness_loop(
+                ws,
+                capabilities_pending=capabilities_pending,
+                published_configured=hello.configured_harnesses,
+                published_gateway=hello.gateway_inference,
+            ),
+            name="host-harness-readiness",
+        )
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
         # waiting on a harness probe. Cache-fresh reconnects are a no-op.
@@ -4231,10 +4292,38 @@ class HostProcess:
     async def _harness_readiness_loop(
         self,
         ws: websockets.asyncio.client.ClientConnection,
+        *,
+        capabilities_pending: bool = False,
+        published_configured: dict[str, HarnessAvailability] | None = None,
+        published_gateway: dict[str, bool] | None = None,
     ) -> None:
         """Refresh advisory capabilities without endangering the tunnel."""
-        published_configured = self._configured_harnesses
-        published_gateway = self._gateway_inference
+        if not capabilities_pending and published_configured is None and published_gateway is None:
+            published_configured = self._configured_harnesses
+            published_gateway = self._gateway_inference
+        if capabilities_pending:
+            discovery = self._capability_init_task
+            if discovery is not None:
+                try:
+                    await asyncio.shield(discovery)
+                except Exception:  # noqa: BLE001 — periodic refresh can recover
+                    _logger.warning(
+                        "Startup capability discovery failed after registration",
+                        exc_info=True,
+                    )
+            if not await self._lifecycle_is_current():
+                return
+            await ws.send(
+                encode_host_frame(
+                    HostHarnessReadinessFrame(
+                        configured_harnesses=self._configured_harnesses,
+                        gateway_inference=self._gateway_inference,
+                        capabilities_pending=False,
+                    )
+                )
+            )
+            published_configured = self._configured_harnesses
+            published_gateway = self._gateway_inference
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
@@ -4274,6 +4363,7 @@ class HostProcess:
                         HostHarnessReadinessFrame(
                             configured_harnesses=configured,
                             gateway_inference=gateway,
+                            capabilities_pending=False,
                         )
                     )
                 )

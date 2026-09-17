@@ -124,6 +124,15 @@ describe("harnessUnavailableReasonOnHost", () => {
     expect(harnessUnavailableReasonOnHost(null, hostWith({ codex: false }))).toBe(null);
   });
 
+  it("fails closed while negotiated startup discovery is pending", () => {
+    expect(
+      harnessUnavailableReasonOnHost("codex", {
+        ...hostWith(null),
+        capabilities_pending: true,
+      }),
+    ).toBe("pending");
+  });
+
   it("treats a missing key on a readiness-reporting host as unconfigured", () => {
     // Version skew: a host predating a harness reports the harnesses it knows but
     // omits the new one. It can't launch what it never lists, so a missing key on

@@ -39,6 +39,11 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# Negotiated on the WebSocket upgrade. A host uses the early-registration
+# protocol only when the server selects this subprotocol; omission keeps the
+# legacy wait-for-capabilities handshake for rolling upgrades.
+HOST_ASYNC_CAPABILITIES_SUBPROTOCOL = "omnigent.host-async-capabilities.v1"
+
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
     """Build the canonical text of a workspace-missing launch refusal.
@@ -160,6 +165,8 @@ class HostHelloFrame:
     :param interactive_shells: Ordered interactive shells installed on this
         machine, with its login shell first. ``None`` means an older host did
         not report an inventory.
+    :param capabilities_pending: Whether the readiness maps are a temporary
+        fail-closed snapshot that will be replaced after startup discovery.
     """
 
     version: str
@@ -169,6 +176,7 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     gateway_inference: dict[str, bool] | None = None
     interactive_shells: list[str] | None = None
+    capabilities_pending: bool = False
     telemetry_opt_out: bool = False
     installation_id: str | None = None
 
@@ -199,10 +207,15 @@ class HostHarnessReadinessFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host that doesn't report
         it) — never treat it as "nothing is gateway-backed".
+    :param capabilities_pending: ``False`` on the initial completion update.
+        The explicit marker permits ``configured_harnesses=None`` when the
+        best-effort probe failed, distinguishing completion from a malformed
+        legacy frame.
     """
 
-    configured_harnesses: dict[str, HarnessAvailability]
+    configured_harnesses: dict[str, HarnessAvailability] | None
     gateway_inference: dict[str, bool] | None = None
+    capabilities_pending: bool = False
 
 
 @dataclass
@@ -226,6 +239,10 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param require_capability_barrier: Whether an unresolved ``harness=None``
+        launch must wait for startup capability discovery before spawning.
+        New servers set this to preserve the legacy ordering when a new host
+        registers before advisory discovery completes.
     """
 
     request_id: str
@@ -233,6 +250,7 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
+    require_capability_barrier: bool = False
 
 
 @dataclass
@@ -1162,6 +1180,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
                 "interactive_shells": frame.interactive_shells,
+                "capabilities_pending": frame.capabilities_pending,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
             }
@@ -1181,6 +1200,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.HARNESS_READINESS.value,
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
+                "capabilities_pending": frame.capabilities_pending,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -1192,6 +1212,11 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
+                **(
+                    {"require_capability_barrier": True}
+                    if frame.require_capability_barrier
+                    else {}
+                ),
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1738,6 +1763,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
             if msg.get("interactive_shells") is not None
             else None
         ),
+        capabilities_pending=bool(msg.get("capabilities_pending", False)),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
@@ -1745,19 +1771,26 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
 
 def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     """Decode a live harness-readiness refresh frame."""
+    pending_marker = msg.get("capabilities_pending")
+    has_pending_marker = isinstance(pending_marker, bool)
     raw = msg.get("configured_harnesses")
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) and not has_pending_marker:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
     configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
-    if configured_harnesses is None:
+    if configured_harnesses is None and not has_pending_marker:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    if len(configured_harnesses) != len(raw):
+    if (
+        isinstance(raw, dict)
+        and configured_harnesses is not None
+        and len(configured_harnesses) != len(raw)
+    ):
         raise ValueError("harness readiness frame contains an unsupported availability state")
-    if not configured_harnesses:
+    if not configured_harnesses and not has_pending_marker:
         raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
     return HostHarnessReadinessFrame(
         configured_harnesses=configured_harnesses,
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        capabilities_pending=bool(pending_marker) if has_pending_marker else False,
     )
 
 
@@ -1773,6 +1806,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
+        require_capability_barrier=bool(msg.get("require_capability_barrier", False)),
     )
 
 

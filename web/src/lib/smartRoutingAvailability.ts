@@ -114,9 +114,16 @@ export function smartRoutingUnavailableReason(inputs: {
  * only an explicit ``false`` from the host is a reason to withhold it.
  */
 export function hostBacksHarnessWithGateway(
-  host: { gateway_inference?: Record<string, boolean> | null } | null | undefined,
+  host:
+    | {
+        gateway_inference?: Record<string, boolean> | null;
+        capabilities_pending?: boolean;
+      }
+    | null
+    | undefined,
   harness: string,
 ): boolean {
+  if (host?.capabilities_pending) return false;
   return host?.gateway_inference?.[harness] !== false;
 }
 

@@ -350,6 +350,18 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.session_id == "conv_abc123"
 
 
+def test_launch_runner_capability_barrier_round_trip() -> None:
+    """A new server can preserve ordering for an unresolved harness."""
+    original = HostLaunchRunnerFrame(
+        request_id="req_barrier",
+        binding_token="secret_token_barrier",
+        workspace="/Users/corey/projects/frontend",
+        require_capability_barrier=True,
+    )
+
+    assert decode_host_frame(encode_host_frame(original)) == original
+
+
 def test_launch_runner_result_frame_success_round_trip() -> None:
     """
     Verify HostLaunchRunnerResultFrame (success) survives
@@ -414,6 +426,24 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_pending_capability_frames_round_trip() -> None:
+    """Negotiated startup can publish fail-closed state and explicit completion."""
+    hello = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="corey-laptop",
+        configured_harnesses=None,
+        capabilities_pending=True,
+    )
+    assert decode_host_frame(encode_host_frame(hello)) == hello
+
+    completed = HostHarnessReadinessFrame(
+        configured_harnesses=None,
+        capabilities_pending=False,
+    )
+    assert decode_host_frame(encode_host_frame(completed)) == completed
 
 
 def test_connection_error_frame_round_trip() -> None:

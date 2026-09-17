@@ -29,6 +29,7 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -251,7 +252,13 @@ def create_host_tunnel_router(
                 )
                 return
 
-        await ws.accept()
+        requested_subprotocols = ws.scope.get("subprotocols") or []
+        selected_subprotocol = (
+            HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
+            if HOST_ASYNC_CAPABILITIES_SUBPROTOCOL in requested_subprotocols
+            else None
+        )
+        await ws.accept(subprotocol=selected_subprotocol)
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"
@@ -568,10 +575,17 @@ async def _receive_loop(
                 host_id,
                 frame.configured_harnesses,
             )
-            conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            conn.hello.configured_harnesses = (
+                dict(frame.configured_harnesses)
+                if frame.configured_harnesses is not None
+                else None
+            )
             conn.hello.gateway_inference = (
                 dict(frame.gateway_inference) if frame.gateway_inference is not None else None
             )
+            conn.hello.capabilities_pending = frame.capabilities_pending
+            if not frame.capabilities_pending:
+                conn.capabilities_ready.set()
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:

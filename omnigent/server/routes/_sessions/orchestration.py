@@ -7993,7 +7993,12 @@ def _native_subagent_wrapper_labels(
 # session landing on a missing or unauthenticated binary would fail to open its
 # terminal, so those harnesses are never offered to Smart Routing.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
-    {False, HARNESS_BINARY_MISSING, HARNESS_NEEDS_AUTH, HARNESS_VERSION_TOO_LOW}
+    {
+        False,
+        HARNESS_BINARY_MISSING,
+        HARNESS_NEEDS_AUTH,
+        HARNESS_VERSION_TOO_LOW,
+    }
 )
 
 
@@ -8249,6 +8254,14 @@ async def _reject_ungatewayed_model_routing(
     if _oss_routing_available():
         return
     host = await _routing_host_for_create(body, request, user_id)
+    if not await _wait_for_initial_host_capabilities(host, request):
+        raise OmnigentError(
+            "The selected host is still checking harness capabilities; retry shortly.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The completion frame persists the authoritative map. Re-read after the
+    # wait so routing never consumes the temporary unknown snapshot.
+    host = await _routing_host_for_create(body, request, user_id)
     if not _ungatewayed_native_harnesses(host, (harness,)):
         return
     raise OmnigentError(_ungatewayed_model_routing_error(harness), code=ErrorCode.INVALID_INPUT)
@@ -8371,6 +8384,38 @@ async def _routing_host_for_create(
         host_id=body.host_id,
         host_store=host_store,
     )
+
+
+_INITIAL_HOST_CAPABILITY_WAIT_S = 15.0
+
+
+async def _wait_for_initial_host_capabilities(
+    host: Host | None,
+    request: Request,
+) -> bool:
+    """Join negotiated host discovery before capability-dependent routing.
+
+    :returns: ``True`` when routing may consume host capability state, or
+        ``False`` when discovery did not finish within the bounded wait.
+    """
+    host_registry = getattr(request.app.state, "host_registry", None)
+    if host is None or host_registry is None:
+        return True
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _INITIAL_HOST_CAPABILITY_WAIT_S
+    while True:
+        conn = host_registry.get(host.host_id)
+        if conn is None or not conn.hello.capabilities_pending:
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        try:
+            await asyncio.wait_for(conn.capabilities_ready.wait(), timeout=remaining)
+        except TimeoutError:
+            # ``None`` plus capabilities_pending fails closed below. Keep the
+            # create bounded instead of waiting forever on a wedged host probe.
+            return False
 
 
 def _create_resolved_harness(
@@ -8553,6 +8598,9 @@ async def _resolve_fixed_native_model_routing(
     from omnigent.server.smart_routing import models_in_family, route_session_harness
 
     host = await _routing_host_for_create(body, request, user_id)
+    if not await _wait_for_initial_host_capabilities(host, request):
+        return None, None, "Host harness capabilities are still being checked; using the default."
+    host = await _routing_host_for_create(body, request, user_id)
     # Off the gateway the built-in judge answers, and the static table's
     # ``databricks-*`` ids are unreachable — the host's pre-launch catalog is the
     # only provider-accurate candidate source.
@@ -8623,6 +8671,16 @@ async def _resolve_native_smart_routing(
         route_session_harness,
     )
 
+    host = await _routing_host_for_create(body, request, user_id)
+    if not await _wait_for_initial_host_capabilities(host, request):
+        return (
+            None,
+            None,
+            None,
+            "Host harness capabilities are still being checked; retry shortly.",
+        )
+    # The completion frame persists the authoritative map. Re-read after the
+    # wait so routing never consumes the temporary unknown snapshot.
     host = await _routing_host_for_create(body, request, user_id)
     # Both arms must be gateway-backed before the WORKSPACE router may choose
     # between them: an arm off the gateway cannot run its picks, and the pick is

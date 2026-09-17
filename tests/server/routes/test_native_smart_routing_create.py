@@ -1137,6 +1137,71 @@ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
     )
 
 
+async def test_capability_dependent_routing_waits_across_host_replacement() -> None:
+    """Smart-routing gates cannot escape through a pending reconnect."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _wait_for_initial_host_capabilities,
+    )
+
+    first = SimpleNamespace(
+        hello=SimpleNamespace(capabilities_pending=True),
+        capabilities_ready=asyncio.Event(),
+    )
+    second = SimpleNamespace(
+        hello=SimpleNamespace(capabilities_pending=True),
+        capabilities_ready=asyncio.Event(),
+    )
+    current = [first]
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                host_registry=SimpleNamespace(get=lambda host_id: current[0]),
+            )
+        )
+    )
+    host = SimpleNamespace(host_id="host_1")
+    wait_task = asyncio.create_task(
+        _wait_for_initial_host_capabilities(cast("Any", host), cast("Any", request))
+    )
+    await asyncio.sleep(0)
+    assert not wait_task.done()
+
+    current[0] = second
+    first.capabilities_ready.set()
+    await asyncio.sleep(0)
+    assert not wait_task.done()
+
+    second.hello.capabilities_pending = False
+    second.capabilities_ready.set()
+    assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+
+
+async def test_capability_dependent_routing_fails_closed_on_timeout() -> None:
+    """A wedged startup probe never restores unknown-as-ready routing."""
+    from omnigent.server.routes._sessions import orchestration
+
+    conn = SimpleNamespace(
+        hello=SimpleNamespace(capabilities_pending=True),
+        capabilities_ready=asyncio.Event(),
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                host_registry=SimpleNamespace(get=lambda host_id: conn),
+            )
+        )
+    )
+    host = SimpleNamespace(host_id="host_1")
+
+    with patch.object(orchestration, "_INITIAL_HOST_CAPABILITY_WAIT_S", 0.01):
+        ready = await orchestration._wait_for_initial_host_capabilities(
+            cast("Any", host),
+            cast("Any", request),
+        )
+
+    assert ready is False
+
+
 @pytest.mark.parametrize(
     ("gateway", "named"),
     [

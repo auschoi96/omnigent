@@ -215,6 +215,15 @@ describe("hostBacksHarnessWithGateway", () => {
     expect(hostBacksHarnessWithGateway(undefined, "codex-native")).toBe(true);
     expect(hostBacksHarnessWithGateway(null, "codex-native")).toBe(true);
   });
+
+  it("withholds gateway routing during negotiated capability discovery", () => {
+    expect(
+      hostBacksHarnessWithGateway(
+        { gateway_inference: null, capabilities_pending: true },
+        "codex-native",
+      ),
+    ).toBe(false);
+  });
 });
 
 describe("smartRoutingDroppedMessage", () => {

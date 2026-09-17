@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
+    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
@@ -35,6 +36,7 @@ def _websocket_scope(
     path: str,
     *,
     client_host: str = "127.0.0.1",
+    subprotocols: list[str] | None = None,
 ) -> dict[str, object]:
     """Build an ASGI WebSocket scope for a test path.
 
@@ -53,13 +55,15 @@ def _websocket_scope(
         "headers": [],
         "client": (client_host, 50000),
         "server": ("testserver", 80),
-        "subprotocols": [],
+        "subprotocols": subprotocols or [],
     }
 
 
 async def _connect_route(
     app: FastAPI,
     path: str,
+    *,
+    subprotocols: list[str] | None = None,
 ) -> ApplicationCommunicator:
     """Connect an ASGI WebSocket communicator to the host tunnel.
 
@@ -67,10 +71,15 @@ async def _connect_route(
     :param path: WebSocket path.
     :returns: The connected ASGI communicator.
     """
-    communicator = ApplicationCommunicator(app, _websocket_scope(path))
+    communicator = ApplicationCommunicator(
+        app,
+        _websocket_scope(path, subprotocols=subprotocols),
+    )
     await communicator.send_input({"type": "websocket.connect"})
     accepted = await communicator.receive_output(timeout=1.0)
     assert accepted["type"] == "websocket.accept", f"Expected {path} to accept; got {accepted!r}"
+    if subprotocols and HOST_ASYNC_CAPABILITIES_SUBPROTOCOL in subprotocols:
+        assert accepted.get("subprotocol") == HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
     return communicator
 
 
@@ -422,6 +431,53 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     assert conn is not None
     assert conn.hello.configured_harnesses == {"pi": True}
     assert updates == [_HOST_ID]
+
+
+async def test_host_tunnel_negotiates_and_completes_async_capabilities(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """The server opts in explicitly and unblocks capability waiters on update."""
+    app, registry, store = host_app
+    comm = await _connect_route(
+        app,
+        _TUNNEL_PATH,
+        subprotocols=[HOST_ASYNC_CAPABILITIES_SUBPROTOCOL],
+    )
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHelloFrame(
+                    version="0.1.0-test",
+                    frame_protocol_version=1,
+                    name="test-laptop",
+                    configured_harnesses=None,
+                    capabilities_pending=True,
+                )
+            ),
+        }
+    )
+    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    assert conn.hello.capabilities_pending
+    assert not conn.capabilities_ready.is_set()
+    assert store.get_host(_HOST_ID).configured_harnesses is None  # type: ignore[union-attr]
+
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostHarnessReadinessFrame(
+                    configured_harnesses={"claude-native": True},
+                    capabilities_pending=False,
+                )
+            ),
+        }
+    )
+    await asyncio.wait_for(conn.capabilities_ready.wait(), timeout=1.0)
+    assert not conn.hello.capabilities_pending
+    assert store.get_host(_HOST_ID).configured_harnesses == {"claude-native": True}  # type: ignore[union-attr]
 
 
 async def test_host_tunnel_sets_offline_on_disconnect(

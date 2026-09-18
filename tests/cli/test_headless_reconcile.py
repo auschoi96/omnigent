@@ -1,7 +1,6 @@
 """Headless recovery through the real SDK's HTTP and SSE parsing paths."""
 
 import json
-from functools import partial
 
 import httpx
 import pytest
@@ -13,7 +12,7 @@ from omnigent.chat import _query_sessions_once
 @pytest.mark.parametrize("completion_stream", [2, 3], ids=["probe", "later-turn"])
 @pytest.mark.parametrize("item_status", ["completed", "incomplete"])
 async def test_headless_recovers_final_text_when_completion_event_is_missed(
-    monkeypatch: pytest.MonkeyPatch, completion_stream: int, item_status: str
+    completion_stream: int, item_status: str
 ) -> None:
     session_id = "conv_headless"
     final_text = "<!-- POLLY_REVIEW_START -->\n## Summary\nReview complete."
@@ -68,30 +67,28 @@ async def test_headless_recovers_final_text_when_completion_event_is_missed(
                     items.append(final_item)
                     snapshot["status"] = "idle"
                 events = [
+                    {"type": "session.heartbeat", "conversation_id": session_id},
                     {
                         "type": "session.status",
                         "conversation_id": session_id,
                         "status": "idle" if streams == completion_stream else "waiting",
-                    }
+                    },
                 ]
             wire = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
             return httpx.Response(200, text=wire, headers={"Content-Type": "text/event-stream"})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-    monkeypatch.setattr(
-        "omnigent_client._client.httpx.AsyncClient",
-        partial(httpx.AsyncClient, transport=httpx.MockTransport(handle)),
-    )
-    async with OmnigentClient(base_url="http://127.0.0.1") as client:
-        result = await _query_sessions_once(
-            client=client,
-            agent_name="polly",
-            tool_handler=None,
-            prompt="Review this PR",
-            session_bundle=b"bundle",
-            session_bundle_filename="agent.tar.gz",
-            runner_id="runner_test",
-        )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http_client:
+        async with OmnigentClient(base_url="http://127.0.0.1", http_client=http_client) as client:
+            result = await _query_sessions_once(
+                client=client,
+                agent_name="polly",
+                tool_handler=None,
+                prompt="Review this PR",
+                session_bundle=b"bundle",
+                session_bundle_filename="agent.tar.gz",
+                runner_id="runner_test",
+            )
 
     assert streams == completion_stream
     assert transcript_reads[0] is False

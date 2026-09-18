@@ -1580,27 +1580,36 @@ async def test_create_stream_opens_before_input_and_owns_local_cleanup() -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("event_type", "status"),
+    ("event_type", "status", "is_status_event"),
     [
-        ("response.completed", "completed"),
-        ("response.failed", "failed"),
-        ("response.incomplete", "incomplete"),
-        ("response.cancelled", "cancelled"),
+        ("response.completed", "completed", False),
+        ("response.failed", "failed", False),
+        ("response.incomplete", "incomplete", False),
+        ("response.cancelled", "cancelled", False),
+        ("session.status", "failed", True),
     ],
 )
-async def test_event_stream_stops_on_each_response_terminal(
+async def test_event_stream_stops_on_each_terminal_signal(
     event_type: str,
     status: str,
+    is_status_event: bool,
 ) -> None:
+    terminal_payload = (
+        {
+            "type": "session.status",
+            "conversation_id": "conv_abc",
+            "status": status,
+            "response_id": "resp_status",
+        }
+        if is_status_event
+        else {
+            "type": event_type,
+            "response": _completed_response_dict("resp_terminal", status),
+        }
+    )
     payloads: list[tuple[str, dict[str, Any] | str]] = [
         ("session.heartbeat", {"type": "session.heartbeat"}),
-        (
-            event_type,
-            {
-                "type": event_type,
-                "response": _completed_response_dict("resp_terminal", status),
-            },
-        ),
+        (event_type, terminal_payload),
         (
             "response.output_text.delta",
             {"type": "response.output_text.delta", "delta": "must not be yielded"},
@@ -1618,22 +1627,24 @@ async def test_event_stream_stops_on_each_response_terminal(
         await client.aclose()
 
     assert [event.type for event in observed] == [event_type]
-    assert events.last_response_id == "resp_terminal"
+    assert events.last_response_id == ("resp_status" if is_status_event else "resp_terminal")
     assert events.terminal_event is observed[0]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("phase", "stream"),
+    ("phase", "stream", "input_value"),
     [
-        ("stream_open", True),
-        ("input_submit", True),
-        ("snapshot_retrieve", False),
+        ("stream_open", True, "start once"),
+        ("input_submit", True, "start once"),
+        ("snapshot_retrieve", False, "start once"),
+        ("snapshot_retrieve", False, None),
     ],
 )
 async def test_create_composition_failure_retains_session_without_compensation(
     phase: str,
     stream: bool,
+    input_value: str | None,
 ) -> None:
     requests: list[httpx.Request] = []
     stream_payloads = [
@@ -1670,9 +1681,9 @@ async def test_create_composition_failure_retains_session_without_compensation(
     try:
         with pytest.raises(SessionCompositionError) as raised:
             if phase == "snapshot_retrieve":
-                await ns.create(b"bundle", input="start once")
+                await ns.create(b"bundle", input=input_value)
             else:
-                await ns.create(agent_id="ag_abc", input="start once", stream=True)
+                await ns.create(agent_id="ag_abc", input=input_value, stream=True)
         if stream:
             assert byte_stream.closed is True
     finally:
@@ -1683,7 +1694,7 @@ async def test_create_composition_failure_retains_session_without_compensation(
     assert error.session_id == "conv_abc"
     assert error.original_exception is error.__cause__
     event_posts = [request for request in requests if request.url.path.endswith("/events")]
-    assert len(event_posts) == (0 if phase == "stream_open" else 1)
+    assert len(event_posts) == (0 if phase == "stream_open" or input_value is None else 1)
     assert all(request.method != "DELETE" for request in requests)
 
 

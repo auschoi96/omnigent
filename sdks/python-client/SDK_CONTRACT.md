@@ -776,9 +776,10 @@ These are behavioral fixtures, not promises to copy OpenAI wire types.
    Examples perform explicit cleanup with `sessions.delete(session_id)`.
 9. For a standalone `events.stream(session_id)` manager, context entry opens
    the stream and consumes readiness before a following `events.create` call.
-   Iteration stops only on explicit OmniGent terminal event types; there is no
-   fabricated `is_root_terminal` because current turn events carry no durable
-   turn or root/subagent identity.
+   Iteration stops on response terminal events and on `session.status: failed`,
+   which is the only terminal signal for setup failures. It does not stop on
+   idle or waiting status, and there is no fabricated `is_root_terminal`
+   because current turn events carry no durable turn or root/subagent identity.
 10. Durable recovery opens a replacement stream, retrieves session/items, and
     merges by item `id` and `response_id`. The SDK does not automate replay or
     resend writes.

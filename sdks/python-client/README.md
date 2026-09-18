@@ -33,9 +33,11 @@ async with OmnigentClient(base_url="http://localhost:8080") as client:
         input="Summarize this repository.",
         stream=True,
     )
+    session_id = events.session_id
     async with events:
         async for event in events:
             print(event.to_json())
+    await client.agents.sessions.delete(session_id)
 ```
 
 The stream is a live tail, not replayable history. If it disconnects, open a

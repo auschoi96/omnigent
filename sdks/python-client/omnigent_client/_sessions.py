@@ -54,6 +54,7 @@ from omnigent.protocol import (
     SessionList,
     SessionMessage,
     SessionResponse,
+    SessionStatusEvent,
     UnknownEvent,
     UpdateSessionRequest,
 )
@@ -170,8 +171,8 @@ class AsyncSessionEventStream:
     Context entry opens a standalone stream through its readiness heartbeat.
     Streams returned by ``create(stream=True)`` are already open; entering
     their context only establishes deterministic local ownership. Iteration
-    stops after yielding a response terminal event. Closing never interrupts
-    or deletes the remote session.
+    stops after yielding a response terminal event or a failed session status.
+    Closing never interrupts or deletes the remote session.
     """
 
     def __init__(
@@ -188,7 +189,12 @@ class AsyncSessionEventStream:
         self.session_id = session_id
         self.last_response_id: str | None = None
         self.terminal_event: (
-            CompletedEvent | FailedEvent | IncompleteEvent | CancelledEvent | None
+            CompletedEvent
+            | FailedEvent
+            | IncompleteEvent
+            | CancelledEvent
+            | SessionStatusEvent
+            | None
         ) = None
         self._sessions = sessions
         self._idle = idle
@@ -235,12 +241,17 @@ class AsyncSessionEventStream:
             await self.aclose()
             raise
 
+        response_id = getattr(event, "response_id", None)
         response = getattr(event, "response", None)
-        response_id = getattr(response, "id", None)
+        nested_response_id = getattr(response, "id", None)
+        if isinstance(nested_response_id, str):
+            response_id = nested_response_id
         if isinstance(response_id, str):
             self.last_response_id = response_id
 
-        if isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
+        if isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES) or (
+            isinstance(event, SessionStatusEvent) and event.status == "failed"
+        ):
             self.terminal_event = event
             await self.aclose()
         return event
@@ -984,8 +995,6 @@ class SessionsNamespace:
                 extra_query=extra_query,
             )
         except Exception as exc:
-            if input is None:
-                raise
             raise SessionCompositionError(
                 phase="snapshot_retrieve",
                 session_id=session_id,

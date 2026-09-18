@@ -528,7 +528,6 @@ def _coerce_to_policy_result(raw: object, *, spec_name: str) -> PolicyResult:
             reason=getattr(raw, "reason", None),
             set_labels=(dict(raw_set_labels) if isinstance(raw_set_labels, dict) else None),
             state_updates=_coerce_state_updates(raw_state_updates, spec_name=spec_name),
-            interrupt_subagents=bool(getattr(raw, "interrupt_subagents", False)),
         )
     raise TypeError(
         f"FunctionPolicy {spec_name!r} returned unsupported type "
@@ -548,8 +547,7 @@ def _policy_result_from_dict(
     Accepts the flat shape::
 
         {"result": "ALLOW"|"DENY"|"ASK", "reason": "...",
-         "data": ..., "state_updates": [...], "set_labels": {...},
-         "interrupt_subagents": bool}
+         "data": ..., "state_updates": [...], "set_labels": {...}}
 
     :param raw: The callable's dict return.
     :param spec_name: Policy name for error messages.
@@ -585,7 +583,6 @@ def _policy_result_from_dict(
         data=raw.get("data"),
         state_updates=_coerce_state_updates(raw_state_updates, spec_name=spec_name),
         set_labels=dict(raw_set_labels) if isinstance(raw_set_labels, dict) else None,
-        interrupt_subagents=bool(raw.get("interrupt_subagents", False)),
     )
 
 

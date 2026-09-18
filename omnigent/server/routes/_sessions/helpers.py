@@ -68,7 +68,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
-from omnigent.policies.types import EvaluationContext
+from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
@@ -275,6 +275,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.types import (
     AgentSpec,
+    FunctionPolicySpec,
     Phase,
     PolicyAction,
 )
@@ -6451,26 +6452,22 @@ async def _forward_session_change_to_runner_impl(
     return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
 
 
-async def _interrupt_running_subagents(
+async def _interrupt_subagents_on_cost_budget_deny(
     session_id: str,
     conv: Conversation,
     conversation_store: ConversationStore,
     runner_router: Any,
+    *,
+    engine: PolicyEngine,
+    result: PolicyResult,
 ) -> None:
     """
-    Best-effort interrupt of every other sub-agent in this session's spawn tree.
+    Interrupt sub-agents automatically when a session hard cost cap denies.
 
-    Enforcement arm of a DENY whose policy set ``interrupt_subagents`` (a
-    block-all budget cap): the deny stops only the gated call, while an
-    unattended sub-agent re-checks policies at its own next gate event —
-    between gates a looping child runs freely past the cap. Push the same
-    ``{"type": "interrupt"}`` the human-decline path forwards to every
-    non-archived sub-agent in the tree except the denied session itself
-    (its gated call is already blocked). The tree root is never targeted:
-    its turns are human-initiated and gate themselves.
-
-    Forwards are concurrent and best-effort — a child without a bound
-    runner is silently skipped by the forwarder.
+    A tool denial can leave the child's model loop running, so include the
+    evaluated child as well as its siblings and descendants. Skip the root
+    and archived sessions. Downgrade gates still permit cheaper model work.
+    Runner forwards are concurrent and best-effort.
 
     :param session_id: The session whose gate produced the DENY,
         e.g. ``"conv_abc123"``.
@@ -6479,17 +6476,26 @@ async def _interrupt_running_subagents(
     :param conversation_store: Store to load the spawn tree from.
     :param runner_router: The server's ``RunnerRouter`` (may be ``None``
         in tests / in-process setups; the forwarder falls back).
+    :param engine: Engine owning the evaluated policy specs.
+    :param result: Composed policy decision, including the deciding policy.
     """
     from omnigent.runtime.policies.builder import load_session_tree
+
+    if result.action != PolicyAction.DENY:
+        return
+    spec = engine.denying_policy_spec
+    if (
+        not isinstance(spec, FunctionPolicySpec)
+        or spec.function is None
+        or spec.function.path != "omnigent.policies.builtins.cost.cost_budget"
+        or (spec.function.arguments or {}).get("expensive_models")
+    ):
+        return
 
     tree = await asyncio.to_thread(
         load_session_tree, session_id, conversation_store, conv.root_conversation_id
     )
-    targets = [
-        c.id
-        for c in tree
-        if c.id != session_id and c.parent_conversation_id is not None and not c.archived
-    ]
+    targets = [c.id for c in tree if c.parent_conversation_id is not None and not c.archived]
     if not targets:
         return
     _logger.info(

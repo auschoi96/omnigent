@@ -162,6 +162,19 @@ class PolicyEngine:
         self._model = initial_model
         self._store = conversation_store
         self._llm_client = llm_client
+        self._denying_policy_spec: PolicySpec | None = None
+
+    @property
+    def denying_policy_spec(self) -> PolicySpec | None:
+        """Return the policy that denied the latest evaluation, if any.
+
+        Names can repeat across policy scopes, so enforcement must use the
+        actual evaluated spec rather than resolving the deny's display name.
+
+        :returns: The denying spec, or ``None`` before evaluation and after
+            an ALLOW or ASK result.
+        """
+        return self._denying_policy_spec
 
     @property
     def labels(self) -> dict[str, str]:
@@ -329,6 +342,7 @@ class PolicyEngine:
             result here — callers receive ALLOW / ASK / DENY
             directly.
         """
+        self._denying_policy_spec = None
         accumulated: dict[str, str] = {}
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
@@ -361,13 +375,13 @@ class PolicyEngine:
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
             if result.action == PolicyAction.DENY:
+                self._denying_policy_spec = policy.spec
                 return self._compose_deny(
                     policy.spec.name,
                     result.reason,
                     accumulated,
                     accumulated_state,
                     read_only=read_only,
-                    interrupt_subagents=result.interrupt_subagents,
                 )
             if result.data is not None:
                 composed_data = result.data
@@ -413,7 +427,6 @@ class PolicyEngine:
         accumulated_state: list[StateUpdate],
         *,
         read_only: bool = False,
-        interrupt_subagents: bool = False,
     ) -> PolicyResult:
         """
         Build the DENY short-circuit result.
@@ -436,10 +449,6 @@ class PolicyEngine:
             effects (label writes and state updates). The
             returned result still carries ``set_labels`` so the
             caller can see what *would* have been written.
-        :param interrupt_subagents: The DENYing policy's request to
-            interrupt running sub-agents in the spawn tree, carried
-            through so the enforcement site (which owns runner
-            transport) can act on it.
         :returns: Composed DENY :class:`PolicyResult`.
         """
         if not read_only:
@@ -451,7 +460,6 @@ class PolicyEngine:
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
             deciding_policies=[deciding_policy],
-            interrupt_subagents=interrupt_subagents,
         )
 
     def _should_fire(

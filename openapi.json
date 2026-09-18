@@ -1316,6 +1316,7 @@
         "type": "object"
       },
       "CopyFilesRequest": {
+        "additionalProperties": false,
         "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; `source_session_id`\nmust be a STRICT ancestor of the destination up its\n`parent_conversation_id` chain (spawn lineage) \u2014 the destination may\nnot name itself as the source. The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.",
         "properties": {
           "file_ids": {
@@ -5455,6 +5456,7 @@
         "type": "object"
       },
       "SessionGitOptions": {
+        "additionalProperties": false,
         "description": "Git worktree options for `POST /v1/sessions`.\n\nRequires `host_id` to be set (and therefore `workspace`, which\nis interpreted as the source repository directory). Two modes,\nselected by `existing_worktree`:\n\n- **create** (default): the server creates a git worktree on the\n  host for a new branch and starts the runner in that worktree\n  instead of the picked directory.\n- **bind** (`existing_worktree=True`): `workspace` already IS a\n  pre-existing worktree; no worktree is created. `branch_name` is\n  recorded as the session's `git_branch` for display and opt-in\n  cleanup, and `base_branch` must not be set.\n\nSee designs/SESSION_GIT_WORKTREE.md.",
         "properties": {
           "base_branch": {
@@ -6418,7 +6420,6 @@
         "type": "object"
       },
       "SessionResourceObject": {
-        "additionalProperties": false,
         "description": "API representation of a session-scoped resource handle.",
         "properties": {
           "environment": {

@@ -11,9 +11,10 @@ server is listening and healthy.
 
 from __future__ import annotations
 
+import httpx
 import pytest
-from omnigent_client import OmnigentClient
-from omnigent_client._http import is_loopback_url
+from omnigent_client import Omnigent, OmnigentClient
+from omnigent_client._http import _AsyncHTTPClient, _SyncHTTPClient, is_loopback_url
 
 
 @pytest.mark.parametrize(
@@ -71,8 +72,9 @@ def test_remote_urls_are_not_loopback(url: str) -> None:
         ("https://example.databricksapps.com", True),
     ],
 )
-def test_client_bypasses_env_proxies_only_for_loopback(
-    server_url: str, expected_trust_env: bool
+@pytest.mark.asyncio
+async def test_client_bypasses_env_proxies_only_for_loopback(
+    server_url: str, expected_trust_env: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The client wires loopback detection into httpx's ``trust_env``.
 
@@ -80,6 +82,54 @@ def test_client_bypasses_env_proxies_only_for_loopback(
     server dies on a proxied connection, which surfaces as a crash rather
     than anything the user can act on.
     """
-    client = OmnigentClient(base_url=server_url)
+    for name in ("ALL_PROXY", "NO_PROXY", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8765")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8765")
 
-    assert client._http.trust_env is expected_trust_env
+    async_client = OmnigentClient(base_url=server_url)
+    sync_client = Omnigent(base_url=server_url)
+    try:
+        assert async_client._http.trust_env is expected_trust_env
+        assert sync_client._http.trust_env is expected_trust_env
+        assert bool(async_client._http._mounts) is expected_trust_env
+        assert bool(sync_client._http._mounts) is expected_trust_env
+    finally:
+        await async_client.close()
+        sync_client.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_retries_apply_to_safe_reads_but_not_writes() -> None:
+    """Retries cannot replay a write while preserving proxy-aware HTTPX setup."""
+    sync_attempts: list[str] = []
+
+    def sync_handler(request: httpx.Request) -> httpx.Response:
+        sync_attempts.append(request.method)
+        if len(sync_attempts) < 3 or request.method == "POST":
+            raise httpx.ConnectError("connect failed", request=request)
+        return httpx.Response(200, request=request)
+
+    with _SyncHTTPClient(
+        max_connect_retries=2, transport=httpx.MockTransport(sync_handler)
+    ) as sync_client:
+        assert sync_client.get("http://srv").status_code == 200
+        with pytest.raises(httpx.ConnectError):
+            sync_client.post("http://srv")
+    assert sync_attempts == ["GET", "GET", "GET", "POST"]
+
+    async_attempts: list[str] = []
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        async_attempts.append(request.method)
+        if len(async_attempts) < 3 or request.method == "POST":
+            raise httpx.ConnectError("connect failed", request=request)
+        return httpx.Response(200, request=request)
+
+    async with _AsyncHTTPClient(
+        max_connect_retries=2, transport=httpx.MockTransport(async_handler)
+    ) as async_client:
+        assert (await async_client.get("http://srv")).status_code == 200
+        with pytest.raises(httpx.ConnectError):
+            await async_client.post("http://srv")
+    assert async_attempts == ["GET", "GET", "GET", "POST"]

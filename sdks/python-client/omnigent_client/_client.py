@@ -2,73 +2,88 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any, Literal, overload
+from collections.abc import Callable, Mapping
+from typing import Any, Literal, cast, overload
 
 import httpx
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.protocol import AgentObject, PaginatedList
+from omnigent.trusted_origin import OMNIGENT_INTERNAL_WS_ORIGIN
 
-from ._errors import OmnigentError
 from ._files import FilesNamespace
-from ._http import is_loopback_url
+from ._http import (
+    _AsyncHTTPClient,
+    _InjectedClientLease,
+    _InjectedClientPolicy,
+    apply_injected_client_policy,
+    is_loopback_url,
+    redirect_stays_on_origin,
+    refuse_cross_origin_redirect_async,
+    restore_injected_client_policy,
+)
+from ._pagination import AsyncCursorPage
 from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
 from ._session import Session
-from ._sessions import SessionsNamespace
+from ._sessions import Headers, Query, SessionsNamespace, Timeout, _options, _query
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
 
 
-def _port_or_default(url: httpx.URL) -> int | None:
-    """The URL's explicit port, or its scheme's default (80/443)."""
-    if url.port is not None:
-        return url.port
-    return {"http": 80, "https": 443}.get(url.scheme)
-
-
 def _redirect_stays_on_origin(request_url: httpx.URL, location: str) -> bool:
-    """True when a redirect target keeps the request's origin.
-
-    Same scheme/host/port (default ports normalized), or the default-port
-    http→https upgrade (80→443) on the same host — the same rule httpx's
-    ``_is_https_redirect`` uses to keep auth headers across a redirect.
-    """
-    try:
-        target = request_url.join(location)
-    except httpx.InvalidURL:
-        return False
-    if target.host != request_url.host:
-        return False
-    if target.scheme == request_url.scheme and _port_or_default(target) == _port_or_default(
-        request_url
-    ):
-        return True
-    return (
-        request_url.scheme == "http"
-        and target.scheme == "https"
-        and _port_or_default(request_url) == 80
-        and _port_or_default(target) == 443
-    )
+    """Compatibility wrapper for the neutral shared redirect policy."""
+    return redirect_stays_on_origin(request_url, location)
 
 
-async def _refuse_cross_origin_redirects(response: httpx.Response) -> None:
-    """Response hook: only follow redirects on the request's own origin.
+class AsyncAgentsResource:
+    """Read-only built-in agent catalog and its session resources."""
 
-    Keeps caller-supplied auth headers and request bodies from being
-    forwarded to a foreign host by a redirecting gateway, and blocks
-    https→http downgrades. Cross-origin hops fail loud instead.
-    """
-    if not response.has_redirect_location:
-        return
-    location = response.headers["location"]
-    if _redirect_stays_on_origin(response.request.url, location):
-        return
-    raise OmnigentError(
-        f"refusing to follow a cross-origin redirect (status {response.status_code}) "
-        f"to {location}",
-        response.status_code,
-    )
+    def __init__(
+        self, http: httpx.AsyncClient, base_url: str, sessions: SessionsNamespace
+    ) -> None:
+        self._http = http
+        self._base = base_url
+        self.sessions = sessions
+
+    async def list(
+        self,
+        *,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: Literal["asc", "desc"] = "desc",
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncCursorPage[AgentObject]:
+        params = _query(extra_query, limit=limit, order=order, after=after, before=before)
+        response = await self._http.get(
+            f"{self._base}/v1/agents", params=params, **_options(timeout, extra_headers)
+        )
+        from ._errors import raise_for_status, require_json_object, response_body
+
+        raise_for_status(response.status_code, response_body(response))
+        page = PaginatedList.model_validate(require_json_object(response, "GET /v1/agents"))
+        data = [AgentObject.model_validate(item) for item in page.data]
+
+        async def next_page(cursor: str) -> AsyncCursorPage[AgentObject]:
+            return await self.list(
+                limit=limit,
+                after=cursor,
+                before=before,
+                order=order,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+
+        return AsyncCursorPage(
+            data,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+            fetch_next_page=next_page,
+        )
 
 
 class OmnigentClient:
@@ -118,10 +133,15 @@ class OmnigentClient:
         self,
         base_url: str,
         *,
-        headers: dict[str, str] | None = None,
-        auth: httpx.Auth | None = None,
-        timeout: float = 30.0,
+        auth: httpx.Auth | tuple[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+        cookies: Any = None,
+        timeout: float | httpx.Timeout = 30.0,
+        max_retries: int = 2,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
+        if max_retries < 0:
+            raise ValueError("max_retries must be non-negative")
         self._base_url = base_url.rstrip("/")
         # Announce this as a first-party non-browser client via the sentinel
         # Origin. The server's require_trusted_origin CSRF guard on the
@@ -129,29 +149,68 @@ class OmnigentClient:
         # requires a trusted Origin; the SDK sends none of its own, so the
         # sentinel is what lets it through. Caller-supplied headers win on
         # conflict (so an explicit Origin override is still honored).
-        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
-        if headers:
-            default_headers.update(headers)
-        self._http = httpx.AsyncClient(
-            headers=default_headers,
-            auth=auth,
-            timeout=httpx.Timeout(timeout),
-            # Follow proxy/gateway redirects (3xx) transparently, streams
-            # included, but only on the configured origin: the response hook
-            # refuses cross-origin hops so headers and bodies never leave
-            # the host the caller configured. httpx raises TooManyRedirects
-            # on loops.
-            follow_redirects=True,
-            event_hooks={"response": [_refuse_cross_origin_redirects]},
-            # A proxy cannot reach our loopback server, so bypass the
-            # environment for local targets. Loopback is plain HTTP with
-            # explicit headers, so losing netrc/CA env with it costs nothing.
-            trust_env=not is_loopback_url(self._base_url),
-        )
+        self._owns_http = http_client is None
+        self._http: httpx.AsyncClient
+        self._injected_http: httpx.AsyncClient | None = None
+        self._injected_client_lease: _InjectedClientLease | None = None
+        self._injected_client_policy: _InjectedClientPolicy | None = None
+        if http_client is None:
+            default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+            if headers:
+                default_headers.update(headers)
+            self._http = _AsyncHTTPClient(
+                max_connect_retries=max_retries,
+                headers=default_headers,
+                auth=auth,
+                cookies=cookies,
+                timeout=timeout,
+                # Follow proxy/gateway redirects (3xx) transparently, streams
+                # included, but only on the configured origin: the response hook
+                # refuses cross-origin hops so headers and bodies never leave
+                # the host the caller configured. httpx raises TooManyRedirects
+                # on loops.
+                follow_redirects=True,
+                event_hooks={"response": [refuse_cross_origin_redirect_async]},
+                # A proxy cannot reach our loopback server, so bypass the
+                # environment for local targets. Loopback is plain HTTP with
+                # explicit headers, so losing netrc/CA env with it costs nothing.
+                trust_env=not is_loopback_url(self._base_url),
+            )
+        else:
+            if headers is not None or auth is not None or cookies is not None:
+                raise ValueError(
+                    "headers, auth, and cookies must be configured on an injected http_client"
+                )
+            if timeout != 30.0 or max_retries != 2:
+                raise ValueError(
+                    "timeout and max_retries must be configured on an injected http_client"
+                )
+            self._injected_http = http_client
+            self._injected_client_lease = _InjectedClientLease(http_client)
+            self._http = cast(httpx.AsyncClient, self._injected_client_lease)
+            self._injected_client_policy = apply_injected_client_policy(
+                http_client,
+                origin=OMNIGENT_INTERNAL_WS_ORIGIN,
+                response_hook=refuse_cross_origin_redirect_async,
+            )
 
-        self.sessions = SessionsNamespace(self._http, self._base_url)
-        self.files = FilesNamespace(self._http, self._base_url)
-        self.responses = ResponsesNamespace(self._http, self._base_url)
+        try:
+            self.sessions = SessionsNamespace(self._http, self._base_url)
+            self.agents = AsyncAgentsResource(self._http, self._base_url, self.sessions)
+            self.files = FilesNamespace(self._http, self._base_url)
+            self.responses = ResponsesNamespace(self._http, self._base_url)
+        except BaseException:
+            if self._injected_client_policy is not None:
+                assert self._injected_http is not None
+                restore_injected_client_policy(
+                    self._injected_http,
+                    self._injected_client_policy,
+                    origin=OMNIGENT_INTERNAL_WS_ORIGIN,
+                )
+                self._injected_client_policy = None
+            if self._injected_client_lease is not None:
+                self._injected_client_lease.close()
+            raise
 
     def session(
         self,
@@ -369,7 +428,18 @@ class OmnigentClient:
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
-        await self._http.aclose()
+        if self._owns_http:
+            await self._http.aclose()
+        elif self._injected_client_policy is not None:
+            assert self._injected_http is not None
+            assert self._injected_client_lease is not None
+            self._injected_client_lease.close()
+            restore_injected_client_policy(
+                self._injected_http,
+                self._injected_client_policy,
+                origin=OMNIGENT_INTERNAL_WS_ORIGIN,
+            )
+            self._injected_client_policy = None
 
     async def __aenter__(self) -> OmnigentClient:
         return self

@@ -1382,10 +1382,10 @@ class _FakeSessionsApi:
         self._captured["create"] = {"workspace": workspace, "filename": filename}
         return SimpleNamespace(id="conv_created")
 
-    async def fork(self, session_id: str) -> dict[str, str]:
+    async def fork(self, session_id: str) -> SimpleNamespace:
         """Record a fork and return the new (fork) session id."""
         self._captured["fork"] = session_id
-        return {"id": "conv_forked"}
+        return SimpleNamespace(id="conv_forked")
 
 
 class _FakeSdkClient:

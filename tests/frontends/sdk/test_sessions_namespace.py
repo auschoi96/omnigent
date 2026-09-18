@@ -22,27 +22,36 @@ What each test claims to prove (and what failure indicates):
   ``_INTERRUPT_TYPE`` matches. Failure means the cancel path is
   silently broken.
 * ``test_stream_*``: that the SSE parser yields typed
-  :data:`ServerStreamEvent` instances and that malformed/unknown
-  payloads are skipped without aborting iteration. Failure means a
-  schema drift between server and SDK silently drops events.
+  :data:`ServerStreamEvent` instances, preserves unknown event
+  discriminators, and skips malformed payloads without aborting
+  iteration. Failure means schema drift silently loses events.
 * ``test_*_404``: that the namespace propagates :class:`OmnigentError`
   for non-2xx responses; failure means errors are silently swallowed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable, Iterable
-from typing import Any
+from collections.abc import AsyncIterator, Callable, Iterable
+from typing import Any, cast
 
 import httpx
 import pytest
+from omnigent_client import (
+    NOT_GIVEN,
+    AsyncSessionEventStream,
+    SessionCompositionError,
+    SessionMessage,
+)
+from omnigent_client._client import AsyncAgentsResource
 from omnigent_client._errors import OmnigentError
 from omnigent_client._sessions import (
     Session,
     SessionsNamespace,
 )
 
+from omnigent.protocol import Interrupt, MessageData, UnknownEvent
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -93,6 +102,18 @@ def _format_sse_lines(events: Iterable[tuple[str, dict[str, Any] | str]]) -> byt
     return "".join(parts).encode("utf-8")
 
 
+class _TrackedAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.content
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 def _session_response_body(
     session_id: str = "conv_abc",
     agent_id: str = "ag_abc",
@@ -115,6 +136,35 @@ def _session_response_body(
         "created_at": 1700000000,
         "updated_at": 1700000042,
         "items": items if items is not None else [],
+    }
+
+
+def _message_item(
+    item_id: str,
+    *,
+    role: str,
+    text: str,
+    response_id: str,
+) -> dict[str, Any]:
+    """Build the nested conversation-item shape returned in snapshots."""
+    data: dict[str, Any] = {
+        "role": role,
+        "content": [
+            {
+                "type": "input_text" if role == "user" else "output_text",
+                "text": text,
+            }
+        ],
+    }
+    if role == "assistant":
+        data["model"] = "test-agent"
+    return {
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "response_id": response_id,
+        "created_at": 1700000042,
+        "data": data,
     }
 
 
@@ -148,8 +198,15 @@ async def test_create_posts_bundle_and_returns_typed_session() -> None:
             b"bundle-bytes",
             filename="agent.tar.gz",
             title="debug title",
+            project_id="project_123",
             labels={"env": "test"},
             reasoning_effort="high",
+            host_id="host_123",
+            workspace="https://example.com/repo.git",
+            terminal_launch_args=["--flag"],
+            parent_session_id="parent_123",
+            host_type="managed",
+            sandbox_provider="sandbox_1",
         )
     finally:
         await client.aclose()
@@ -163,9 +220,16 @@ async def test_create_posts_bundle_and_returns_typed_session() -> None:
     assert str(captured["content_type"]).startswith("multipart/form-data; boundary=")
     body = bytes(captured["body"])
     assert b'name="metadata"' in body
-    assert (
-        b'{"title": "debug title", "labels": {"env": "test"}, "reasoning_effort": "high"}' in body
-    )
+    assert b'"title": "debug title"' in body
+    assert b'"project_id": "project_123"' in body
+    assert b'"labels": {"env": "test"}' in body
+    assert b'"reasoning_effort": "high"' in body
+    assert b'"host_id": "host_123"' in body
+    assert b'"workspace": "https://example.com/repo.git"' in body
+    assert b'"terminal_launch_args": ["--flag"]' in body
+    assert b'"parent_session_id": "parent_123"' in body
+    assert b'"host_type": "managed"' in body
+    assert b'"sandbox_provider": "sandbox_1"' in body
     assert b'name="bundle"; filename="agent.tar.gz"' in body
     assert b"bundle-bytes" in body
 
@@ -229,7 +293,14 @@ async def test_get_returns_typed_session() -> None:
         return httpx.Response(
             200,
             json=_session_response_body(
-                items=[{"id": "msg_1", "type": "message"}],
+                items=[
+                    _message_item(
+                        "msg_1",
+                        role="user",
+                        text="hello",
+                        response_id="resp_1",
+                    )
+                ],
             ),
         )
 
@@ -240,9 +311,9 @@ async def test_get_returns_typed_session() -> None:
         await client.aclose()
 
     assert isinstance(session, Session)
-    # items round-trip as raw dicts (heterogeneous, intentionally
-    # un-modeled per the namespace docstring).
-    assert session.items == [{"id": "msg_1", "type": "message"}]
+    assert session.items[0].id == "msg_1"
+    assert isinstance(session.items[0].data, MessageData)
+    assert session.items[0].data.content[0]["text"] == "hello"
     assert session.updated_at == 1700000042
 
 
@@ -547,7 +618,13 @@ async def test_post_event_404_raises() -> None:
     ns, client = _make_namespace(handler)
     try:
         with pytest.raises(OmnigentError):
-            await ns.post_event("conv_x", {"type": "message", "data": {}})
+            await ns.post_event(
+                "conv_x",
+                {
+                    "type": "message",
+                    "data": {"role": "user", "content": []},
+                },
+            )
     finally:
         await client.aclose()
 
@@ -638,9 +715,54 @@ async def test_stream_yields_typed_events_in_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_skips_malformed_and_unknown_events() -> None:
+async def test_open_stream_ready_establishes_get_and_consumes_heartbeat() -> None:
+    """The public manager opens through readiness before a following write."""
+    requests: list[str] = []
     payloads: list[tuple[str, dict[str, Any] | str]] = [
-        # Unknown discriminator — should be logged and skipped.
+        ("session.heartbeat", {"type": "session.heartbeat"}),
+        (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "after ready"},
+        ),
+        ("done", "[DONE]"),
+    ]
+    byte_stream = _TrackedAsyncByteStream(_format_sse_lines(payloads))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.path}")
+        if request.method == "POST":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            200,
+            stream=byte_stream,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        async with ns.events.stream("conv_abc") as stream:
+            assert requests == ["GET /v1/sessions/conv_abc/stream"]
+            await ns.events.create(
+                "conv_abc",
+                events=SessionMessage.text("after subscribe"),
+            )
+            event = await stream.__anext__()
+        assert byte_stream.closed is True
+    finally:
+        await client.aclose()
+
+    assert requests == [
+        "GET /v1/sessions/conv_abc/stream",
+        "POST /v1/sessions/conv_abc/events",
+    ]
+    assert isinstance(event, OutputTextDeltaEvent)
+    assert event.delta == "after ready"
+
+
+@pytest.mark.asyncio
+async def test_stream_skips_malformed_and_preserves_unknown_events() -> None:
+    payloads: list[tuple[str, dict[str, Any] | str]] = [
+        # Unknown discriminator — preserved for forward compatibility.
         (
             "made.up.event",
             {"type": "made.up.event", "data": "ignored"},
@@ -669,14 +791,12 @@ async def test_stream_skips_malformed_and_unknown_events() -> None:
     finally:
         await client.aclose()
 
-    # Exactly one event survives — the well-formed
-    # OutputTextDeltaEvent. If 0, the adapter is too strict and a
-    # malformed event is killing the iteration. If 2+, an unknown
-    # event leaked through, indicating the discriminator validation
-    # was bypassed.
-    assert len(events) == 1
-    assert isinstance(events[0], OutputTextDeltaEvent)
-    assert events[0].delta == "ok"
+    assert len(events) == 2
+    assert isinstance(events[0], UnknownEvent)
+    assert events[0].type == "made.up.event"
+    assert events[0].raw == {"type": "made.up.event", "data": "ignored"}
+    assert isinstance(events[1], OutputTextDeltaEvent)
+    assert events[1].delta == "ok"
 
 
 @pytest.mark.asyncio
@@ -798,7 +918,14 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
             # GET sees it — matches the real server, which writes the
             # queued item before responding 202.
             if body.get("type") == "message":
-                history.append({"type": "message", "data": body["data"]})
+                history.append(
+                    _message_item(
+                        f"msg_user_{len(history)}",
+                        role="user",
+                        text=body["data"]["content"][0]["text"],
+                        response_id=f"resp_input_{len(history)}",
+                    )
+                )
             return httpx.Response(202, json={"queued": True})
         raise AssertionError(
             f"Unexpected request: {method} {url} (body={request.content!r})",
@@ -920,15 +1047,12 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
         # ``conv_store.append`` after the workflow's
         # response.completed fires — same observable result.
         history.append(
-            {
-                "type": "message",
-                "data": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": turn1_assistant_text},
-                    ],
-                },
-            },
+            _message_item(
+                "msg_assistant_1",
+                role="assistant",
+                text=turn1_assistant_text,
+                response_id="resp_t1",
+            )
         )
 
         # Turn 1 stream invariants. If any of these fail, the SDK
@@ -980,7 +1104,8 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
         # stream's delta concat — proves the live + durable views
         # are the same data.
         assistant_item = post_turn_1_items[1]
-        assert assistant_item["data"]["content"][0]["text"] == turn1_assistant_text, (
+        assert isinstance(assistant_item.data, MessageData)
+        assert assistant_item.data.content[0]["text"] == turn1_assistant_text, (
             "The assistant text returned by GET must match the live "
             "stream's delta concat. If they diverge, the SDK's view "
             "of history is inconsistent with what it just observed."
@@ -1003,15 +1128,12 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
             turn2_events.append(event)
 
         history.append(
-            {
-                "type": "message",
-                "data": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": turn2_assistant_text},
-                    ],
-                },
-            },
+            _message_item(
+                "msg_assistant_2",
+                role="assistant",
+                text=turn2_assistant_text,
+                response_id="resp_t2",
+            )
         )
 
         turn2_text = "".join(e.delta for e in turn2_events if isinstance(e, OutputTextDeltaEvent))
@@ -1036,8 +1158,10 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
         # persistence invariant the spec promises: clients can
         # always reconstruct full session state via GET, even
         # across stream disconnects.
-        assert final_items[1]["data"]["content"][0]["text"] == turn1_assistant_text
-        assert final_items[3]["data"]["content"][0]["text"] == turn2_assistant_text
+        assert isinstance(final_items[1].data, MessageData)
+        assert final_items[1].data.content[0]["text"] == turn1_assistant_text
+        assert isinstance(final_items[3].data, MessageData)
+        assert final_items[3].data.content[0]["text"] == turn2_assistant_text
 
         # ── Cross-check: stream-1 view ⊆ final history ────────────
         # The user-facing invariant for step 4's final assertion:
@@ -1049,9 +1173,11 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
             e.delta for e in turn1_events if isinstance(e, OutputTextDeltaEvent)
         )
         snapshot_texts = [
-            item["data"]["content"][0]["text"]
+            item.data.content[0]["text"]
             for item in final_items
-            if item.get("type") == "message" and item["data"].get("role") == "assistant"
+            if item.type == "message"
+            and isinstance(item.data, MessageData)
+            and item.data.role == "assistant"
         ]
         assert live_turn_1_text in snapshot_texts, (
             f"Turn 1 assistant text {live_turn_1_text!r} (observed "
@@ -1115,10 +1241,10 @@ async def test_fork_posts_correct_url_and_parses_response() -> None:
     assert body == {"title": "Fork of original"}, f"Expected body with title, got {body}"
 
     # Verify the response is parsed correctly.
-    assert result["id"] == "conv_fork"
-    assert result["agent_id"] == "ag_cloned"
-    assert result["status"] == "idle"
-    assert result["title"] == "Fork of original"
+    assert result.id == "conv_fork"
+    assert result.agent_id == "ag_cloned"
+    assert result.status == "idle"
+    assert result.title == "Fork of original"
 
 
 @pytest.mark.asyncio
@@ -1175,6 +1301,643 @@ async def test_fork_404_raises() -> None:
     try:
         with pytest.raises(OmnigentError):
             await ns.fork("conv_nonexistent")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_agents_sessions_is_identity_alias() -> None:
+    """The discoverable hierarchy must not create a second session runtime."""
+    from omnigent_client import OmnigentClient
+
+    client = OmnigentClient("http://127.0.0.1:1")
+    try:
+        assert client.sessions is client.agents.sessions
+        assert client.sessions.files is not None
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_raw_response_executes_exactly_one_request() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert dict(request.url.params) == {
+            "include_items": "false",
+            "include_liveness": "false",
+            "refresh_state": "true",
+        }
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "req_123"},
+            json=_session_response_body(),
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        raw = await ns.with_raw_response.retrieve(
+            "conv_abc",
+            include_items=False,
+            include_liveness=False,
+            refresh_state=True,
+        )
+        assert raw.request_id == "req_123"
+        assert raw.parse().id == "conv_abc"
+        assert raw.parse().id == "conv_abc"
+        assert calls == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_events_create_validates_batch_and_preserves_ack_order() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert [event["type"] for event in payload] == ["message", "interrupt"]
+        return httpx.Response(
+            202,
+            json=[{"queued": True, "item_id": "msg_1"}, {"queued": False}],
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        result = await ns.events.create(
+            "conv_abc",
+            events=(
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    },
+                },
+                {"type": "interrupt", "data": {}},
+            ),
+        )
+        assert isinstance(result, list)
+        assert [ack.item_id for ack in result] == ["msg_1", None]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_accepts_project_only_and_rejects_bundle_registered_fields() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create(project_id="proj_123", title="project session")
+        assert json.loads(requests[0].content) == {
+            "project_id": "proj_123",
+            "title": "project session",
+            "host_type": "external",
+        }
+        await ns.create(
+            agent_id="ag_123",
+            project_id="proj_123",
+            initial_items=[Interrupt()],
+            title="full inventory",
+            labels={"team": "sdk"},
+            parent_session_id="parent_123",
+            sub_agent_name="reviewer",
+            host_type="managed",
+            host_id="host_123",
+            sandbox_provider="sandbox_1",
+            workspace="https://example.com/one.git",
+            workspaces=["https://example.com/two.git"],
+            git={"branch_name": "feature/sdk"},
+            terminal_launch_args=["--flag"],
+            model_override="model-1",
+            reasoning_effort="high",
+            cost_control_mode_override="on",
+            subagent_routing_override="off",
+            harness_override="harness-1",
+            smart_routing_message="route this",
+        )
+        assert json.loads(requests[1].content) == {
+            "agent_id": "ag_123",
+            "project_id": "proj_123",
+            "title": "full inventory",
+            "labels": {"team": "sdk"},
+            "parent_session_id": "parent_123",
+            "sub_agent_name": "reviewer",
+            "host_type": "managed",
+            "host_id": "host_123",
+            "sandbox_provider": "sandbox_1",
+            "workspace": "https://example.com/one.git",
+            "workspaces": ["https://example.com/two.git"],
+            "git": {"branch_name": "feature/sdk"},
+            "terminal_launch_args": ["--flag"],
+            "model_override": "model-1",
+            "reasoning_effort": "high",
+            "cost_control_mode_override": "on",
+            "subagent_routing_override": "off",
+            "harness_override": "harness-1",
+            "smart_routing_message": "route this",
+            "initial_items": [{"type": "interrupt", "data": {}}],
+        }
+        for kwargs in ({"workspaces": ["repo"]}, {"initial_items": []}, {"git": {}}):
+            with pytest.raises(ValueError, match="bundle create does not support"):
+                await cast(Any, ns.create)(b"bundle", **kwargs)
+        with pytest.raises(ValueError, match="filename is only valid with bundle"):
+            await ns.create(  # type: ignore[call-overload]
+                agent_id="ag_123", filename="ignored.tar.gz"
+            )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await ns.create(
+                agent_id="ag_123",
+                input="start",
+                initial_items=[Interrupt()],
+            )
+        assert len(requests) == 2
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_value", "expected_texts"),
+    [
+        ("one", ["one"]),
+        (SessionMessage.text("two"), ["two"]),
+        ([SessionMessage.text("three"), SessionMessage.text("four")], ["three", "four"]),
+    ],
+)
+async def test_create_with_input_submits_messages_then_retrieves_snapshot(
+    input_value: object,
+    expected_texts: list[str],
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            assert "initial_items" not in json.loads(request.content)
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/events"):
+            payload = json.loads(request.content)
+            messages = payload if isinstance(payload, list) else [payload]
+            assert [message["data"]["content"][0]["text"] for message in messages] == (
+                expected_texts
+            )
+            acknowledgements = [{"queued": True} for _ in messages]
+            return httpx.Response(
+                202,
+                json=acknowledgements if isinstance(payload, list) else acknowledgements[0],
+            )
+        return httpx.Response(200, json=_session_response_body(status="running"))
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.create(agent_id="ag_abc", input=cast(Any, input_value))
+    finally:
+        await client.aclose()
+
+    assert session.status == "running"
+    assert [f"{request.method} {request.url.path}" for request in requests] == [
+        "POST /v1/sessions",
+        "POST /v1/sessions/conv_abc/events",
+        "GET /v1/sessions/conv_abc",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_stream_opens_before_input_and_owns_local_cleanup() -> None:
+    requests: list[httpx.Request] = []
+    byte_stream = _TrackedAsyncByteStream(
+        _format_sse_lines(
+            [
+                ("session.heartbeat", {"type": "session.heartbeat"}),
+                (
+                    "response.created",
+                    {
+                        "type": "response.created",
+                        "response": _completed_response_dict("resp_1", "in_progress"),
+                    },
+                ),
+                (
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": _completed_response_dict("resp_1"),
+                    },
+                ),
+            ]
+        )
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(
+                200,
+                stream=byte_stream,
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    ns, client = _make_namespace(handler)
+    try:
+        events = await ns.create(
+            agent_id="ag_abc",
+            input="start",
+            stream=True,
+            timeout=9.0,
+            extra_headers={"x-test": "yes"},
+            extra_query={"trace": "one"},
+        )
+        assert isinstance(events, AsyncSessionEventStream)
+        assert [f"{request.method} {request.url.path}" for request in requests] == [
+            "POST /v1/sessions",
+            "GET /v1/sessions/conv_abc/stream",
+            "POST /v1/sessions/conv_abc/events",
+        ]
+        async with events as entered:
+            assert entered is events
+            observed = [event async for event in events]
+        assert byte_stream.closed is True
+    finally:
+        await client.aclose()
+
+    assert [event.type for event in observed] == ["response.created", "response.completed"]
+    assert events.session_id == "conv_abc"
+    assert events.last_response_id == "resp_1"
+    assert events.terminal_event is observed[-1]
+    for request in requests:
+        assert request.headers["x-test"] == "yes"
+        assert request.url.params["trace"] == "one"
+        assert request.extensions["timeout"]["read"] == 9.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "status", "is_status_event"),
+    [
+        ("response.completed", "completed", False),
+        ("response.failed", "failed", False),
+        ("response.incomplete", "incomplete", False),
+        ("response.cancelled", "cancelled", False),
+        ("session.status", "failed", True),
+    ],
+)
+async def test_event_stream_stops_on_each_terminal_signal(
+    event_type: str,
+    status: str,
+    is_status_event: bool,
+) -> None:
+    terminal_payload = (
+        {
+            "type": "session.status",
+            "conversation_id": "conv_abc",
+            "status": status,
+            "response_id": "resp_status",
+        }
+        if is_status_event
+        else {
+            "type": event_type,
+            "response": _completed_response_dict("resp_terminal", status),
+        }
+    )
+    payloads: list[tuple[str, dict[str, Any] | str]] = [
+        ("session.heartbeat", {"type": "session.heartbeat"}),
+        (event_type, terminal_payload),
+        (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "must not be yielded"},
+        ),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_format_sse_lines(payloads))
+
+    ns, client = _make_namespace(handler)
+    try:
+        async with ns.events.stream("conv_abc") as events:
+            observed = [event async for event in events]
+    finally:
+        await client.aclose()
+
+    assert [event.type for event in observed] == [event_type]
+    assert events.last_response_id == ("resp_status" if is_status_event else "resp_terminal")
+    assert events.terminal_event is observed[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "stream", "input_value"),
+    [
+        ("stream_open", True, "start once"),
+        ("input_submit", True, "start once"),
+        ("snapshot_retrieve", False, "start once"),
+        ("snapshot_retrieve", False, None),
+    ],
+)
+async def test_create_composition_failure_retains_session_without_compensation(
+    phase: str,
+    stream: bool,
+    input_value: str | None,
+) -> None:
+    requests: list[httpx.Request] = []
+    stream_payloads = [
+        (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "not ready"},
+        )
+    ]
+    if phase != "stream_open":
+        stream_payloads.insert(0, ("session.heartbeat", {"type": "session.heartbeat"}))
+    byte_stream = _TrackedAsyncByteStream(_format_sse_lines(stream_payloads))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            if phase == "snapshot_retrieve":
+                return httpx.Response(201, json={"session_id": "conv_abc"})
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, stream=byte_stream)
+        if request.url.path.endswith("/events"):
+            if phase == "input_submit":
+                return httpx.Response(
+                    500,
+                    json={"error": {"code": "server_error", "message": "submit failed"}},
+                )
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            500,
+            json={"error": {"code": "server_error", "message": "retrieve failed"}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(SessionCompositionError) as raised:
+            if phase == "snapshot_retrieve":
+                await ns.create(b"bundle", input=input_value)
+            else:
+                await ns.create(agent_id="ag_abc", input=input_value, stream=True)
+        if stream:
+            assert byte_stream.closed is True
+    finally:
+        await client.aclose()
+
+    error = raised.value
+    assert error.phase == phase
+    assert error.session_id == "conv_abc"
+    assert error.original_exception is error.__cause__
+    event_posts = [request for request in requests if request.url.path.endswith("/events")]
+    assert len(event_posts) == (0 if phase == "stream_open" or input_value is None else 1)
+    assert all(request.method != "DELETE" for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_create_stream_cancellation_during_input_closes_local_stream() -> None:
+    requests: list[httpx.Request] = []
+    byte_stream = _TrackedAsyncByteStream(
+        _format_sse_lines([("session.heartbeat", {"type": "session.heartbeat"})])
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, stream=byte_stream)
+        raise asyncio.CancelledError
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await ns.create(agent_id="ag_abc", input="start", stream=True)
+        assert byte_stream.closed is True
+    finally:
+        await client.aclose()
+
+    assert [f"{request.method} {request.url.path}" for request in requests] == [
+        "POST /v1/sessions",
+        "GET /v1/sessions/conv_abc/stream",
+        "POST /v1/sessions/conv_abc/events",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,value,expected",
+    [
+        ("cost_control_mode_override", NOT_GIVEN, {"silent": False}),
+        (
+            "cost_control_mode_override",
+            None,
+            {"cost_control_mode_override": None, "silent": False},
+        ),
+        (
+            "cost_control_mode_override",
+            "off",
+            {"cost_control_mode_override": "off", "silent": False},
+        ),
+        ("subagent_routing_override", NOT_GIVEN, {"silent": False}),
+        ("subagent_routing_override", None, {"subagent_routing_override": None, "silent": False}),
+        ("subagent_routing_override", "on", {"subagent_routing_override": "on", "silent": False}),
+        ("share_workspace_files", NOT_GIVEN, {"silent": False}),
+        ("share_workspace_files", None, {"share_workspace_files": None, "silent": False}),
+        ("share_workspace_files", False, {"share_workspace_files": False, "silent": False}),
+        ("project_id", NOT_GIVEN, {"silent": False}),
+        ("project_id", None, {"project_id": None, "silent": False}),
+        ("project_id", "", {"project_id": "", "silent": False}),
+    ],
+)
+async def test_update_preserves_omitted_null_and_value_fields(
+    name: str, value: object, expected: dict[str, object]
+) -> None:
+    body: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body.update(json.loads(request.content))
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await cast(Any, ns.update)("conv_abc", **{name: value})
+        assert body == expected
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout, expected", [(None, 600.0), (17.0, 17.0)])
+async def test_events_stream_uses_sse_default_or_explicit_timeout(
+    timeout: float | None, expected: float
+) -> None:
+    observed: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request.extensions["timeout"])
+        return httpx.Response(
+            200,
+            content=_format_sse_lines(
+                [
+                    ("session.heartbeat", {"type": "session.heartbeat"}),
+                    ("done", "[DONE]"),
+                ]
+            ),
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        assert [event async for event in ns.events.stream("conv_abc", timeout=timeout)] == []
+        assert observed[0]["read"] == expected
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bundle_create_forwards_options_to_create_and_retrieve() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(201, json={"session_id": "conv_abc"})
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create(
+            b"bundle",
+            timeout=9.0,
+            extra_headers={"x-test": "yes"},
+            extra_query={"trace": "one"},
+        )
+        assert len(requests) == 2
+        for request in requests:
+            assert request.headers["x-test"] == "yes"
+            assert request.url.params["trace"] == "one"
+            assert request.extensions["timeout"]["read"] == 9.0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,value,expected",
+    [
+        ("model_override", NOT_GIVEN, {}),
+        ("model_override", None, {"model_override": None}),
+        ("model_override", "model-1", {"model_override": "model-1"}),
+        ("reasoning_effort", NOT_GIVEN, {}),
+        ("reasoning_effort", None, {"reasoning_effort": None}),
+        ("reasoning_effort", "high", {"reasoning_effort": "high"}),
+        ("terminal_launch_args", NOT_GIVEN, {}),
+        ("terminal_launch_args", None, {"terminal_launch_args": None}),
+        ("terminal_launch_args", ["--flag"], {"terminal_launch_args": ["--flag"]}),
+        ("workspace", NOT_GIVEN, {}),
+        ("workspace", None, {"workspace": None}),
+        ("workspace", "/repo", {"workspace": "/repo"}),
+    ],
+)
+async def test_fork_presence_sensitive_fields(
+    name: str, value: object, expected: dict[str, object]
+) -> None:
+    body: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body.update(json.loads(request.content))
+        return httpx.Response(201, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await cast(Any, ns.fork)("conv_abc", **{name: value})
+        assert body == expected
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["agents", "sessions", "items", "subagents"])
+async def test_page_next_preserves_options_and_replaces_after(resource: str) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [],
+                "first_id": None,
+                "last_id": "cursor_2",
+                "has_more": "after" not in request.url.params,
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    common: dict[str, Any] = {
+        "limit": 7,
+        "before": "before_1",
+        "order": "asc",
+        "timeout": 11.0,
+        "extra_headers": {"x-page": "yes"},
+        "extra_query": {"custom": "kept", "limit": 999, "order": "bad", "after": "bad"},
+    }
+    try:
+        if resource == "agents":
+            page = await AsyncAgentsResource(client, "http://srv", ns).list(**common)
+        elif resource == "sessions":
+            page = await ns.list(
+                agent_id="ag_123",
+                agent_name="reviewer",
+                sort_by="updated_at",
+                search_query="needle",
+                include_archived=True,
+                kind="any",
+                project="project_123",
+                pinned=True,
+                visibility="shared",
+                **common,
+            )
+        elif resource == "items":
+            page = await ns.items.list("conv_abc", **common)
+        else:
+            page = await ns.subagents.list(
+                "conv_abc", tool="delegate", session_name="reviewer", **common
+            )
+        await page.get_next_page()
+        second = requests[1]
+        assert second.url.params["after"] == "cursor_2"
+        assert second.url.params["before"] == "before_1"
+        assert second.url.params["limit"] == "7"
+        assert second.url.params["order"] == "asc"
+        assert second.url.params["custom"] == "kept"
+        assert second.headers["x-page"] == "yes"
+        assert second.extensions["timeout"]["read"] == 11.0
+        if resource == "sessions":
+            assert dict(second.url.params) == {
+                "custom": "kept",
+                "limit": "7",
+                "order": "asc",
+                "after": "cursor_2",
+                "before": "before_1",
+                "sort_by": "updated_at",
+                "agent_id": "ag_123",
+                "agent_name": "reviewer",
+                "search_query": "needle",
+                "project": "project_123",
+                "include_archived": "true",
+                "kind": "any",
+                "pinned": "true",
+                "visibility": "shared",
+            }
+        elif resource == "subagents":
+            assert second.url.params["tool"] == "delegate"
+            assert second.url.params["session_name"] == "reviewer"
     finally:
         await client.aclose()
 

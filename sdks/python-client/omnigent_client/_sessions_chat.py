@@ -16,7 +16,7 @@ matching the server-side conversation lifecycle defined in
 ``omnigent/server/API.md`` ("Sessions API"). Per the same spec
 there is no event replay; this helper opens a fresh SSE subscription
 per :meth:`send` call, posts the input event, and yields the typed
-:data:`omnigent.server.schemas.ServerStreamEvent` envelopes
+:data:`omnigent.protocol.ServerStreamEvent` envelopes
 until the turn's terminal ``response.*`` event arrives.
 
 The helper does NOT re-export under the existing public name
@@ -30,7 +30,6 @@ in-flight migrations. Instead we expose
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 import json
 import mimetypes
@@ -39,13 +38,10 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
 
-from omnigent.server.schemas import (
-    CancelledEvent,
+from omnigent.protocol import (
     CompletedEvent,
     CreatedEvent,
     ElicitationRequestEvent,
-    FailedEvent,
-    IncompleteEvent,
     InProgressEvent,
     OutputFileDoneEvent,
     OutputItemDoneEvent,
@@ -58,13 +54,19 @@ from omnigent.server.schemas import (
     SessionChildSessionUpdatedEvent,
     SessionCreatedEvent,
     SessionStatusEvent,
+    UnknownEvent,
 )
 
 from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._query import QueryResult, QueryStream
-from ._sessions import Session, SessionsNamespace
+from ._sessions import (
+    _RESPONSE_TERMINAL_EVENT_TYPES,
+    Session,
+    SessionsNamespace,
+    _aclose_stream,
+)
 from ._tool_handler import (
     ElicitationRequestCtx,
     FileOutputCtx,
@@ -89,14 +91,14 @@ _OUTPUT_TEXT_BLOCK_TYPES: frozenset[str] = frozenset({"output_text", "text"})
 
 # Wire ``type`` literal that the input-message wire format uses for
 # user-text events. Mirrors the ``"message"`` arm of
-# :class:`omnigent.server.schemas.SessionEventInput`. Kept as a
+# :class:`omnigent.protocol.PublicSessionEventInput`. Kept as a
 # named constant so a single grep finds every emit/match site.
 _MESSAGE_INPUT_TYPE: str = "message"
 
 # Wire ``type`` literal for the function_call_output event posted back
 # to the session after a client-side tool callable finishes. Mirrors
 # the ``"function_call_output"`` arm of
-# :class:`omnigent.server.schemas.SessionEventInput`. Kept as a
+# :class:`omnigent.protocol.PublicSessionEventInput`. Kept as a
 # named constant so a single grep finds every emit site.
 _FUNCTION_CALL_OUTPUT_TYPE: str = "function_call_output"
 
@@ -114,6 +116,7 @@ _FUNCTION_CALL_ITEM_TYPE: str = "function_call"
 # (``status == "completed"``) are server-executed and need no
 # client-side action.
 _ACTION_REQUIRED_STATUS: str = "action_required"
+SessionStreamEvent = ServerStreamEvent | UnknownEvent
 
 # Wire literal for the spec ``runtime`` field that identifies a
 # tool as client-executed. A spec tool entry with
@@ -211,30 +214,11 @@ class _AgentToolsGetter(Protocol):
         ...
 
 
-# Concrete event classes that signal a turn's terminal state. Used
-# by :meth:`SessionsChat.send` to know when to stop iterating the
-# per-turn stream subscription. Matches the response-lifecycle
-# terminal set listed in ``omnigent/server/schemas.py`` (and
-# the ``_TERMINAL_STATUSES`` set in
-# :mod:`omnigent_client._session`).
-_TURN_TERMINAL_EVENT_TYPES = (
-    CompletedEvent,
-    FailedEvent,
-    IncompleteEvent,
-    CancelledEvent,
-)
-
 _RESPONSE_START_EVENT_TYPES = (
     CreatedEvent,
     QueuedEvent,
     InProgressEvent,
 )
-
-# Newer servers emit an immediate ``session.heartbeat`` after the
-# live-tail subscriber is registered. Older servers do not, so keep a
-# short fallback instead of hanging forever before posting the user's
-# message.
-_STREAM_READY_TIMEOUT_S: float = 1.0
 
 
 @dataclass
@@ -509,7 +493,7 @@ class SessionsChat:
         input: str | list[dict[str, Any]],
         *,
         files: list[str] | None = None,
-    ) -> AsyncIterator[ServerStreamEvent]:
+    ) -> AsyncIterator[SessionStreamEvent]:
         """
         Post a user message to the session and yield typed events for the turn.
 
@@ -564,37 +548,17 @@ class SessionsChat:
             "data": {"role": "user", "content": content},
         }
 
-        # Subscription/post ordering: per API.md "Reconnect Contract",
-        # the server has no replay buffer. ``stream()`` returns an
-        # async iterator whose HTTP connection opens on first
-        # ``__anext__``; constructing the iterator is not enough. Start
-        # the first read and, when the server provides an immediate
-        # ready/heartbeat event, wait for it before posting so fast
-        # turns cannot publish all output before this subscriber exists.
-        stream_aiter = self._namespace.stream(self._session.id)
+        # The shared readiness primitive establishes the GET and consumes the
+        # server's subscriber-registration heartbeat before this write.
+        stream_aiter = await self._namespace._open_stream_ready(self._session.id)
         hook_state = _StreamHookState()
-        first_event_task = asyncio.ensure_future(stream_aiter.__anext__())
         try:
-            first_event: ServerStreamEvent | None
-            try:
-                first_event = await asyncio.wait_for(
-                    asyncio.shield(first_event_task),
-                    timeout=_STREAM_READY_TIMEOUT_S,
-                )
-            except asyncio.TimeoutError:
-                first_event = None
-            except StopAsyncIteration:
-                return
             await self._namespace.post_event(self._session.id, event_payload)
-            event: ServerStreamEvent
-            if first_event is None:
+            while True:
                 try:
-                    event = await first_event_task
+                    event = await stream_aiter.__anext__()
                 except StopAsyncIteration:
                     return
-            else:
-                event = first_event
-            while True:
                 await self._fire_stream_hooks(event, hook_state)
                 yield event
                 # Dispatch client-side tool calls inline, BEFORE
@@ -612,7 +576,7 @@ class SessionsChat:
                 # action.
                 if isinstance(event, OutputItemDoneEvent):
                     await self._maybe_dispatch_tool_call(event, hook_state)
-                if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                if isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
                     return
                 # A SETUP-phase failure (spec resolution, spawn-env
                 # build) ends the turn before the LLM stream starts, so
@@ -631,20 +595,12 @@ class SessionsChat:
                     )
                     code = event.error.code if event.error is not None else None
                     raise OmnigentError(message, code=code)
-                try:
-                    event = await stream_aiter.__anext__()
-                except StopAsyncIteration:
-                    return
         finally:
-            if not first_event_task.done():
-                first_event_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await first_event_task
             # Closing the underlying generator releases the SSE
             # connection promptly; httpx would GC it otherwise but
             # an explicit close avoids holding the pool slot until
             # GC. ``aclose`` is the standard async-generator API.
-            await _aclose(stream_aiter)
+            await _aclose_stream(stream_aiter)
 
     async def _validate_tool_callables(self) -> None:
         """
@@ -789,24 +745,24 @@ class SessionsChat:
 
     async def post_event(self, event: dict[str, Any]) -> None:
         """
-        Low-level: post an arbitrary event into the session.
+        Low-level: post a public event into the session.
 
         Most callers want :meth:`send` (for user messages) or
-        :meth:`cancel` (for interrupts). This is the escape hatch
-        for posting tool outputs, approvals, or other event types
-        the server understands. The body is forwarded as-is to
-        :meth:`SessionsNamespace.post_event`.
+        :meth:`cancel` (for interrupts). This method also supports
+        ``function_call_output``. Elicitation decisions use the
+        dedicated resolution flow; runner/internal controls are not
+        public SDK inputs.
 
         :param event: Event dict with ``type`` and ``data`` keys,
             e.g. ``{"type": "function_call_output", "data":
             {"call_id": "...", "output": "..."}}``. Validated
-            server-side per ``type``.
+            by :meth:`SessionsNamespace.post_event` before network I/O.
         :raises OmnigentError: If the session does not exist
             (404) or the event is rejected (400).
         """
         await self._namespace.post_event(self._session.id, event)
 
-    async def stream(self) -> AsyncIterator[ServerStreamEvent]:
+    async def stream(self) -> AsyncIterator[SessionStreamEvent]:
         """
         Subscribe to the live SSE stream for this session.
 
@@ -838,7 +794,7 @@ class SessionsChat:
         # to the wrong callable or silently drop the call.
         await self._validate_tool_callables()
 
-        stream_aiter = self._namespace.stream(self._session.id)
+        stream_aiter = await self._namespace._open_stream_ready(self._session.id)
         hook_state = _StreamHookState()
         try:
             async for event in stream_aiter:
@@ -850,11 +806,11 @@ class SessionsChat:
                 if isinstance(event, OutputItemDoneEvent):
                     await self._maybe_dispatch_tool_call(event, hook_state)
         finally:
-            await _aclose(stream_aiter)
+            await _aclose_stream(stream_aiter)
 
     async def _fire_stream_hooks(
         self,
-        event: ServerStreamEvent,
+        event: SessionStreamEvent,
         state: _StreamHookState,
     ) -> None:
         """
@@ -921,7 +877,7 @@ class SessionsChat:
             await self._fire_sub_agent_completed_if_terminal(event, state)
             return
 
-        if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+        if isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
             await self._end_reasoning_if_open(state)
             response = _response_from_server_object(event.response)
             await self._ensure_response_started(response, state)
@@ -1244,7 +1200,7 @@ class SessionsChat:
                     # closes cleanly (avoids "aclose(): already running" when
                     # asyncio.timeout fires mid-stream).
                     break
-                elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                elif isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
                     break
 
         try:
@@ -1590,10 +1546,9 @@ async def _invoke_callable(
     """
     Invoke a tool callable (sync or async) and validate its return.
 
-    Uses :func:`inspect.isawaitable` rather than
-    :func:`inspect.iscoroutinefunction` because the callable may
-    be a wrapper / partial / lambda returning a coroutine — the
-    runtime check on the actual return value is what matters.
+    Definitely synchronous callables run in a worker thread so user code
+    cannot block SSE processing. Wrappers that return an awaitable remain
+    supported: the wrapper runs off-loop and its result is awaited here.
 
     :param callable_for_tool: The user-supplied callable.
     :param info: Context to pass to the callable.
@@ -1605,7 +1560,10 @@ async def _invoke_callable(
         ``output`` field — accepting other types here would lead
         to a confusing 400 from the server later.
     """
-    result = callable_for_tool(info)
+    if inspect.iscoroutinefunction(callable_for_tool):
+        result = callable_for_tool(info)
+    else:
+        result = await asyncio.to_thread(callable_for_tool, info)
     if inspect.isawaitable(result):
         output_str = await result
     else:
@@ -1744,30 +1702,6 @@ def _format_validation_error(missing: set[str], extra: set[str]) -> str:
         "every client-runtime tool has a callable and every "
         "callable maps to a declared tool."
     )
-
-
-async def _aclose(iterator: AsyncIterator[ServerStreamEvent]) -> None:
-    """
-    Close an async generator iterator returned by :meth:`SessionsNamespace.stream`.
-
-    :meth:`SessionsNamespace.stream` is an async generator, so the
-    iterator returned always exposes ``aclose``. Calling it tears
-    down the underlying ``httpx`` SSE connection promptly rather
-    than waiting for GC. We assert the attribute exists rather than
-    silently skipping — if a future refactor returns a non-generator
-    iterator from :meth:`SessionsNamespace.stream`, the assert
-    surfaces the contract change immediately rather than leaking
-    the connection.
-
-    :param iterator: The async generator iterator to close.
-    """
-    aclose = getattr(iterator, "aclose", None)
-    assert aclose is not None, (
-        "SessionsNamespace.stream() must return an async generator "
-        "exposing aclose(); got an iterator without it. This is a "
-        "contract violation — the SSE connection would leak."
-    )
-    await aclose()
 
 
 __all__ = ["SessionToolCallInfo", "SessionsChat", "ToolCallable"]

@@ -28,13 +28,17 @@ from typing import Any
 
 import httpx
 
+from omnigent.protocol import FRAMEWORK_NOTICE_BLOCK_TYPE
+from omnigent.protocol import (
+    reject_authored_framework_notices as reject_authored_framework_notices,
+)
+
 _logger = logging.getLogger(__name__)
 
 # Characters that would corrupt a "[Attached: ...]" / "[Attachment ...]"
 # marker line for the consumers that regex-match it (forwarders, title
 # seeding): brackets end the match early, newlines break the line shape.
 _MARKER_UNSAFE = re.compile(r"[\[\]\r\n]")
-FRAMEWORK_NOTICE_BLOCK_TYPE = "_omnigent_framework_notice"
 
 # Maps a data-URI MIME type to the file extension used when no filename
 # is supplied, e.g. ``"image/png"`` -> ``".png"``.
@@ -250,19 +254,6 @@ def resize_dimensions(source_metadata: object) -> dict[str, int] | None:
     if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
         return None
     return {"width": width, "height": height}
-
-
-def reject_authored_framework_notices(content: object) -> object:
-    """Reject reserved context blocks in authored message content."""
-    if isinstance(content, dict):
-        if content.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE:
-            raise ValueError("Framework notice blocks are reserved for attachment resolution")
-        for value in content.values():
-            reject_authored_framework_notices(value)
-    elif isinstance(content, list):
-        for value in content:
-            reject_authored_framework_notices(value)
-    return content
 
 
 def framework_notice_block(source_metadata: Mapping[str, object]) -> dict[str, object]:

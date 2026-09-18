@@ -1708,7 +1708,7 @@ async def _prepare_chat_session_via_daemon(
             try:
                 if fork_session_id is not None:
                     fork_result = await sdk.sessions.fork(fork_session_id)
-                    return fork_result["id"], False
+                    return fork_result.id, False
                 if resume_conversation_id is not None:
                     return resume_conversation_id, False
                 created = await sdk.sessions.create(
@@ -4144,12 +4144,12 @@ def _run_repl(
                     fork_result = await client.sessions.fork(fork_session_id)
                 except Exception as exc:
                     raise click.ClickException(f"Fork failed: {exc}") from exc
-                effective_resume_id = fork_result["id"]
+                effective_resume_id = fork_result.id
                 # The fork is a fresh session on (possibly) a different host.
                 # Record its host and repoint the auth from the source session
                 # to the fork, so this client's requests route to the fork's
                 # replica instead of the source's for the rest of the REPL.
-                fork_host = fork_result.get("host_id")
+                fork_host = fork_result.host_id
                 set_session_host(
                     effective_resume_id,
                     fork_host if isinstance(fork_host, str) and fork_host else None,

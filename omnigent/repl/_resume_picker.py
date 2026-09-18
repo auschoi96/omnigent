@@ -30,7 +30,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TextIO
+from typing import TYPE_CHECKING, Literal, Protocol, TextIO
 
 if TYPE_CHECKING:
     from omnigent_client import OmnigentClient
@@ -910,7 +910,7 @@ async def _list_sessions_with_retry(
     limit: int = 200,
     agent_id: str | None = None,
     agent_name: str | None = None,
-    order: str = "desc",
+    order: Literal["asc", "desc"] = "desc",
 ) -> list[SessionListItem]:
     """Call ``client.sessions.list`` with bounded retries on 429.
 

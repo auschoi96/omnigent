@@ -388,7 +388,7 @@ def _server_stream_event_schema() -> dict[str, Any]:
         * ``"definitions"`` — the per-variant component schemas
           (merged into ``components.schemas``).
     """
-    from omnigent.server.schemas import ServerStreamEvent
+    from omnigent.protocol import ServerStreamEvent
 
     adapter: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
     schema = adapter.json_schema(ref_template="#/components/schemas/{model}")

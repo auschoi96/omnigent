@@ -6249,11 +6249,17 @@ def create_runner_app(
             inject_slash_command,
             read_claude_status_model,
             read_model_env,
+            read_model_picker_values,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
+            stored_claude_catalog_rows,
+            stored_claude_picker_values,
         )
-        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+        from omnigent.models.claude_model_vocabulary import (
+            claude_model_command_arg,
+            picker_command_values,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -6268,19 +6274,32 @@ def create_runner_app(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        # ``/model`` takes only this session's own picker vocabulary — its
-        # family aliases and its one custom slot. Typing a bare catalog id
-        # outside it leaves the pane on its old model while this handler
-        # reports success, so fail loud instead. Same translation the routed
-        # turn path and the executor apply.
+        # Translate through the pane's picker values, aliases, and custom slot.
+        # An unknown spelling must fail before any command reaches the terminal.
         env = read_model_env(bridge_dir) or None
-        model_arg = claude_model_command_arg(resolved_model, env)
+        cached_options = _claude_model_options_rows.get(conv_id)
+        if cached_options is not None:
+            picker_values = picker_command_values(cached_options[1])
+        else:
+            stored_rows = stored_claude_catalog_rows(claude_config)
+            if stored_rows is not None and not stored_rows:
+                # Discovery stored an authoritative empty catalog (every
+                # picker entry disabled): launch-recorded bridge values are
+                # stale vocabulary, so nothing is switchable.
+                picker_values: list[str] = []
+            else:
+                picker_values = read_model_picker_values(bridge_dir)
+                if not picker_values:
+                    picker_values = stored_claude_picker_values(claude_config, stored_rows)
+        model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         if model_arg is None:
             _logger.warning(
-                "claude-native model change: %r has no spelling session=%s accepts (pins=%s)",
+                "claude-native model change: %r has no spelling session=%s accepts "
+                "(pins=%s, picker=%s)",
                 resolved_model,
                 conv_id,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": conv_id},
             )
             return JSONResponse(
@@ -11723,7 +11742,7 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
-        if not rows:
+        if rows is None:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -11736,6 +11755,37 @@ def create_runner_app(
             time.monotonic() + _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S,
             rows,
         )
+        # Executor parity: a cold launch may have recorded no picker
+        # vocabulary (the store had no catalog yet), while routing decisions
+        # accept picks against THIS listing. Refresh the bridge snapshot so
+        # a routed turn's executor translates exactly the vocabulary served
+        # here — including an authoritative empty catalog, which clears
+        # stale launch values. Best-effort: the terminal may not exist yet.
+        try:
+            from omnigent.harnesses.claude_native.bridge import (
+                bridge_dir_for_bridge_id,
+                record_model_vocabulary,
+            )
+            from omnigent.models.claude_model_vocabulary import picker_command_values
+
+            bridge_id = await _claude_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=session_id,
+            )
+            await asyncio.to_thread(
+                record_model_vocabulary,
+                bridge_dir_for_bridge_id(bridge_id),
+                launch_env=None,
+                launch_model=None,
+                picker_values=picker_command_values(rows),
+            )
+        except Exception:  # noqa: BLE001 — vocabulary refresh is advisory
+            _logger.debug(
+                "claude-native model options: bridge vocabulary refresh skipped for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
         return JSONResponse(status_code=200, content={"models": rows})
 
     @app.get("/v1/sessions/{session_id}/model-options")

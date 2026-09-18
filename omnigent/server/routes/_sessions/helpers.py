@@ -27,7 +27,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
 import httpx
 from fastapi import (
@@ -4585,6 +4585,29 @@ def _require_codex_approval_mode_forward(
         )
 
 
+# Bound fallback assistant text while preserving multiline tracebacks and
+# runner-exit diagnostics within the limit.
+_FAILURE_LOG_DETAIL_MAX_CHARS: Final[int] = 4500
+
+
+def _failure_log_detail(error: ErrorDetail | None) -> str:
+    """Render a turn failure's reason for the log, bounded in length.
+
+    :param error: The failure's typed detail, or ``None`` when the publisher
+        attached none.
+    :returns: The reason, truncated with a dropped-character count when it
+        exceeds :data:`_FAILURE_LOG_DETAIL_MAX_CHARS`; ``"no detail"`` when
+        ``error`` is ``None`` or carries no message.
+    """
+    if error is None or not error.message.strip():
+        return "no detail"
+    message = error.message
+    if len(message) <= _FAILURE_LOG_DETAIL_MAX_CHARS:
+        return message
+    dropped = len(message) - _FAILURE_LOG_DETAIL_MAX_CHARS
+    return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
+
+
 def _publish_status(
     session_id: str,
     status: str,
@@ -4694,7 +4717,7 @@ def _publish_status(
             origin,
             failure_code,
             previous_status or "unknown",
-            error.message if error is not None else "no detail",
+            _failure_log_detail(error),
             extra=debug_event(
                 "session_turn_failed",
                 session_id=session_id,

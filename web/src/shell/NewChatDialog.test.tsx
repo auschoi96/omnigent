@@ -6835,6 +6835,36 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     );
   });
 
+  it("hides Codex's transport namespace in the new-session model label", () => {
+    const wireModel = "system.ai.gpt-6-astra";
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native"
+          ? {
+              ...CODEX_MODEL_OPTIONS_RESULT,
+              data: [
+                {
+                  id: wireModel,
+                  model: wireModel,
+                  displayName: wireModel,
+                  isDefault: true,
+                  supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+                },
+              ],
+            }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+
+    renderLanding();
+    selectAgent("a2");
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Codex, Model gpt-6-astra");
+    expect(picker).not.toHaveTextContent("system.ai");
+    openAgentModels("a2");
+    expect(screen.getByRole("menuitemcheckbox", { name: "gpt-6-astra" })).toBeVisible();
+  });
+
   it("edits Claude models without opening a permissions modal", () => {
     renderLanding();
     openAgentModels("a1");

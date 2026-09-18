@@ -188,6 +188,7 @@ import {
   livenessRowFromSession,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
+import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { HostBadge } from "@/components/HostBadge";
@@ -1613,6 +1614,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // including stopped/resumable sessions, and the connection indicator
   // remains below it for offline sessions.
   const showTerminal = shouldShowTerminalSurface(conversationId, terminalFirst, runnerOnline);
+  useMessageDeepLinkChatView(conversationId);
 
   // All hook calls below must run on every render regardless of
   // `showTerminal` — Rules of Hooks. The single return at the bottom

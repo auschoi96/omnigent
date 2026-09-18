@@ -21,6 +21,10 @@ class OmnigentError(Exception):
         self.code = code
 
 
+class StreamProtocolError(OmnigentError):
+    """A live session stream ended without its normal ``[DONE]`` marker."""
+
+
 class SessionCompositionError(OmnigentError):
     """A multi-request session create flow failed after creation succeeded."""
 

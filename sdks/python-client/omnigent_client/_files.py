@@ -21,6 +21,7 @@ from omnigent.protocol import (
 
 from ._errors import raise_for_status, require_json_object, response_body
 from ._pagination import AsyncCursorPage
+from ._sessions_shared import session_files_url
 from ._types import File
 
 Timeout = float | httpx.Timeout | None
@@ -40,7 +41,7 @@ class AsyncSessionFilesResource:
         self._http, self._base = http, base_url
 
     def _path(self, session_id: str) -> str:
-        return f"{self._base}/v1/sessions/{quote(session_id, safe='')}/resources/files"
+        return session_files_url(self._base, session_id)
 
     async def list(
         self,

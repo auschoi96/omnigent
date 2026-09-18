@@ -9,6 +9,8 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
+from omnigent.trusted_origin import OMNIGENT_INTERNAL_WS_ORIGIN as OMNIGENT_INTERNAL_WS_ORIGIN
+
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Host-launched runners delegate machine-global stale-process cleanup to the
@@ -42,15 +44,8 @@ RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
-# Sentinel ``Origin`` header that the project's own non-browser WebSocket
-# clients (runner -> server tunnel, host/daemon -> server tunnel,
-# terminal-attach) set on their handshakes so the server's CSWSH origin
-# guard allows them. Lives here, alongside the tunnel token header,
-# because it is part of the same client/server handshake contract and the
-# server imports it from this module (server -> runner, not the reverse).
-# The non-HTTP scheme is deliberate: a browser computes ``Origin`` from
-# the page URL and can never emit this value.
-OMNIGENT_INTERNAL_WS_ORIGIN = "omnigent://internal"
+# Compatibility re-export; the transport-neutral definition lives in
+# ``omnigent.trusted_origin`` so SDK clients do not import runner internals.
 # "1" enables per-session workspace isolation so each session
 # gets its own subdirectory. Set by shared-host servers; single-user
 # CLI flows leave it unset (agent sees the project root directly).

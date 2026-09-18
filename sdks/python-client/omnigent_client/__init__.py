@@ -59,11 +59,12 @@ from ._errors import (
     RateLimitedError,
     SessionCompositionError,
     StaleCursorError,
+    StreamProtocolError,
     ToolCallDenied,
 )
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
 from ._not_given import NOT_GIVEN, NotGiven
-from ._pagination import AsyncCursorPage
+from ._pagination import AsyncCursorPage, SyncCursorPage
 from ._query import QueryResult, QueryStream
 from ._raw_response import APIResponse
 from ._server import LocalServer
@@ -76,6 +77,8 @@ from ._sessions import (
 )
 from ._sessions_chat import SessionsChat, SessionToolCallInfo, ToolCallable
 from ._stream import BlockStream, format_tool_args_brief
+from ._sync_client import Omnigent
+from ._sync_sessions import SessionEventStream
 from ._tool_handler import (
     ElicitationRequestCtx,
     StreamHooks,
@@ -92,6 +95,8 @@ from ._transforms import (
 from ._types import File
 from .tools import ToolMetadata, ToolState, tool
 
+AsyncOmnigent = OmnigentClient
+
 __all__ = [
     "MCP_ELICITATION_METHOD",
     "NOT_GIVEN",
@@ -99,6 +104,7 @@ __all__ = [
     "APIResponse",
     "AnyBlock",
     "AsyncCursorPage",
+    "AsyncOmnigent",
     "AsyncSessionEventStream",
     "BlockContext",
     "BlockStream",
@@ -114,6 +120,7 @@ __all__ = [
     "LocalServer",
     "NativeToolBlock",
     "NotGiven",
+    "Omnigent",
     "OmnigentClient",
     "OmnigentError",
     "QueryResult",
@@ -128,6 +135,7 @@ __all__ = [
     "RetryBlock",
     "Session",
     "SessionCompositionError",
+    "SessionEventStream",
     "SessionMessage",
     "SessionToolCallInfo",
     "SessionsChat",
@@ -135,6 +143,8 @@ __all__ = [
     "StaleCursorError",
     "StreamBlock",
     "StreamHooks",
+    "StreamProtocolError",
+    "SyncCursorPage",
     "TextChunk",
     "TextDone",
     "ToolCallDenied",

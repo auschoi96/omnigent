@@ -29,6 +29,12 @@ The first boundary is intentionally only `sessions.py`. New files such as
 cohesive family useful. We will not create one file per endpoint or an empty
 future namespace.
 
+The first-party non-browser Origin sentinel is a transport handshake constant,
+not a session model. Its lightweight canonical owner is
+`omnigent.trusted_origin`; `omnigent.runner.identity` compatibility-reexports
+it. This keeps SDK transport out of runner internals without making the
+runner's spawn-sensitive identity import initialize the Pydantic model graph.
+
 ## PR 1 migration manifest
 
 PR 1 is a mechanical ownership move plus missing wire-output models. It does

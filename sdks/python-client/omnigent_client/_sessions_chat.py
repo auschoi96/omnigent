@@ -39,12 +39,9 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
 
 from omnigent.protocol import (
-    CancelledEvent,
     CompletedEvent,
     CreatedEvent,
     ElicitationRequestEvent,
-    FailedEvent,
-    IncompleteEvent,
     InProgressEvent,
     OutputFileDoneEvent,
     OutputItemDoneEvent,
@@ -64,7 +61,12 @@ from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._query import QueryResult, QueryStream
-from ._sessions import Session, SessionsNamespace, _aclose_stream
+from ._sessions import (
+    _RESPONSE_TERMINAL_EVENT_TYPES,
+    Session,
+    SessionsNamespace,
+    _aclose_stream,
+)
 from ._tool_handler import (
     ElicitationRequestCtx,
     FileOutputCtx,
@@ -211,19 +213,6 @@ class _AgentToolsGetter(Protocol):
         """
         ...
 
-
-# Concrete event classes that signal a turn's terminal state. Used
-# by :meth:`SessionsChat.send` to know when to stop iterating the
-# per-turn stream subscription. Matches the response-lifecycle
-# terminal set listed in ``omnigent/server/schemas.py`` (and
-# the ``_TERMINAL_STATUSES`` set in
-# :mod:`omnigent_client._session`).
-_TURN_TERMINAL_EVENT_TYPES = (
-    CompletedEvent,
-    FailedEvent,
-    IncompleteEvent,
-    CancelledEvent,
-)
 
 _RESPONSE_START_EVENT_TYPES = (
     CreatedEvent,
@@ -587,7 +576,7 @@ class SessionsChat:
                 # action.
                 if isinstance(event, OutputItemDoneEvent):
                     await self._maybe_dispatch_tool_call(event, hook_state)
-                if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                if isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
                     return
                 # A SETUP-phase failure (spec resolution, spawn-env
                 # build) ends the turn before the LLM stream starts, so
@@ -888,7 +877,7 @@ class SessionsChat:
             await self._fire_sub_agent_completed_if_terminal(event, state)
             return
 
-        if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+        if isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
             await self._end_reasoning_if_open(state)
             response = _response_from_server_object(event.response)
             await self._ensure_response_started(response, state)
@@ -1211,7 +1200,7 @@ class SessionsChat:
                     # closes cleanly (avoids "aclose(): already running" when
                     # asyncio.timeout fires mid-stream).
                     break
-                elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                elif isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
                     break
 
         try:
@@ -1557,10 +1546,9 @@ async def _invoke_callable(
     """
     Invoke a tool callable (sync or async) and validate its return.
 
-    Uses :func:`inspect.isawaitable` rather than
-    :func:`inspect.iscoroutinefunction` because the callable may
-    be a wrapper / partial / lambda returning a coroutine — the
-    runtime check on the actual return value is what matters.
+    Definitely synchronous callables run in a worker thread so user code
+    cannot block SSE processing. Wrappers that return an awaitable remain
+    supported: the wrapper runs off-loop and its result is awaited here.
 
     :param callable_for_tool: The user-supplied callable.
     :param info: Context to pass to the callable.
@@ -1572,7 +1560,10 @@ async def _invoke_callable(
         ``output`` field — accepting other types here would lead
         to a confusing 400 from the server later.
     """
-    result = callable_for_tool(info)
+    if inspect.iscoroutinefunction(callable_for_tool):
+        result = callable_for_tool(info)
+    else:
+        result = await asyncio.to_thread(callable_for_tool, info)
     if inspect.isawaitable(result):
         output_str = await result
     else:

@@ -26,7 +26,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar, overload
+from typing import Any, Literal, TypeAlias, TypeVar, overload
 
 import httpx
 from pydantic import TypeAdapter
@@ -34,10 +34,14 @@ from pydantic import TypeAdapter
 from omnigent.protocol import (
     SERVER_STREAM_EVENT_TYPES,
     AgentObject,
+    CancelledEvent,
     ChildSessionList,
     ChildSessionSummary,
+    CompletedEvent,
     ConversationDeleted,
     EventAcknowledgement,
+    FailedEvent,
+    IncompleteEvent,
     PaginatedList,
     ProjectSessionCreateRequest,
     PublicSessionEventInput,
@@ -48,6 +52,7 @@ from omnigent.protocol import (
     SessionGitOptions,
     SessionItem,
     SessionList,
+    SessionMessage,
     SessionResponse,
     UnknownEvent,
     UpdateSessionRequest,
@@ -57,7 +62,13 @@ from omnigent.protocol import (
 )
 
 from ._child_status import child_summary_busy
-from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
+from ._errors import (
+    OmnigentError,
+    SessionCompositionError,
+    raise_for_status,
+    require_json_object,
+    response_body,
+)
 from ._not_given import NOT_GIVEN, NotGiven
 from ._pagination import AsyncCursorPage
 from ._raw_response import APIResponse
@@ -103,6 +114,15 @@ T = TypeVar("T")
 Timeout = float | httpx.Timeout | None
 Headers = Mapping[str, str] | None
 Query = Mapping[str, str | int | float | bool | None] | None
+SessionStreamEvent: TypeAlias = ServerStreamEvent | UnknownEvent
+CreateSessionInput: TypeAlias = str | SessionMessage | Sequence[SessionMessage]
+
+_RESPONSE_TERMINAL_EVENT_TYPES = (
+    CompletedEvent,
+    FailedEvent,
+    IncompleteEvent,
+    CancelledEvent,
+)
 
 
 def _present(**values: Any) -> dict[str, Any]:
@@ -125,6 +145,115 @@ def _query(extra_query: Query, **method: Any) -> dict[str, Any]:
         else:
             params[key] = value
     return params
+
+
+def _normalize_create_input(
+    input: CreateSessionInput | None,
+) -> SessionMessage | list[SessionMessage] | None:
+    if input is None:
+        return None
+    if isinstance(input, str):
+        return SessionMessage.text(input)
+    if isinstance(input, SessionMessage):
+        return input
+    messages = list(input)
+    if not 1 <= len(messages) <= 100:
+        raise ValueError("input must contain between 1 and 100 messages")
+    if not all(isinstance(message, SessionMessage) for message in messages):
+        raise TypeError("input sequences may contain only SessionMessage values")
+    return messages
+
+
+class AsyncSessionEventStream:
+    """Context-managed view over one existing session SSE iterator.
+
+    Context entry opens a standalone stream through its readiness heartbeat.
+    Streams returned by ``create(stream=True)`` are already open; entering
+    their context only establishes deterministic local ownership. Iteration
+    stops after yielding a response terminal event. Closing never interrupts
+    or deletes the remote session.
+    """
+
+    def __init__(
+        self,
+        sessions: SessionsNamespace,
+        session_id: str,
+        *,
+        idle: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+        iterator: AsyncIterator[SessionStreamEvent] | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.last_response_id: str | None = None
+        self.terminal_event: (
+            CompletedEvent | FailedEvent | IncompleteEvent | CancelledEvent | None
+        ) = None
+        self._sessions = sessions
+        self._idle = idle
+        self._timeout = timeout
+        self._extra_headers = extra_headers
+        self._extra_query = extra_query
+        self._iterator = iterator
+        self._closed = False
+
+    async def _ensure_open(self) -> AsyncIterator[SessionStreamEvent]:
+        if self._closed:
+            raise RuntimeError("session event stream is closed")
+        if self._iterator is None:
+            try:
+                self._iterator = await self._sessions._open_stream_ready(
+                    self.session_id,
+                    idle=self._idle,
+                    timeout=self._timeout,
+                    extra_headers=self._extra_headers,
+                    extra_query=self._extra_query,
+                )
+            except BaseException:
+                self._closed = True
+                raise
+        return self._iterator
+
+    async def __aenter__(self) -> AsyncSessionEventStream:
+        await self._ensure_open()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    def __aiter__(self) -> AsyncSessionEventStream:
+        return self
+
+    async def __anext__(self) -> SessionStreamEvent:
+        if self._closed:
+            raise StopAsyncIteration
+        iterator = await self._ensure_open()
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+
+        response = getattr(event, "response", None)
+        response_id = getattr(response, "id", None)
+        if isinstance(response_id, str):
+            self.last_response_id = response_id
+
+        if isinstance(event, _RESPONSE_TERMINAL_EVENT_TYPES):
+            self.terminal_event = event
+            await self.aclose()
+        return event
+
+    async def aclose(self) -> None:
+        """Release the local HTTP stream without changing remote state."""
+        if self._closed:
+            return
+        self._closed = True
+        iterator = self._iterator
+        self._iterator = None
+        if iterator is not None:
+            await _aclose_stream(iterator)
 
 
 class AsyncEventsResource:
@@ -200,8 +329,9 @@ class AsyncEventsResource:
         timeout: Timeout = None,
         extra_headers: Headers = None,
         extra_query: Query = None,
-    ) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
-        return self._sessions.stream(
+    ) -> AsyncSessionEventStream:
+        return AsyncSessionEventStream(
+            self._sessions,
             session_id,
             idle=idle,
             timeout=timeout,
@@ -479,6 +609,62 @@ class SessionsNamespace:
         parent_session_id: str | None = None,
         host_type: Literal["external", "managed"] = "external",
         sandbox_provider: str | None = None,
+        input: CreateSessionInput | None = None,
+        stream: Literal[False] = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> Session: ...
+
+    @overload
+    async def create(
+        self,
+        bundle: bytes,
+        *,
+        filename: str = "agent.tar.gz",
+        title: str | None = None,
+        project_id: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        host_id: str | None = None,
+        workspace: str | None = None,
+        terminal_launch_args: Sequence[str] | None = None,
+        parent_session_id: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
+        input: CreateSessionInput | None = None,
+        stream: Literal[True],
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncSessionEventStream: ...
+
+    @overload
+    async def create(
+        self,
+        *,
+        agent_id: str | None = None,
+        project_id: str | None = None,
+        initial_items: Sequence[PublicSessionEventInput] | None = None,
+        title: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        parent_session_id: str | None = None,
+        sub_agent_name: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        host_id: str | None = None,
+        sandbox_provider: str | None = None,
+        workspace: str | None = None,
+        workspaces: Sequence[str] | None = None,
+        git: SessionGitOptions | Mapping[str, object] | None = None,
+        terminal_launch_args: Sequence[str] | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
+        cost_control_mode_override: Literal["on", "off"] | None = None,
+        subagent_routing_override: Literal["on", "off"] | None = None,
+        harness_override: str | None = None,
+        smart_routing_message: str | None = None,
+        input: CreateSessionInput | None = None,
+        stream: Literal[False] = False,
         timeout: Timeout = None,
         extra_headers: Headers = None,
         extra_query: Query = None,
@@ -508,10 +694,12 @@ class SessionsNamespace:
         subagent_routing_override: Literal["on", "off"] | None = None,
         harness_override: str | None = None,
         smart_routing_message: str | None = None,
+        input: CreateSessionInput | None = None,
+        stream: Literal[True],
         timeout: Timeout = None,
         extra_headers: Headers = None,
         extra_query: Query = None,
-    ) -> Session: ...
+    ) -> AsyncSessionEventStream: ...
 
     async def create(
         self,
@@ -538,18 +726,27 @@ class SessionsNamespace:
         harness_override: str | None = None,
         smart_routing_message: str | None = None,
         initial_items: Sequence[PublicSessionEventInput | Mapping[str, Any]] | None = None,
+        input: CreateSessionInput | None = None,
+        stream: bool = False,
         timeout: Timeout = None,
         extra_headers: Headers = None,
         extra_query: Query = None,
-    ) -> Session:
+    ) -> Session | AsyncSessionEventStream:
         """
-        Create a new session from an uploaded agent bundle.
+        Create a session and optionally submit initial user input.
 
-        Calls multipart ``POST /v1/sessions`` with a JSON
-        ``metadata`` form part and a ``bundle`` file part. The
-        endpoint returns only ``{"session_id": "..."}``, so this
-        method immediately fetches ``GET /v1/sessions/{id}`` and
-        returns the full typed snapshot.
+        Without ``bundle``, calls JSON ``POST /v1/sessions``. With a bundle,
+        calls the existing multipart endpoint and retrieves its full snapshot
+        when a snapshot is the promised return. ``input`` is submitted through
+        the existing events route after creation; it never substitutes the
+        server's history-seeding ``initial_items`` behavior.
+
+        With ``stream=True``, the method creates the session, opens its SSE
+        stream through ``session.heartbeat``, submits ``input`` if supplied,
+        and returns the already-open :class:`AsyncSessionEventStream`. The
+        caller owns that local stream immediately and should use ``async with``
+        or call ``aclose()``. Partial failures retain the created session ID in
+        :class:`SessionCompositionError` and never resend, interrupt, or delete.
 
         :param bundle: Gzipped agent tarball bytes.
         :param filename: Filename sent for the multipart file part,
@@ -572,10 +769,17 @@ class SessionsNamespace:
         :param sandbox_provider: With ``host_type="managed"``, which
             configured sandbox provider to provision (e.g. ``"lakebox"``);
             ``None`` takes the server's first. Ignored for external hosts.
-        :returns: The newly created :class:`Session` snapshot.
+        :param input: Text, one :class:`SessionMessage`, or an ordered sequence
+            of messages to submit after creation.
+        :param stream: Return an already-open event stream instead of a
+            snapshot.
+        :returns: The created :class:`Session` snapshot or event stream.
         :raises OmnigentError: If the server returns a non-2xx
             status.
         """
+        if input is not None and initial_items is not None:
+            raise ValueError("input and initial_items are mutually exclusive")
+        normalized_input = _normalize_create_input(input)
         if bundle is None and agent_id is None and project_id is None:
             raise ValueError("Pass bundle, agent_id, or project_id")
         if bundle is None and not isinstance(filename, NotGiven):
@@ -632,7 +836,18 @@ class SessionsNamespace:
                 **_options(timeout, extra_headers),
             )
             raise_for_status(response.status_code, response_body(response))
-            return Session.model_validate(require_json_object(response, "POST /v1/sessions"))
+            created_session = Session.model_validate(
+                require_json_object(response, "POST /v1/sessions")
+            )
+            return await self._complete_create(
+                created_session.id,
+                created_session=created_session,
+                input=normalized_input,
+                stream=stream,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
 
         registered_only = {
             "sub_agent_name": sub_agent_name,
@@ -684,12 +899,98 @@ class SessionsNamespace:
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
         session_id = str(created["session_id"])
-        return await self.retrieve(
+        return await self._complete_create(
             session_id,
+            created_session=None,
+            input=normalized_input,
+            stream=stream,
             timeout=timeout,
             extra_headers=extra_headers,
             extra_query=extra_query,
         )
+
+    async def _complete_create(
+        self,
+        session_id: str,
+        *,
+        created_session: Session | None,
+        input: SessionMessage | list[SessionMessage] | None,
+        stream: bool,
+        timeout: Timeout,
+        extra_headers: Headers,
+        extra_query: Query,
+    ) -> Session | AsyncSessionEventStream:
+        if stream:
+            try:
+                iterator = await self._open_stream_ready(
+                    session_id,
+                    timeout=timeout,
+                    extra_headers=extra_headers,
+                    extra_query=extra_query,
+                )
+            except Exception as exc:
+                raise SessionCompositionError(
+                    phase="stream_open",
+                    session_id=session_id,
+                    original_exception=exc,
+                ) from exc
+
+            events = AsyncSessionEventStream(self, session_id, iterator=iterator)
+            if input is None:
+                return events
+            try:
+                await self.events.create(
+                    session_id,
+                    events=input,
+                    timeout=timeout,
+                    extra_headers=extra_headers,
+                    extra_query=extra_query,
+                )
+            except BaseException as exc:
+                await events.aclose()
+                if isinstance(exc, Exception):
+                    raise SessionCompositionError(
+                        phase="input_submit",
+                        session_id=session_id,
+                        original_exception=exc,
+                    ) from exc
+                raise
+            return events
+
+        if input is None and created_session is not None:
+            return created_session
+
+        if input is not None:
+            try:
+                await self.events.create(
+                    session_id,
+                    events=input,
+                    timeout=timeout,
+                    extra_headers=extra_headers,
+                    extra_query=extra_query,
+                )
+            except Exception as exc:
+                raise SessionCompositionError(
+                    phase="input_submit",
+                    session_id=session_id,
+                    original_exception=exc,
+                ) from exc
+
+        try:
+            return await self.retrieve(
+                session_id,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+        except Exception as exc:
+            if input is None:
+                raise
+            raise SessionCompositionError(
+                phase="snapshot_retrieve",
+                session_id=session_id,
+                original_exception=exc,
+            ) from exc
 
     async def create_from_agent_id(
         self,
@@ -1675,7 +1976,7 @@ class SessionsNamespace:
             {"type": _INTERRUPT_TYPE, "data": {}},
         )
 
-    async def stream(
+    def stream(
         self,
         session_id: str,
         *,
@@ -1706,7 +2007,7 @@ class SessionsNamespace:
             status when opening the stream (404 when the session
             does not exist).
         """
-        async for event in _stream_session_events(
+        return _stream_session_events(
             self._http,
             self._base,
             session_id,
@@ -1714,12 +2015,16 @@ class SessionsNamespace:
             timeout=timeout,
             extra_headers=extra_headers,
             extra_query=extra_query,
-        ):
-            yield event
+        )
 
     async def _open_stream_ready(
         self,
         session_id: str,
+        *,
+        idle: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
     ) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
         """Open a session stream and consume its registration heartbeat.
 
@@ -1739,7 +2044,16 @@ class SessionsNamespace:
         :raises OmnigentError: If the stream closes or emits another event
             before its registration heartbeat.
         """
-        stream_aiter = self.stream(session_id).__aiter__()
+        stream_options: dict[str, Any] = {}
+        if idle:
+            stream_options["idle"] = True
+        if timeout is not None:
+            stream_options["timeout"] = timeout
+        if extra_headers is not None:
+            stream_options["extra_headers"] = extra_headers
+        if extra_query is not None:
+            stream_options["extra_query"] = extra_query
+        stream_aiter = self.stream(session_id, **stream_options).__aiter__()
         try:
             ready_event = await stream_aiter.__anext__()
             if ready_event.type != _STREAM_READY_EVENT_TYPE:

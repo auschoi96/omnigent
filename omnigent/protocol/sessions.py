@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from typing import Annotated, Any, Literal, Self, TypeVar, cast, get_args
 
 from pydantic import (
@@ -1462,6 +1462,36 @@ class SessionMessage(_StrictRequestModel):
     data: _SessionMessageData
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
+
+    @classmethod
+    def text(
+        cls,
+        text: str,
+        *,
+        model_override: str | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> Self:
+        """Build a user message containing one ``input_text`` block."""
+        return cls.from_content(
+            [{"type": "input_text", "text": text}],
+            model_override=model_override,
+            tools=tools,
+        )
+
+    @classmethod
+    def from_content(
+        cls,
+        content: Sequence[Mapping[str, Any]],
+        *,
+        model_override: str | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> Self:
+        """Build a user message from existing OmniGent content blocks."""
+        return cls(
+            data=_SessionMessageData(content=[dict(block) for block in content]),
+            model_override=model_override,
+            tools=[dict(tool) for tool in tools] if tools is not None else None,
+        )
 
 
 class _FunctionCallOutputInputData(_StrictRequestModel):

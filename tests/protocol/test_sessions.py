@@ -408,6 +408,27 @@ def test_public_session_event_inputs_accept_only_supported_shapes(
     assert parsed.model_dump(exclude_none=True) == raw
 
 
+def test_session_message_constructors_preserve_existing_wire_shape() -> None:
+    """Convenience constructors build only the existing message envelope."""
+    text = protocol.SessionMessage.text(
+        "hello",
+        model_override="model-1",
+        tools=[{"name": "search"}],
+    )
+    content = protocol.SessionMessage.from_content([{"type": "input_file", "file_id": "file_1"}])
+
+    assert text.model_dump(exclude_none=True) == {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        },
+        "model_override": "model-1",
+        "tools": [{"name": "search"}],
+    }
+    assert content.data.content == [{"type": "input_file", "file_id": "file_1"}]
+
+
 @pytest.mark.parametrize(
     "raw",
     [

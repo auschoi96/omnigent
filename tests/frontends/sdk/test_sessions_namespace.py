@@ -31,13 +31,19 @@ What each test claims to prove (and what failure indicates):
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any, cast
 
 import httpx
 import pytest
-from omnigent_client import NOT_GIVEN
+from omnigent_client import (
+    NOT_GIVEN,
+    AsyncSessionEventStream,
+    SessionCompositionError,
+    SessionMessage,
+)
 from omnigent_client._client import AsyncAgentsResource
 from omnigent_client._errors import OmnigentError
 from omnigent_client._sessions import (
@@ -94,6 +100,18 @@ def _format_sse_lines(events: Iterable[tuple[str, dict[str, Any] | str]]) -> byt
         else:
             parts.append(f"event: {event_type}\ndata: {json.dumps(payload)}\n\n")
     return "".join(parts).encode("utf-8")
+
+
+class _TrackedAsyncByteStream(httpx.AsyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self.content
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def _session_response_body(
@@ -698,8 +716,8 @@ async def test_stream_yields_typed_events_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_open_stream_ready_establishes_get_and_consumes_heartbeat() -> None:
-    """The readiness primitive opens the route and hides only its first ack."""
-    requested_paths: list[str] = []
+    """The public manager opens through readiness before a following write."""
+    requests: list[str] = []
     payloads: list[tuple[str, dict[str, Any] | str]] = [
         ("session.heartbeat", {"type": "session.heartbeat"}),
         (
@@ -708,26 +726,37 @@ async def test_open_stream_ready_establishes_get_and_consumes_heartbeat() -> Non
         ),
         ("done", "[DONE]"),
     ]
+    byte_stream = _TrackedAsyncByteStream(_format_sse_lines(payloads))
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requested_paths.append(request.url.path)
+        requests.append(f"{request.method} {request.url.path}")
+        if request.method == "POST":
+            return httpx.Response(202, json={"queued": True})
         return httpx.Response(
             200,
-            content=_format_sse_lines(payloads),
+            stream=byte_stream,
             headers={"content-type": "text/event-stream"},
         )
 
     ns, client = _make_namespace(handler)
     try:
-        stream = await ns._open_stream_ready("conv_abc")
-        events = [event async for event in stream]
+        async with ns.events.stream("conv_abc") as stream:
+            assert requests == ["GET /v1/sessions/conv_abc/stream"]
+            await ns.events.create(
+                "conv_abc",
+                events=SessionMessage.text("after subscribe"),
+            )
+            event = await stream.__anext__()
+        assert byte_stream.closed is True
     finally:
         await client.aclose()
 
-    assert requested_paths == ["/v1/sessions/conv_abc/stream"]
-    assert len(events) == 1
-    assert isinstance(events[0], OutputTextDeltaEvent)
-    assert events[0].delta == "after ready"
+    assert requests == [
+        "GET /v1/sessions/conv_abc/stream",
+        "POST /v1/sessions/conv_abc/events",
+    ]
+    assert isinstance(event, OutputTextDeltaEvent)
+    assert event.delta == "after ready"
 
 
 @pytest.mark.asyncio
@@ -1421,9 +1450,271 @@ async def test_create_accepts_project_only_and_rejects_bundle_registered_fields(
             await ns.create(  # type: ignore[call-overload]
                 agent_id="ag_123", filename="ignored.tar.gz"
             )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await ns.create(
+                agent_id="ag_123",
+                input="start",
+                initial_items=[Interrupt()],
+            )
         assert len(requests) == 2
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_value", "expected_texts"),
+    [
+        ("one", ["one"]),
+        (SessionMessage.text("two"), ["two"]),
+        ([SessionMessage.text("three"), SessionMessage.text("four")], ["three", "four"]),
+    ],
+)
+async def test_create_with_input_submits_messages_then_retrieves_snapshot(
+    input_value: object,
+    expected_texts: list[str],
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            assert "initial_items" not in json.loads(request.content)
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/events"):
+            payload = json.loads(request.content)
+            messages = payload if isinstance(payload, list) else [payload]
+            assert [message["data"]["content"][0]["text"] for message in messages] == (
+                expected_texts
+            )
+            acknowledgements = [{"queued": True} for _ in messages]
+            return httpx.Response(
+                202,
+                json=acknowledgements if isinstance(payload, list) else acknowledgements[0],
+            )
+        return httpx.Response(200, json=_session_response_body(status="running"))
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.create(agent_id="ag_abc", input=cast(Any, input_value))
+    finally:
+        await client.aclose()
+
+    assert session.status == "running"
+    assert [f"{request.method} {request.url.path}" for request in requests] == [
+        "POST /v1/sessions",
+        "POST /v1/sessions/conv_abc/events",
+        "GET /v1/sessions/conv_abc",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_stream_opens_before_input_and_owns_local_cleanup() -> None:
+    requests: list[httpx.Request] = []
+    byte_stream = _TrackedAsyncByteStream(
+        _format_sse_lines(
+            [
+                ("session.heartbeat", {"type": "session.heartbeat"}),
+                (
+                    "response.created",
+                    {
+                        "type": "response.created",
+                        "response": _completed_response_dict("resp_1", "in_progress"),
+                    },
+                ),
+                (
+                    "response.completed",
+                    {
+                        "type": "response.completed",
+                        "response": _completed_response_dict("resp_1"),
+                    },
+                ),
+            ]
+        )
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(
+                200,
+                stream=byte_stream,
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    ns, client = _make_namespace(handler)
+    try:
+        events = await ns.create(
+            agent_id="ag_abc",
+            input="start",
+            stream=True,
+            timeout=9.0,
+            extra_headers={"x-test": "yes"},
+            extra_query={"trace": "one"},
+        )
+        assert isinstance(events, AsyncSessionEventStream)
+        assert [f"{request.method} {request.url.path}" for request in requests] == [
+            "POST /v1/sessions",
+            "GET /v1/sessions/conv_abc/stream",
+            "POST /v1/sessions/conv_abc/events",
+        ]
+        async with events as entered:
+            assert entered is events
+            observed = [event async for event in events]
+        assert byte_stream.closed is True
+    finally:
+        await client.aclose()
+
+    assert [event.type for event in observed] == ["response.created", "response.completed"]
+    assert events.session_id == "conv_abc"
+    assert events.last_response_id == "resp_1"
+    assert events.terminal_event is observed[-1]
+    for request in requests:
+        assert request.headers["x-test"] == "yes"
+        assert request.url.params["trace"] == "one"
+        assert request.extensions["timeout"]["read"] == 9.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "status"),
+    [
+        ("response.completed", "completed"),
+        ("response.failed", "failed"),
+        ("response.incomplete", "incomplete"),
+        ("response.cancelled", "cancelled"),
+    ],
+)
+async def test_event_stream_stops_on_each_response_terminal(
+    event_type: str,
+    status: str,
+) -> None:
+    payloads: list[tuple[str, dict[str, Any] | str]] = [
+        ("session.heartbeat", {"type": "session.heartbeat"}),
+        (
+            event_type,
+            {
+                "type": event_type,
+                "response": _completed_response_dict("resp_terminal", status),
+            },
+        ),
+        (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "must not be yielded"},
+        ),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_format_sse_lines(payloads))
+
+    ns, client = _make_namespace(handler)
+    try:
+        async with ns.events.stream("conv_abc") as events:
+            observed = [event async for event in events]
+    finally:
+        await client.aclose()
+
+    assert [event.type for event in observed] == [event_type]
+    assert events.last_response_id == "resp_terminal"
+    assert events.terminal_event is observed[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "stream"),
+    [
+        ("stream_open", True),
+        ("input_submit", True),
+        ("snapshot_retrieve", False),
+    ],
+)
+async def test_create_composition_failure_retains_session_without_compensation(
+    phase: str,
+    stream: bool,
+) -> None:
+    requests: list[httpx.Request] = []
+    stream_payloads = [
+        (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "not ready"},
+        )
+    ]
+    if phase != "stream_open":
+        stream_payloads.insert(0, ("session.heartbeat", {"type": "session.heartbeat"}))
+    byte_stream = _TrackedAsyncByteStream(_format_sse_lines(stream_payloads))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            if phase == "snapshot_retrieve":
+                return httpx.Response(201, json={"session_id": "conv_abc"})
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, stream=byte_stream)
+        if request.url.path.endswith("/events"):
+            if phase == "input_submit":
+                return httpx.Response(
+                    500,
+                    json={"error": {"code": "server_error", "message": "submit failed"}},
+                )
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            500,
+            json={"error": {"code": "server_error", "message": "retrieve failed"}},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(SessionCompositionError) as raised:
+            if phase == "snapshot_retrieve":
+                await ns.create(b"bundle", input="start once")
+            else:
+                await ns.create(agent_id="ag_abc", input="start once", stream=True)
+        if stream:
+            assert byte_stream.closed is True
+    finally:
+        await client.aclose()
+
+    error = raised.value
+    assert error.phase == phase
+    assert error.session_id == "conv_abc"
+    assert error.original_exception is error.__cause__
+    event_posts = [request for request in requests if request.url.path.endswith("/events")]
+    assert len(event_posts) == (0 if phase == "stream_open" else 1)
+    assert all(request.method != "DELETE" for request in requests)
+
+
+@pytest.mark.asyncio
+async def test_create_stream_cancellation_during_input_closes_local_stream() -> None:
+    requests: list[httpx.Request] = []
+    byte_stream = _TrackedAsyncByteStream(
+        _format_sse_lines([("session.heartbeat", {"type": "session.heartbeat"})])
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(201, json=_session_response_body(status="idle"))
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, stream=byte_stream)
+        raise asyncio.CancelledError
+
+    ns, client = _make_namespace(handler)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await ns.create(agent_id="ag_abc", input="start", stream=True)
+        assert byte_stream.closed is True
+    finally:
+        await client.aclose()
+
+    assert [f"{request.method} {request.url.path}" for request in requests] == [
+        "POST /v1/sessions",
+        "GET /v1/sessions/conv_abc/stream",
+        "POST /v1/sessions/conv_abc/events",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1478,7 +1769,15 @@ async def test_events_stream_uses_sse_default_or_explicit_timeout(
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed.append(request.extensions["timeout"])
-        return httpx.Response(200, content="event: done\ndata: [DONE]\n\n")
+        return httpx.Response(
+            200,
+            content=_format_sse_lines(
+                [
+                    ("session.heartbeat", {"type": "session.heartbeat"}),
+                    ("done", "[DONE]"),
+                ]
+            ),
+        )
 
     ns, client = _make_namespace(handler)
     try:
@@ -1824,3 +2123,83 @@ async def test_list_preserves_host_id_on_rows() -> None:
     by_id = {row.id: row for row in rows}
     assert by_id["conv_host_bound"].host_id == "a1b2c3d4e5f67890abcdef1234567890"
     assert by_id["conv_unbound"].host_id is None
+
+
+@pytest.mark.asyncio
+async def test_create_with_stream_no_input_opens_ready_stream() -> None:
+    """create(stream=True) without input opens a ready stream."""
+    request_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_log.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/v1/sessions" and request.method == "POST":
+            return httpx.Response(
+                200,
+                json=_session_response_body(session_id="conv_s", status="running"),
+            )
+        if request.url.path == "/v1/sessions/conv_s/stream":
+            return httpx.Response(
+                200,
+                content=_format_sse_lines(
+                    [
+                        ("session.heartbeat", {"type": "session.heartbeat"}),
+                        ("done", "[DONE]"),
+                    ]
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(404)
+
+    ns, client = _make_namespace(handler)
+    try:
+        events = await ns.create(agent_id="ag_abc", stream=True)
+        assert isinstance(events, AsyncSessionEventStream)
+        assert events.session_id == "conv_s"
+        consumed = [event async for event in events]
+        assert consumed == []  # heartbeat consumed, then [DONE]
+    finally:
+        await client.aclose()
+
+    # Create, then stream GET — no events POST since input is None
+    assert request_log == ["POST /v1/sessions", "GET /v1/sessions/conv_s/stream"]
+
+
+@pytest.mark.asyncio
+async def test_event_stream_context_exit_closes_stream_only() -> None:
+    """Context exit closes the HTTP stream; no interrupt or delete is sent."""
+    request_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_log.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/v1/sessions" and request.method == "POST":
+            return httpx.Response(
+                200,
+                json=_session_response_body(session_id="conv_ctx", status="running"),
+            )
+        if request.url.path == "/v1/sessions/conv_ctx/stream":
+            return httpx.Response(
+                200,
+                content=_format_sse_lines(
+                    [
+                        ("session.heartbeat", {"type": "session.heartbeat"}),
+                        ("done", "[DONE]"),
+                    ]
+                ),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(404)
+
+    ns, client = _make_namespace(handler)
+    try:
+        events = await ns.create(agent_id="ag_abc", stream=True)
+        assert isinstance(events, AsyncSessionEventStream)
+        async with events:
+            pass  # immediate exit
+    finally:
+        await client.aclose()
+
+    methods = [r.split(" ")[0] for r in request_log]
+    paths = [r.split(" ")[1] for r in request_log]
+    # Only POST /v1/sessions and GET stream — no DELETE, no events POST
+    assert "DELETE" not in methods
+    assert not any("events" in p for p in paths)

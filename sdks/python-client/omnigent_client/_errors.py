@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import httpx
 
 _BODY_PREVIEW_CHARS = 200
@@ -17,6 +19,29 @@ class OmnigentError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+
+
+class SessionCompositionError(OmnigentError):
+    """A multi-request session create flow failed after creation succeeded."""
+
+    def __init__(
+        self,
+        *,
+        phase: Literal["stream_open", "input_submit", "snapshot_retrieve"],
+        session_id: str,
+        original_exception: Exception,
+    ) -> None:
+        status_code = getattr(original_exception, "status_code", None)
+        code = getattr(original_exception, "code", None)
+        super().__init__(
+            f"Session {session_id!r} was created, but the "
+            f"{phase.replace('_', ' ')} phase failed: {original_exception}",
+            status_code=status_code,
+            code=code,
+        )
+        self.phase = phase
+        self.session_id = session_id
+        self.original_exception = original_exception
 
 
 class AgentNotFoundError(OmnigentError):

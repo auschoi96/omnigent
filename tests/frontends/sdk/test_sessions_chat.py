@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -1700,7 +1701,11 @@ async def test_send_dispatches_sync_callable() -> None:
         tools=[{"name": "compute", "runtime": "client"}],
     )
 
+    event_loop_thread = threading.get_ident()
+    callable_threads: list[int] = []
+
     def _sync_callable(info: SessionToolCallInfo) -> str:
+        callable_threads.append(threading.get_ident())
         return f"sync result for {info.name}"
 
     ns = _FakeNamespace(
@@ -1730,6 +1735,7 @@ async def test_send_dispatches_sync_callable() -> None:
     # would fail with a TypeError before reaching the check.
     output_call = ns.post_event_calls[1]
     assert output_call.event["data"]["output"] == "sync result for compute"
+    assert callable_threads and callable_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

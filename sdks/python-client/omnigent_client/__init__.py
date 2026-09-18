@@ -26,6 +26,8 @@ Or consume semantic blocks via :class:`BlockStream`::
         ...
 """
 
+from omnigent.protocol import FunctionCallOutput, Interrupt, SessionMessage
+
 from ._blocks import (
     AnyBlock,
     BlockContext,
@@ -55,6 +57,7 @@ from ._client import OmnigentClient
 from ._errors import (
     OmnigentError,
     RateLimitedError,
+    SessionCompositionError,
     StaleCursorError,
     ToolCallDenied,
 )
@@ -65,7 +68,12 @@ from ._query import QueryResult, QueryStream
 from ._raw_response import APIResponse
 from ._server import LocalServer
 from ._session import Session
-from ._sessions import RegisteredAgent, SessionsNamespace
+from ._sessions import (
+    AsyncSessionEventStream,
+    CreateSessionInput,
+    RegisteredAgent,
+    SessionsNamespace,
+)
 from ._sessions_chat import SessionsChat, SessionToolCallInfo, ToolCallable
 from ._stream import BlockStream, format_tool_args_brief
 from ._tool_handler import (
@@ -91,14 +99,18 @@ __all__ = [
     "APIResponse",
     "AnyBlock",
     "AsyncCursorPage",
+    "AsyncSessionEventStream",
     "BlockContext",
     "BlockStream",
     "CompactionBlock",
+    "CreateSessionInput",
     "ElicitationRequest",
     "ElicitationRequestCtx",
     "ErrorBlock",
     "File",
     "FileBlock",
+    "FunctionCallOutput",
+    "Interrupt",
     "LocalServer",
     "NativeToolBlock",
     "NotGiven",
@@ -115,6 +127,8 @@ __all__ = [
     "ResponseStartBlock",
     "RetryBlock",
     "Session",
+    "SessionCompositionError",
+    "SessionMessage",
     "SessionToolCallInfo",
     "SessionsChat",
     "SessionsNamespace",

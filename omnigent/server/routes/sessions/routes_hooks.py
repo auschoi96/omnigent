@@ -1066,8 +1066,10 @@ def register_hooks_routes(
         # not gated on write access.
         if result.action == PolicyAction.DENY and phase == Phase.TOOL_CALL:
             _publish_policy_denied(session_id, result.reason or "Blocked by policy.", phase.value)
-        # Queue cost-cap interrupts before returning the denial. A read-only
-        # policy evaluation must not signal runners.
+        # Queue cost-cap interrupts before returning the denial. This route
+        # admits read-level callers, so the helper re-checks effective EDIT
+        # on the parent chain before signalling runners; ``is_read_only``
+        # only reflects the direct grant.
         if result.action == PolicyAction.DENY and not is_read_only:
             await _interrupt_subagents_on_cost_budget_deny(
                 session_id,
@@ -1076,6 +1078,8 @@ def register_hooks_routes(
                 get_server_runner_router(),
                 engine=engine,
                 result=result,
+                user_id=user_id,
+                permission_store=permission_store,
             )
         # An LLM_RESPONSE DENY reaches the harness only after the assistant
         # text already streamed through the runner relay, whose terminal

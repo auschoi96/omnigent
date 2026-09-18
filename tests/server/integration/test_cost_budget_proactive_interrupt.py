@@ -595,3 +595,216 @@ async def test_read_only_budget_deny_leaves_children_running(
 
     access.assert_awaited_once()
     assert interrupted_sessions == []
+
+
+# ── Effective permissions ────────────────────────────────────────────────────
+
+
+_OWNER = "owner@example.com"
+_VIEWER = "viewer@example.com"
+
+
+@pytest.fixture()
+def auth_policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+    """Policy-enabled app with a real permission store and header auth.
+
+    The single-user ``policy_app`` skips permission resolution entirely, so
+    it cannot exercise the effective-EDIT gate on tree-wide interrupts.
+
+    :param runtime_init: Fixture that initializes the runtime with a mock LLM.
+    :param db_uri: Test database URI.
+    :param tmp_path: Pytest temporary directory fixture.
+    """
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        policy_store=SqlAlchemyPolicyStore(db_uri),
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        auth_provider=UnifiedAuthProvider(source="header"),
+    )
+
+
+@pytest_asyncio.fixture()
+async def auth_client(
+    auth_policy_app: FastAPI,
+    mock_llm: ControllableMockClient,
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Async HTTP client wired to the auth-enabled policy app.
+
+    :param auth_policy_app: The auth-enabled FastAPI app.
+    :param mock_llm: Controllable mock LLM (released on teardown).
+    :param tmp_path: Pytest temporary directory fixture.
+    :param db_uri: Test database URI.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.runtime import _globals, set_harness_process_manager
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+
+    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
+    await pm.start()
+    set_harness_process_manager(pm)
+
+    monkeypatch.setattr(_globals, "_policy_store", SqlAlchemyPolicyStore(db_uri))
+
+    transport = httpx.ASGITransport(app=auth_policy_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+    mock_llm.release_all()
+    set_harness_process_manager(None)
+    await pm.shutdown()
+
+
+async def _set_up_shared_over_budget_tree(
+    client: httpx.AsyncClient, store: SqlAlchemyConversationStore
+) -> tuple[str, str]:
+    """Build the over-budget parent+child tree owned by ``_OWNER``.
+
+    :param client: Test HTTP client for the auth-enabled app.
+    :param store: Conversation store for spawning the child + seeding usage.
+    :returns: ``(parent_id, child_id)``.
+    """
+    owner_headers = {"X-Forwarded-Email": _OWNER}
+    agent = await create_test_agent(client, user=_OWNER)
+    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]}, headers=owner_headers)
+    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
+    parent_id = resp.json()["id"]
+
+    child_row = store.create_conversation(
+        agent_id=agent["id"],
+        parent_conversation_id=parent_id,
+        title="runaway sub-agent",
+    )
+    child_id = child_row.id
+
+    attach = await client.post(
+        f"/v1/sessions/{parent_id}/policies",
+        json=_COST_BUDGET_PAYLOAD,
+        headers=owner_headers,
+    )
+    assert attach.status_code < 400, f"policy attach failed: {attach.status_code} {attach.text}"
+
+    store.set_session_usage(parent_id, {"total_cost_usd": _PARENT_SPEND_USD})
+    store.set_session_usage(child_id, {"total_cost_usd": _CHILD_SPEND_USD})
+    return parent_id, child_id
+
+
+async def _assert_native_gate_denies(
+    client: httpx.AsyncClient, session_id: str, user: str
+) -> None:
+    """Evaluate the native request gate as *user* and expect a budget DENY."""
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_request_event(),
+        headers={"X-Forwarded-Email": user},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["result"] == "POLICY_ACTION_DENY", resp.text
+
+
+async def test_inherited_read_access_cannot_interrupt_tree(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    interrupted_sessions: list[str],
+) -> None:
+    """A parent-READ collaborator's child evaluation must not signal runners.
+
+    The child has no direct grant, so the caller's displayed level is
+    ``None`` and the route's direct-grant ``is_read_only`` check treats the
+    viewer as writable. The interrupt gate must instead require effective
+    EDIT on the parent chain: the viewer still receives the budget denial,
+    but no runner gets an interrupt.
+    """
+    from omnigent.server.auth import LEVEL_READ
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent_id, child_id = await _set_up_shared_over_budget_tree(auth_client, store)
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(_VIEWER)
+    perms.grant(_VIEWER, parent_id, LEVEL_READ)
+
+    await _assert_native_gate_denies(auth_client, child_id, _VIEWER)
+
+    assert interrupted_sessions == []
+
+
+async def test_child_edit_grant_without_parent_edit_cannot_interrupt_tree(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    interrupted_sessions: list[str],
+) -> None:
+    """A direct child EDIT grant does not authorize tree-wide interrupts.
+
+    Sub-agent access delegates to the parent chain, so a caller with parent
+    READ plus a direct EDIT grant on the child still lacks effective EDIT.
+    The denial is returned; no interrupts are sent.
+    """
+    from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent_id, child_id = await _set_up_shared_over_budget_tree(auth_client, store)
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(_VIEWER)
+    perms.grant(_VIEWER, parent_id, LEVEL_READ)
+    perms.grant(_VIEWER, child_id, LEVEL_EDIT)
+
+    await _assert_native_gate_denies(auth_client, child_id, _VIEWER)
+
+    assert interrupted_sessions == []
+
+
+async def test_parent_editor_evaluation_still_interrupts(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    interrupted_sessions: list[str],
+) -> None:
+    """Effective EDIT via the parent chain keeps the interrupt behavior."""
+    from omnigent.server.auth import LEVEL_EDIT
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent_id, child_id = await _set_up_shared_over_budget_tree(auth_client, store)
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user(_VIEWER)
+    perms.grant(_VIEWER, parent_id, LEVEL_EDIT)
+
+    await _assert_native_gate_denies(auth_client, child_id, _VIEWER)
+
+    assert interrupted_sessions == [child_id]
+
+
+async def test_tree_load_failure_preserves_denial(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted_sessions: list[str],
+) -> None:
+    """A store failure during interrupt discovery must not become an HTTP 500."""
+    import omnigent.runtime.policies.builder as builder_mod
+
+    store = SqlAlchemyConversationStore(db_uri)
+    parent_id, _child_id = await _set_up_over_budget_tree(client, store)
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("conversation store unavailable")
+
+    monkeypatch.setattr(builder_mod, "load_session_tree", _boom)
+
+    await _assert_denied(client, parent_id, "native")
+
+    assert interrupted_sessions == []

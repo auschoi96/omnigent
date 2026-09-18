@@ -532,17 +532,22 @@ async def test_sharded_get_host_readdresses_to_the_tunnel_owner(
 ) -> None:
     """A host-scoped detail read never serves another replica's empty cache."""
     app_b, registry_b, _hs, _cs = host_api_app
-    _comm = await _connect_host(app_b, registry_b)
+    comm = await _connect_host(app_b, registry_b)
 
-    app_a, registry_a, _store_a, _conv_a = _build_host_api_app(db_uri)
-    assert registry_a.get(_HOST_ID) is None
-    monkeypatch.setattr("omnigent.server.routes.hosts._deployment_is_sharded", lambda: True)
+    try:
+        app_a, registry_a, _store_a, _conv_a = _build_host_api_app(db_uri)
+        assert registry_a.get(_HOST_ID) is None
+        monkeypatch.setattr("omnigent.server.routes.hosts._deployment_is_sharded", lambda: True)
 
-    async with AsyncClient(transport=ASGITransport(app=app_a), base_url="http://test") as client:
-        response = await client.get(f"/v1/hosts/{_HOST_ID}")
+        async with AsyncClient(
+            transport=ASGITransport(app=app_a), base_url="http://test"
+        ) as client:
+            response = await client.get(f"/v1/hosts/{_HOST_ID}")
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+    finally:
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
 async def test_list_hosts_reports_offline_after_disconnect(

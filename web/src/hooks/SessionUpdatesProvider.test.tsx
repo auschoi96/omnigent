@@ -193,6 +193,7 @@ describe("SessionUpdatesProvider host changes", () => {
     act(() => frameHandler()({ type: "hosts_changed" }));
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["hosts"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["host-detail"] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-agent"] });
   });
 });

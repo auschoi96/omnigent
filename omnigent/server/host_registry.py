@@ -31,7 +31,7 @@ from cachetools import TTLCache
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHelloFrame, HostSkillsResultFrame
+from omnigent.host.frames import HostHarnessReadinessFrame, HostHelloFrame, HostSkillsResultFrame
 
 _logger = logging.getLogger(__name__)
 
@@ -475,6 +475,50 @@ class HostRegistry:
             if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
                 return False
             conn.last_frame_at = time.time()
+            return True
+
+    def stage_capability_update(
+        self,
+        conn: HostConnection,
+        frame: HostHarnessReadinessFrame,
+    ) -> bool:
+        """Stage a readiness frame only if its tunnel is still current.
+
+        Completion stays pending until the durable host row is updated. This
+        lets routing waiters safely re-read the row after their event fires.
+        """
+        with self._lock:
+            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
+                return False
+            conn.hello.configured_harnesses = (
+                dict(frame.configured_harnesses)
+                if frame.configured_harnesses is not None
+                else None
+            )
+            conn.hello.gateway_inference = (
+                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
+            )
+            if frame.gateway_inference is None:
+                self._gateway_inference.pop(conn.host_id, None)
+            else:
+                self._gateway_inference[conn.host_id] = dict(frame.gateway_inference)
+            if frame.capabilities_pending:
+                conn.hello.capabilities_pending = True
+            return True
+
+    def finish_capability_update(
+        self,
+        conn: HostConnection,
+        *,
+        capabilities_pending: bool,
+    ) -> bool:
+        """Publish staged completion if *conn* still owns this host."""
+        with self._lock:
+            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
+                return False
+            conn.hello.capabilities_pending = capabilities_pending
+            if not capabilities_pending:
+                conn.capabilities_ready.set()
             return True
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:

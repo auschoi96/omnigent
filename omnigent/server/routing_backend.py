@@ -233,9 +233,16 @@ def gateway_backs_all(
 
     gateway = reported_gateway_inference(host)
     if host_has_async_capabilities(host):
-        from omnigent.gateway_inference import gateway_inference_state
+        from omnigent.gateway_inference import (
+            gateway_inference_harness_supported,
+            gateway_inference_state,
+        )
 
-        return all(gateway_inference_state(gateway, harness) is True for harness in harnesses)
+        return all(
+            not gateway_inference_harness_supported(harness)
+            or gateway_inference_state(gateway, harness) is True
+            for harness in harnesses
+        )
     return not not_gateway_backed(gateway, harnesses)
 
 

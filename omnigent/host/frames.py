@@ -39,23 +39,16 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
-# Negotiated on the WebSocket upgrade. A host uses the early-registration
-# protocol only when the server selects this subprotocol; omission keeps the
-# legacy wait-for-capabilities handshake for rolling upgrades.
-HOST_ASYNC_CAPABILITIES_SUBPROTOCOL = "omnigent.host-async-capabilities.v1"
-
-# Extends the v1 early-registration protocol with an authenticated server →
-# host identity frame. New hosts offer both versions so an older server can
-# select v1; only v2 lets the host skip its legacy /v1/me fallback.
+# Negotiated on the WebSocket upgrade. A host registers before capability
+# discovery only when the server selects this protocol. It also carries the
+# authenticated server → host identity frame that replaces the legacy /v1/me
+# lookup. Omission keeps both legacy ordering guarantees during rolling upgrades.
 HOST_IDENTITY_SUBPROTOCOL = "omnigent.host-async-capabilities.v2"
 
 
 def host_subprotocol_has_async_capabilities(subprotocol: str | None) -> bool:
-    """Return whether *subprotocol* includes v1 early registration."""
-    return subprotocol in {
-        HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
-        HOST_IDENTITY_SUBPROTOCOL,
-    }
+    """Return whether *subprotocol* includes early registration."""
+    return subprotocol == HOST_IDENTITY_SUBPROTOCOL
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -267,10 +260,6 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
-    :param require_capability_barrier: Whether an unresolved ``harness=None``
-        launch must wait for startup capability discovery before spawning.
-        New servers set this to preserve the legacy ordering when a new host
-        registers before advisory discovery completes.
     """
 
     request_id: str
@@ -278,7 +267,6 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
-    require_capability_barrier: bool = False
 
 
 @dataclass
@@ -1248,11 +1236,6 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
-                **(
-                    {"require_capability_barrier": True}
-                    if frame.require_capability_barrier
-                    else {}
-                ),
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1844,7 +1827,6 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
-        require_capability_barrier=bool(msg.get("require_capability_barrier", False)),
     )
 
 

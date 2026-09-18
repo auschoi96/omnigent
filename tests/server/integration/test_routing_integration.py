@@ -8,6 +8,7 @@ fail-mode knob, and the decision cache.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner import subagent_routing
 from omnigent.runner.subagent_routing import (
     AUTO_HARNESS_LABEL_KEY,
@@ -26,6 +28,7 @@ from omnigent.server.routes._sessions.common import get_server_host_registry
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.smart_routing import RoutingResult
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import Host
 from tests.server.helpers import (
     FakeCaps,
     FakeRoutingClient,
@@ -2232,3 +2235,156 @@ async def test_an_auto_harness_outage_leaves_the_route_once_label_unclaimed(
     assert routed is not None
     assert routed.model_override == GPT_MODEL
     assert routed.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+
+async def test_auto_harness_timeout_does_not_persist_or_forward_the_first_prompt(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A pending host snapshot leaves a clean request for the caller to retry."""
+    agent = await create_test_agent(
+        client,
+        name="routing-pending-capabilities-auto",
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "cost_control_mode_override": "on",
+            "harness_override": "auto",
+        },
+    )
+    assert created.status_code == 201, created.text
+    session_id = str(created.json()["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="sized task", harness="codex")
+    )
+    forwarded: list[dict[str, Any]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "first"}]},
+    )
+    async with httpx.AsyncClient(
+        base_url="http://runner.test",
+        transport=httpx.MockTransport(_handler),
+    ) as runner_client:
+        with (
+            patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
+            patch.object(
+                orchestration_module,
+                "_wait_for_host_capabilities",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            with pytest.raises(OmnigentError) as error:
+                await orchestration_module._forward_event_to_runner(
+                    conv.id,
+                    conv,
+                    body,
+                    conv_store,
+                    runner_client,
+                )
+
+    pending = conv_store.get_conversation(session_id)
+    assert pending is not None
+    assert pending.harness_override == "auto"
+    assert error.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert routing_client.calls == []
+    assert forwarded == []
+    assert conv_store.list_items(session_id).data == []
+
+    async with httpx.AsyncClient(
+        base_url="http://runner.test",
+        transport=httpx.MockTransport(_handler),
+    ) as runner_client:
+        with (
+            patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
+            patch.object(
+                orchestration_module,
+                "_wait_for_host_capabilities",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            await orchestration_module._forward_event_to_runner(
+                pending.id,
+                pending,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    resolved = conv_store.get_conversation(session_id)
+    assert resolved is not None
+    assert resolved.harness_override == "codex"
+    assert len(routing_client.calls) == 1
+    assert len(forwarded) == 1
+
+
+async def test_running_session_routing_uses_ready_tunnel_capabilities() -> None:
+    """A local pending handshake supplies its exact generation's snapshot."""
+    pending_host = Host(
+        host_id=_GATEWAY_HOST_ID,
+        name="test",
+        user_id="local",
+        status="online",
+        created_at=0,
+        updated_at=0,
+        configured_harnesses=None,
+    )
+    connection = SimpleNamespace(
+        hello=SimpleNamespace(
+            capabilities_pending=True,
+            configured_harnesses=None,
+        ),
+        capabilities_ready=asyncio.Event(),
+    )
+    registry = SimpleNamespace(get=lambda host_id: connection)
+
+    refresh = asyncio.create_task(
+        orchestration_module._session_routing_host_after_capabilities(
+            pending_host,
+            registry,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not refresh.done()
+
+    connection.hello.configured_harnesses = {"codex-native": True}
+    connection.hello.capabilities_pending = False
+    connection.capabilities_ready.set()
+    result = await refresh
+
+    assert result is not pending_host
+    assert result is not None
+    assert result.configured_harnesses == {"codex-native": True}
+
+
+async def test_running_session_routing_without_local_tunnel_remains_fail_open() -> None:
+    """A request on another replica preserves the legacy unknown-host behavior."""
+    stale_host = Host(
+        host_id=_GATEWAY_HOST_ID,
+        name="test",
+        user_id="local",
+        status="online",
+        created_at=0,
+        updated_at=0,
+        configured_harnesses={"claude-native": True},
+    )
+    registry = SimpleNamespace(get=lambda host_id: None)
+
+    result = await orchestration_module._session_routing_host_after_capabilities(
+        stale_host,
+        registry,
+    )
+
+    assert result is stale_host

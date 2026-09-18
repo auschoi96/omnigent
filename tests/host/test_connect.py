@@ -31,7 +31,6 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
-    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
     HOST_IDENTITY_SUBPROTOCOL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
@@ -900,41 +899,6 @@ async def test_handle_launch_without_harness_skips_check(
     _cleanup_host(host)
 
 
-async def test_unresolved_launch_joins_new_server_capability_barrier(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A new server cannot bypass discovery by sending ``harness=None``."""
-    host = _make_host_process()
-    discovery_started = asyncio.Event()
-    discovery_release = asyncio.Event()
-
-    async def _discover() -> None:
-        discovery_started.set()
-        await discovery_release.wait()
-        host._capabilities_initialized = True
-
-    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
-    launch_task = asyncio.create_task(
-        host._handle_launch(
-            HostLaunchRunnerFrame(
-                request_id="req_unresolved_barrier",
-                binding_token="token_barrier",
-                workspace="/missing-after-barrier",
-                require_capability_barrier=True,
-            )
-        )
-    )
-    await asyncio.wait_for(discovery_started.wait(), timeout=1.0)
-    await asyncio.sleep(0)
-    assert not launch_task.done()
-
-    discovery_release.set()
-    result = await asyncio.wait_for(launch_task, timeout=1.0)
-
-    assert result.status == "failed"
-    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
-
-
 async def test_handle_launch_prints_exact_runner_log_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1082,7 +1046,7 @@ class _AsyncCapabilitiesTunnel(_BlockingTunnel):
 
     def __init__(self) -> None:
         super().__init__()
-        self.subprotocol = HOST_ASYNC_CAPABILITIES_SUBPROTOCOL
+        self.subprotocol = HOST_IDENTITY_SUBPROTOCOL
 
 
 async def _cancel(task: asyncio.Task[None]) -> None:
@@ -2214,12 +2178,10 @@ async def test_run_cancels_inflight_capability_discovery_on_shutdown(
     assert host._capability_init_task is None
 
 
-@pytest.mark.parametrize("subprotocol", [None, HOST_ASYNC_CAPABILITIES_SUBPROTOCOL])
-async def test_owner_lookup_does_not_delay_registration(
+async def test_legacy_owner_lookup_precedes_registration(
     monkeypatch: pytest.MonkeyPatch,
-    subprotocol: str | None,
 ) -> None:
-    """Legacy and v1 /v1/me attribution runs behind the host hello."""
+    """An old server keeps the historical /v1/me-before-hello ordering."""
     import websockets.asyncio.client as ws_client
 
     host = _make_host_process()
@@ -2227,7 +2189,7 @@ async def test_owner_lookup_does_not_delay_registration(
     lookup_started = asyncio.Event()
     lookup_release = asyncio.Event()
     tunnel = _BlockingTunnel()
-    tunnel.subprotocol = subprotocol
+    tunnel.subprotocol = None
 
     async def _blocked_lookup() -> None:
         lookup_started.set()
@@ -2246,24 +2208,16 @@ async def test_owner_lookup_does_not_delay_registration(
 
     connect_task = asyncio.create_task(host._connect_and_serve())
     try:
-        await asyncio.wait_for(
-            asyncio.gather(lookup_started.wait(), tunnel.first_send.wait()),
-            timeout=1.0,
-        )
-        lookup_task = host._owner_user_id_task
-        assert lookup_task is not None
-        assert not lookup_task.done()
-        assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+        await asyncio.wait_for(lookup_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        assert not tunnel.first_send.is_set()
 
-        await _cancel(connect_task)
-        assert not lookup_task.cancelled()
         lookup_release.set()
-        await lookup_task
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
     finally:
         if not connect_task.done():
             await _cancel(connect_task)
-        if host._owner_user_id_task is not None and not host._owner_user_id_task.done():
-            await _cancel(host._owner_user_id_task)
 
 
 async def test_negotiated_identity_skips_me_and_precedes_request_dispatch(
@@ -2343,79 +2297,6 @@ async def test_negotiated_identity_skips_me_and_precedes_request_dispatch(
         ]
     finally:
         await _cancel(connect_task)
-
-
-async def test_owner_lookup_is_shared_and_retried_after_an_empty_result(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A live lookup is shared; a later reconnect may retry no-attribution results."""
-    host = _make_host_process()
-    release = asyncio.Event()
-    calls = 0
-
-    async def _lookup() -> None:
-        nonlocal calls
-        calls += 1
-        await release.wait()
-        if calls == 2:
-            host._owner_user_id = "user-123"
-
-    monkeypatch.setattr(host, "_ensure_owner_user_id", _lookup)
-    host._start_owner_user_id_resolution()
-    first = host._owner_user_id_task
-    host._start_owner_user_id_resolution()
-    assert host._owner_user_id_task is first
-    assert calls == 0
-
-    await asyncio.sleep(0)
-    assert calls == 1
-    release.set()
-    assert first is not None
-    await first
-
-    release.clear()
-    host._start_owner_user_id_resolution()
-    second = host._owner_user_id_task
-    assert second is not None and second is not first
-    release.set()
-    await second
-
-    assert calls == 2
-    assert host._owner_user_id == "user-123"
-    host._start_owner_user_id_resolution()
-    assert host._owner_user_id_task is second
-
-
-async def test_run_cancels_inflight_owner_lookup_on_shutdown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Daemon teardown owns and drains the background attribution lookup."""
-    host = _host()
-    host._zygote_disabled = True
-    host._capabilities_initialized = True
-    lookup_started = asyncio.Event()
-    lookup_cancelled = asyncio.Event()
-
-    async def _lookup() -> None:
-        lookup_started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            lookup_cancelled.set()
-
-    async def _connect_and_serve() -> None:
-        host._start_owner_user_id_resolution()
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(host, "_ensure_owner_user_id", _lookup)
-    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
-    monkeypatch.setattr(host, "_reap_orphans_once", lambda: 0)
-    run_task = asyncio.create_task(host.run())
-    await asyncio.wait_for(lookup_started.wait(), timeout=1.0)
-    await _cancel(run_task)
-
-    assert lookup_cancelled.is_set()
-    assert host._owner_user_id_task is None
 
 
 async def test_capability_probe_failure_does_not_block_registration(

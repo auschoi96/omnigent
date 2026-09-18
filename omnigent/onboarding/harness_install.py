@@ -43,6 +43,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
@@ -800,6 +801,18 @@ _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
 
 
+@dataclass
+class _VersionProbeFlight:
+    """One shared ``--version`` subprocess for a binary signature."""
+
+    event: threading.Event
+    deadline: float
+    result: str | None = None
+
+
+_VERSION_PROBE_INFLIGHT: dict[tuple[str, int, int], _VersionProbeFlight] = {}
+
+
 def _binary_signature(binary: str) -> tuple[str, int, int] | None:
     """Return *binary*'s identity signature for the version cache.
 
@@ -975,30 +988,73 @@ def _harness_cli_version_string(
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
     sig = _binary_signature(binary)
+    flight: _VersionProbeFlight | None = None
+    probe_timeout = timeout
     if sig is not None:
-        with _PROBE_CACHE_LOCK:
-            cached = _VERSION_PROBE_CACHE.get(sig)
-        if cached is not None:
-            return cached
+        deadline = time.monotonic() + timeout
+        while True:
+            with _PROBE_CACHE_LOCK:
+                cached = _VERSION_PROBE_CACHE.get(sig)
+                if cached is not None:
+                    return cached
+                flight = _VERSION_PROBE_INFLIGHT.get(sig)
+                if flight is None:
+                    probe_timeout = deadline - time.monotonic()
+                    if probe_timeout <= 0:
+                        return None
+                    flight = _VersionProbeFlight(threading.Event(), deadline)
+                    _VERSION_PROBE_INFLIGHT[sig] = flight
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not flight.event.wait(timeout=remaining):
+                return None
+            if flight.result is not None:
+                return flight.result
+            if deadline <= flight.deadline:
+                return None
+            # A shorter readiness probe failed; preserve this caller's larger
+            # launch/setup budget with one sequential retry inside its original
+            # wall-clock deadline.
+            flight = None
+
+    version: str | None
     try:
         completed = subprocess.run(
             [binary, "--version"],
             capture_output=True,
             text=True,
-            timeout=timeout,
+            timeout=probe_timeout,
             check=False,
         )
+        version = _parse_harness_cli_version(
+            (completed.stdout or "") + "\n" + (completed.stderr or "")
+        )
     except (OSError, subprocess.SubprocessError):
-        return None
-    version = _parse_harness_cli_version(
-        (completed.stdout or "") + "\n" + (completed.stderr or "")
-    )
-    if version is not None and sig is not None:
-        with _PROBE_CACHE_LOCK:
+        version = None
+    except BaseException:
+        if sig is not None and flight is not None:
+            _finish_version_probe(sig, flight, None)
+        raise
+    if sig is not None and flight is not None:
+        _finish_version_probe(sig, flight, version)
+    return version
+
+
+def _finish_version_probe(
+    sig: tuple[str, int, int],
+    flight: _VersionProbeFlight,
+    result: str | None,
+) -> None:
+    """Publish one probe result and wake callers sharing it."""
+    with _PROBE_CACHE_LOCK:
+        if result is not None:
             if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
                 _VERSION_PROBE_CACHE.clear()
-            _VERSION_PROBE_CACHE[sig] = version
-    return version
+            _VERSION_PROBE_CACHE[sig] = result
+        flight.result = result
+        if _VERSION_PROBE_INFLIGHT.get(sig) is flight:
+            _VERSION_PROBE_INFLIGHT.pop(sig, None)
+        flight.event.set()
 
 
 def harness_install_command(key: str) -> list[str]:

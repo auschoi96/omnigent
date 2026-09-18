@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -318,6 +321,104 @@ def test_version_probe_caches_by_binary_signature(
     os.utime(binary, ns=(1, 1))
     assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
     assert len(runs) == 3
+
+
+def test_concurrent_version_probes_share_one_subprocess(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Startup discovery and launch gating must not probe one CLI twice."""
+    binary = tmp_path / "fake-cli"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def _blocked_version_run(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        entered.set()
+        assert release.wait(timeout=2)
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="1.2.3", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", _blocked_version_run)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        startup = executor.submit(hi._harness_cli_version_string, spec, str(binary), 10.0)
+        assert entered.wait(timeout=2)
+        launch = executor.submit(hi._harness_cli_version_string, spec, str(binary), 30.0)
+        deadline = time.monotonic() + 2
+        while not launch.running() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert launch.running()
+        # Give the second worker a chance to join the in-flight event. Without
+        # coalescing it enters the blocked subprocess and increments ``calls``.
+        time.sleep(0.05)
+        release.set()
+        assert startup.result(timeout=2) == "1.2.3"
+        assert launch.result(timeout=2) == "1.2.3"
+
+    assert calls == 1
+
+
+def test_version_probe_retry_preserves_each_callers_wall_clock_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A later caller may retry after the flight it joined exhausts first."""
+    binary = tmp_path / "fake-cli"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(ANTHROPIC_FAMILY)
+    assert spec is not None
+    entered = [threading.Event() for _ in range(3)]
+    release = [threading.Event() for _ in range(2)]
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def _staggered_version_run(
+        argv: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        with calls_lock:
+            index = calls
+            calls += 1
+        entered[index].set()
+        if index < 2:
+            assert release[index].wait(timeout=2)
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="1.2.3", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", _staggered_version_run)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        short = executor.submit(hi._harness_cli_version_string, spec, str(binary), 1.0)
+        assert entered[0].wait(timeout=2)
+        middle = executor.submit(hi._harness_cli_version_string, spec, str(binary), 5.0)
+        deadline = time.monotonic() + 2
+        while not middle.running() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert middle.running()
+        time.sleep(0.05)
+        release[0].set()
+        assert entered[1].wait(timeout=2)
+        late = executor.submit(hi._harness_cli_version_string, spec, str(binary), 5.0)
+        deadline = time.monotonic() + 2
+        while not late.running() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert late.running()
+        time.sleep(0.05)
+        release[1].set()
+
+        assert short.result(timeout=2) is None
+        assert middle.result(timeout=2) is None
+        assert late.result(timeout=2) == "1.2.3"
+
+    assert entered[2].is_set()
+    assert calls == 3
 
 
 def test_cursor_install_spec_is_login_only_no_npm() -> None:

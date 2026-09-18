@@ -53,7 +53,6 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
-    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
     HOST_IDENTITY_SUBPROTOCOL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
@@ -1055,10 +1054,6 @@ class HostProcess:
         # authenticated tunnel. Injected into every runner and published to
         # OMNIGENT_USER_ID so host/runner debug-log rows carry it.
         self._owner_user_id: str | None = None
-        # Older servers cannot send the identity frame. Their best-effort
-        # /v1/me fallback remains detached from registration and is shared
-        # across reconnects.
-        self._owner_user_id_task: asyncio.Task[None] | None = None
         # The fronting Databricks workspace id for this server, resolved once from
         # the server URL (its ?o= selector or the stored login record) — the same
         # resolution the display URL uses, no extra network. Published to
@@ -1776,16 +1771,6 @@ class HostProcess:
         #
         # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
         # CLI, which inline would stall the keepalive pong and every other frame.
-        if frame.harness is None and frame.require_capability_barrier:
-            self._start_capability_discovery()
-            if self._capability_init_task is not None:
-                try:
-                    await asyncio.shield(self._capability_init_task)
-                except Exception:  # noqa: BLE001 — completion, not success, is the barrier
-                    _logger.warning(
-                        "Capability discovery failed before an unresolved launch",
-                        exc_info=True,
-                    )
         if frame.harness is not None and not await asyncio.to_thread(
             harness_is_configured, frame.harness
         ):
@@ -3903,11 +3888,6 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._capability_init_task
                 self._capability_init_task = None
-            if self._owner_user_id_task is not None:
-                self._owner_user_id_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await self._owner_user_id_task
-                self._owner_user_id_task = None
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4010,10 +3990,7 @@ class HostProcess:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
-                subprotocols=[
-                    Subprotocol(HOST_IDENTITY_SUBPROTOCOL),
-                    Subprotocol(HOST_ASYNC_CAPABILITIES_SUBPROTOCOL),
-                ],
+                subprotocols=[Subprotocol(HOST_IDENTITY_SUBPROTOCOL)],
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -4053,7 +4030,10 @@ class HostProcess:
         disconnect_error: BaseException | None = None
         try:
             if getattr(ws, "subprotocol", None) != HOST_IDENTITY_SUBPROTOCOL:
-                self._start_owner_user_id_resolution()
+                # An old server cannot send the authenticated identity frame.
+                # Preserve its historical ordering so the first runner's logs
+                # are attributed before the host becomes launchable.
+                await self._ensure_owner_user_id()
             await self._serve_frames(ws)
         except BaseException as exc:
             disconnect_error = exc
@@ -4077,16 +4057,6 @@ class HostProcess:
             # ``async with`` this replaced; the manual enter is only so the
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
-
-    def _start_owner_user_id_resolution(self) -> None:
-        """Resolve best-effort attribution without delaying host registration."""
-        if self._owner_user_id is not None:
-            return
-        if self._owner_user_id_task is None or self._owner_user_id_task.done():
-            self._owner_user_id_task = asyncio.create_task(
-                self._ensure_owner_user_id(),
-                name="host-owner-user-id",
-            )
 
     async def _ensure_owner_user_id(self) -> None:
         """Resolve this host's owning user once and publish it for attribution.
@@ -4394,8 +4364,6 @@ class HostProcess:
         if isinstance(frame, HostConnectionErrorFrame):
             self._raise_connection_error(frame)
         if isinstance(frame, HostIdentityFrame):
-            if self._owner_user_id_task is not None and not self._owner_user_id_task.done():
-                self._owner_user_id_task.cancel()
             self._owner_user_id = frame.user_id
             if frame.user_id:
                 os.environ[USER_ID_ENV_VAR] = frame.user_id

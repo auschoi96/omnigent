@@ -1173,6 +1173,20 @@ def test_modern_partial_gateway_snapshot_fails_closed_for_missing_families(
     assert _ungatewayed_native_harnesses(host, AUTO_NATIVE_ROUTING_HARNESSES) == ["codex-native"]
 
 
+def test_modern_gateway_snapshot_leaves_spec_configured_sdk_harnesses_unmeasured(
+    gateway_host_registry: HostRegistry,
+) -> None:
+    from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
+    from omnigent.server.smart_routing import _AUTO_ROUTING_HARNESSES
+
+    _register_modern_host(
+        gateway_host_registry,
+        pending=False,
+        gateway={"claude-native": False, "codex-native": False},
+    )
+    assert _ungatewayed_native_harnesses(_host(None), _AUTO_ROUTING_HARNESSES) == []
+
+
 def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
     """A request whose host store serves *host* and whose registry is empty."""
     return SimpleNamespace(
@@ -1188,15 +1202,22 @@ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
 async def test_capability_dependent_routing_waits_across_host_replacement() -> None:
     """Smart-routing gates cannot escape through a pending reconnect."""
     from omnigent.server.routes._sessions.orchestration import (
+        _host_with_current_capabilities,
         _wait_for_initial_host_capabilities,
     )
 
     first = SimpleNamespace(
-        hello=SimpleNamespace(capabilities_pending=True),
+        hello=SimpleNamespace(
+            capabilities_pending=True,
+            configured_harnesses=None,
+        ),
         capabilities_ready=asyncio.Event(),
     )
     second = SimpleNamespace(
-        hello=SimpleNamespace(capabilities_pending=True),
+        hello=SimpleNamespace(
+            capabilities_pending=True,
+            configured_harnesses=None,
+        ),
         capabilities_ready=asyncio.Event(),
     )
     current = [first]
@@ -1207,7 +1228,7 @@ async def test_capability_dependent_routing_waits_across_host_replacement() -> N
             )
         )
     )
-    host = SimpleNamespace(host_id="host_1")
+    host = _host({"claude-native": True})
     wait_task = asyncio.create_task(
         _wait_for_initial_host_capabilities(cast("Any", host), cast("Any", request))
     )
@@ -1219,9 +1240,16 @@ async def test_capability_dependent_routing_waits_across_host_replacement() -> N
     await asyncio.sleep(0)
     assert not wait_task.done()
 
+    second.hello.configured_harnesses = {"codex-native": True}
     second.hello.capabilities_pending = False
     second.capabilities_ready.set()
     assert await asyncio.wait_for(wait_task, timeout=1.0) is True
+    snapshot = _host_with_current_capabilities(
+        host,
+        cast("Any", request.app.state.host_registry),
+    )
+    assert snapshot is not None
+    assert snapshot.configured_harnesses == {"codex-native": True}
 
 
 async def test_capability_dependent_routing_fails_closed_on_timeout() -> None:
@@ -1495,6 +1523,63 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
     items = (await client.get(f"/v1/sessions/{created.json()['id']}/items")).json()["data"]
     decisions = [i for i in items if i["type"] == "routing_decision"]
     assert decisions and decisions[0]["router_source"] == "oss-llm"
+
+
+async def test_explicit_model_pin_skips_gateway_capability_gate(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A pinned model disables routing, so capability state cannot reject it."""
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="unused"))
+    with patch.object(
+        orchestration,
+        "_routing_host_for_create",
+        side_effect=AssertionError("explicit pins must not read host capabilities"),
+    ):
+        created = await _create_fixed_harness_session(
+            client,
+            wrappers["claude-native"],
+            routing_client,
+            model_override=CLAUDE_MODEL,
+            oss=False,
+        )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["model_override"] == CLAUDE_MODEL
+    assert routing_client.offered == []
+
+
+async def test_fixed_harness_capability_timeout_falls_back_to_its_default_model(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A bounded capability wait cannot prevent a fixed-harness terminal."""
+    from omnigent.server.routes._sessions import orchestration
+
+    wrappers = await _native_wrappers(client, db_uri)
+    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="unused"))
+    with patch.object(
+        orchestration,
+        "_wait_for_initial_host_capabilities",
+        AsyncMock(return_value=False),
+    ):
+        created = await _create_fixed_harness_session(
+            client,
+            wrappers["claude-native"],
+            routing_client,
+            oss=True,
+        )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["model_override"] is None
+    assert routing_client.offered == []
+    decisions = _routing_decision_items(db_uri, created.json()["id"])
+    assert len(decisions) == 1
+    assert decisions[0]["applied"] is False
+    assert "still being checked" in decisions[0]["rationale"]
 
 
 @pytest.mark.parametrize("harness", list(AUTO_NATIVE_ROUTING_HARNESSES))

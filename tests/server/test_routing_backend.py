@@ -173,6 +173,25 @@ def test_modern_host_unknown_gateway_state_fails_closed(
     assert gateway_backs_all(SimpleNamespace(host_id=_HOST_ID), ("claude-native",)) is False
 
 
+def test_modern_host_does_not_fail_closed_for_unmeasured_pi(
+    host_registry: HostRegistry,
+) -> None:
+    host_registry.register(
+        _HOST_ID,
+        SimpleNamespace(),  # type: ignore[arg-type]
+        HostHelloFrame(
+            version="test",
+            frame_protocol_version=1,
+            name="test-host",
+            gateway_inference={"claude-native": True, "codex-native": True},
+        ),
+        owner="local",
+        async_capabilities=True,
+    )
+    host_registry.record_gateway_inference(_HOST_ID, {"claude-native": True, "codex-native": True})
+    assert gateway_backs_all(SimpleNamespace(host_id=_HOST_ID), ("claude-sdk", "codex", "pi"))
+
+
 # ── backends_from_caps: explicit pair wins, else derive by type ──────────────
 
 

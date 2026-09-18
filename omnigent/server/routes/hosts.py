@@ -979,7 +979,6 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
-                require_capability_barrier=True,
             )
         )
         try:

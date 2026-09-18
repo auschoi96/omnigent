@@ -17,3 +17,4 @@ def _clear_probe_caches() -> None:
     """
     harness_install._LOGIN_PROBE_CACHE.clear()
     harness_install._VERSION_PROBE_CACHE.clear()
+    harness_install._VERSION_PROBE_INFLIGHT.clear()

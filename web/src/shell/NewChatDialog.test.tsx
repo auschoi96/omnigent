@@ -2759,6 +2759,27 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it("does not keep a removed host selectable from stale detail cache", async () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "start here" } });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+
+    mockHosts([], { isFetching: false });
+    useHostDetailsMock.mockReturnValue({
+      ...SUCCESS_QUERY_STATE,
+      data: host("online"),
+    } as ReturnType<typeof useHostDetails>);
+    fireEvent.change(input, { target: { value: "rerender after removal" } });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAccessibleName(
+        expect.stringContaining("No host selected"),
+      ),
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+  });
+
   it("does not replace an unavailable remembered host with the managed sandbox", async () => {
     localStorage.setItem("omnigent:last-host-choice", "host_2");
     mockHosts([host("online", 1)], { isFetching: false });
@@ -7411,9 +7432,13 @@ describe("NewChatLandingScreen smart routing", () => {
     pickPrimaryOption("model", "Smart Routing");
     closePrimaryPicker();
 
-    // The cross-replica list may remain stale while the selected-host detail
-    // request is still reaching the tunnel owner.
-    useHostDetailsMock.mockReturnValue(PENDING_QUERY_STATE as ReturnType<typeof useHostDetails>);
+    // A fresh list event can report pending before the cached detail query has
+    // refreshed. Either source must keep capability-dependent create disabled.
+    mockHosts([{ ...host("online"), capabilities_pending: true }]);
+    useHostDetailsMock.mockReturnValue({
+      ...SUCCESS_QUERY_STATE,
+      data: { ...host("online"), capabilities_pending: false },
+    } as ReturnType<typeof useHostDetails>);
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "ship it" },
     });
@@ -7447,6 +7472,30 @@ describe("NewChatLandingScreen smart routing", () => {
     await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
     openAgentModels("a1");
     expect(selectedPickerModel()).toHaveTextContent("Smart Routing");
+  });
+
+  it("does not block a warm Smart Routing create on the host-detail fetch", async () => {
+    mockHosts([
+      {
+        ...host("online"),
+        configured_harnesses: { "claude-native": true, "codex-native": true },
+        gateway_inference: { "claude-native": true, "codex-native": true },
+        capabilities_pending: false,
+      },
+    ]);
+    useHostDetailsMock.mockReturnValue(PENDING_QUERY_STATE as ReturnType<typeof useHostDetails>);
+    renderLanding({ smart_routing_enabled: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Smart Routing");
+    closePrimaryPicker();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "ship it" },
+    });
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
   });
 
   it("disables effort choices while Smart Routing owns effort", () => {

@@ -485,10 +485,8 @@ def register_core_routes(
                 workspace=workspace,
                 session_id=session_id,
                 # Lets the host refuse an unconfigured harness before
-                # spawning. None (agent not resolvable) waits for startup
-                # discovery, then skips the targeted check.
+                # spawning. None (agent not resolvable) skips the targeted check.
                 harness=harness,
-                require_capability_barrier=True,
             )
         )
         try:

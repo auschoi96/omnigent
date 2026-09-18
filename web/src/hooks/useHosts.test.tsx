@@ -341,6 +341,13 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
       ["hosts", { includeSandbox: false }],
       [{ host_id: HOST, name: "Laptop", owner: "alice", status: "online" }],
     );
+    client.setQueryData(["host-detail", HOST], {
+      host_id: HOST,
+      name: "Laptop",
+      owner: "alice",
+      status: "online",
+      capabilities_pending: false,
+    });
 
     const { result } = renderHook(
       () => ({
@@ -382,6 +389,10 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
       { includeSandbox: false },
     ]);
     expect(hosts?.[0].configured_harnesses?.["codex-native"]).toBe("needs-auth");
+    expect(
+      client.getQueryData<{ configured_harnesses?: Record<string, unknown> }>(["host-detail", HOST])
+        ?.configured_harnesses?.["codex-native"],
+    ).toBe("needs-auth");
 
     // Resolve Pi: it clears too and its response (again the full map) reflects
     // both harnesses' final readiness.
@@ -525,6 +536,13 @@ describe("useStoreCredential", () => {
       ["hosts", { includeSandbox: false }],
       [{ host_id: "host_1", name: "Laptop", owner: "alice", status: "online" }],
     );
+    client.setQueryData(["host-detail", "host_1"], {
+      host_id: "host_1",
+      name: "Laptop",
+      owner: "alice",
+      status: "online",
+      gateway_inference: { "codex-native": false },
+    });
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
     const { result } = renderHook(() => useStoreCredential("host_1"), { wrapper: sharedWrapper });
@@ -537,6 +555,13 @@ describe("useStoreCredential", () => {
       { includeSandbox: false },
     ]);
     expect(hosts?.[0].configured_harnesses?.["codex-native"]).toBe(true);
+    expect(
+      client.getQueryData<{ configured_harnesses?: Record<string, unknown> }>([
+        "host-detail",
+        "host_1",
+      ])?.configured_harnesses?.["codex-native"],
+    ).toBe(true);
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["host-detail", "host_1"] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["detected-credentials", "host_1"] });
   });
 });

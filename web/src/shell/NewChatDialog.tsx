@@ -2437,10 +2437,7 @@ export function NewChatLandingScreen() {
           : managedSandboxesEnabled || (hosts ?? []).some((host) => host.status === "online")));
   const noExecutionTargetSelected =
     !sandboxSelected && selectedHostId === null && !executionTargetSelectionPending;
-  const { data: selectedHostDetails, isPending: selectedHostDetailsPending } = useHostDetails(
-    selectedHostId,
-    hostSelected,
-  );
+  const { data: selectedHostDetails } = useHostDetails(selectedHostId, hostSelected);
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
@@ -3178,12 +3175,26 @@ export function NewChatLandingScreen() {
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
   const selectedHostFromList = allHosts.find((h) => h.host_id === selectedHostId);
-  const selectedHost = selectedHostDetails ?? selectedHostFromList;
+  const selectedHost = useMemo(
+    () =>
+      selectedHostFromList === undefined
+        ? undefined
+        : selectedHostDetails === undefined
+          ? selectedHostFromList
+          : {
+              ...selectedHostFromList,
+              configured_harnesses: selectedHostDetails.configured_harnesses,
+              capabilities_pending: selectedHostDetails.capabilities_pending,
+              gateway_inference: selectedHostDetails.gateway_inference,
+            },
+    [selectedHostDetails, selectedHostFromList],
+  );
 
   const hostCapabilitiesPending =
     !sandboxSelected &&
     selectedHostId !== null &&
-    (selectedHostDetailsPending || selectedHostDetails?.capabilities_pending === true);
+    (selectedHostFromList?.capabilities_pending === true ||
+      selectedHostDetails?.capabilities_pending === true);
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
   // Selection stays allowed — the host re-checks at launch and the create

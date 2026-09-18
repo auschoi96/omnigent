@@ -29,7 +29,6 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
-    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
     HOST_IDENTITY_SUBPROTOCOL,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -256,16 +255,10 @@ def create_host_tunnel_router(
                 return
 
         requested_subprotocols = ws.scope.get("subprotocols") or []
-        selected_subprotocol = next(
-            (
-                candidate
-                for candidate in (
-                    HOST_IDENTITY_SUBPROTOCOL,
-                    HOST_ASYNC_CAPABILITIES_SUBPROTOCOL,
-                )
-                if candidate in requested_subprotocols
-            ),
-            None,
+        selected_subprotocol = (
+            HOST_IDENTITY_SUBPROTOCOL
+            if HOST_IDENTITY_SUBPROTOCOL in requested_subprotocols
+            else None
         )
         await ws.accept(subprotocol=selected_subprotocol)
         conn: HostConnection | None = None
@@ -323,11 +316,7 @@ def create_host_tunnel_router(
                     conn,
                     encode_host_frame(
                         HostIdentityFrame(
-                            user_id=(
-                                tunnel_owner
-                                if managed_token is not None or auth_provider is not None
-                                else None
-                            )
+                            user_id=(tunnel_owner if tunnel_owner != RESERVED_USER_LOCAL else None)
                         )
                     ),
                 )
@@ -517,6 +506,31 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         await ws.send_text(data)
 
 
+async def _repair_current_harness_readiness(
+    host_id: str,
+    host_store: HostStore,
+    host_registry: HostRegistry,
+) -> None:
+    """Converge the DB row after a superseded connection finished a late write."""
+    while True:
+        current = host_registry.get(host_id)
+        if current is None:
+            return
+        configured = (
+            dict(current.hello.configured_harnesses)
+            if current.hello.configured_harnesses is not None
+            else None
+        )
+        await asyncio.to_thread(
+            host_store.update_harness_readiness,
+            host_id,
+            configured,
+        )
+        latest = host_registry.get(host_id)
+        if latest is current and latest.hello.configured_harnesses == configured:
+            return
+
+
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -595,23 +609,19 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostHarnessReadinessFrame):
+            if not host_registry.stage_capability_update(conn, frame):
+                continue
             await asyncio.to_thread(
                 host_store.update_harness_readiness,
                 host_id,
                 frame.configured_harnesses,
             )
-            conn.hello.configured_harnesses = (
-                dict(frame.configured_harnesses)
-                if frame.configured_harnesses is not None
-                else None
-            )
-            conn.hello.gateway_inference = (
-                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
-            )
-            conn.hello.capabilities_pending = frame.capabilities_pending
-            if not frame.capabilities_pending:
-                conn.capabilities_ready.set()
-            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
+            if not host_registry.finish_capability_update(
+                conn,
+                capabilities_pending=frame.capabilities_pending,
+            ):
+                await _repair_current_harness_readiness(host_id, host_store, host_registry)
+                continue
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)

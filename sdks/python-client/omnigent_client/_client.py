@@ -357,9 +357,8 @@ class OmnigentClient:
         self,
         *,
         agent_id: str,
-        filename: Literal["agent.tar.gz"] = "agent.tar.gz",
         title: str | None = None,
-        labels: dict[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         host_type: Literal["external", "managed"] = "external",
@@ -375,7 +374,7 @@ class OmnigentClient:
         agent_id: str | None = None,
         filename: str = "agent.tar.gz",
         title: str | None = None,
-        labels: dict[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         host_type: Literal["external", "managed"] = "external",
@@ -459,21 +458,10 @@ class OmnigentClient:
         Fetch the spec-declared tool entries for an agent.
 
         Used as the ``agent_tools_getter`` injection for
-        :class:`SessionsChat`. Reads the tool list off the
-        :class:`Agent` returned by ``GET /api/agents/{agent_id}``.
-
-        The server's :class:`AgentObject`
-        carries a ``tools`` list where each entry has a ``name``
-        and a ``runtime`` discriminator
-        (``"server"`` or ``"client"``). When that field is not yet
-        present, the SDK's :class:`Agent` dataclass simply lacks
-        the field and this returns ``[]`` — which means
-        validation succeeds for any caller that doesn't pass
-        ``tool_callables``, and fails loud (with a clear "extra
-        callable" message) for any caller that does. That is the
-        correct degraded behavior: in F1's absence we cannot
-        verify the spec, but we will never silently accept a
-        broken setup.
+        :class:`SessionsChat`. It reuses the typed session-agent resource
+        instead of duplicating its route or HTTP error handling. ``tools`` is
+        currently an additive server field retained by
+        :class:`~omnigent.protocol.AgentObject`.
 
         :param agent_id: The agent's durable identifier, e.g.
             ``"ag_abc123"``.
@@ -481,16 +469,14 @@ class OmnigentClient:
             and (post-F1) ``runtime`` keys. Empty if the agent
             declares no tools or the server response shape
             predates F1.
-        :raises OmnigentError: If the agents endpoint returns
+        :raises OmnigentError: If the session-agent endpoint returns
             a non-2xx (e.g. 404).
         """
+        del agent_id  # The session-bound agent is authoritative.
         if session_id is None:
             return []  # No session context — cannot resolve agent tools
-        path = f"{self._base_url}/v1/sessions/{session_id}/agent"
-        resp = await self._http.get(path)
-        if resp.status_code != 200:
-            return []
-        agent_data = resp.json()
+        agent = await self.sessions.agent.retrieve(session_id)
+        agent_data = agent.model_dump(mode="python")
         tools = agent_data.get("tools")
         if isinstance(tools, list):
             return [t for t in tools if isinstance(t, dict)]

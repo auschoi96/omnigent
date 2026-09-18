@@ -1,23 +1,17 @@
 # Databricks notebook source
-# ruff: noqa: E402, E501
+# ruff: noqa: E402, E501, F704, I001
+# pyrefly: ignore-errors
 # MAGIC %md
-# MAGIC # Run an OmniGent agent with full visibility
+# MAGIC # Run an OmniGent agent from Databricks
 # MAGIC
-# MAGIC Connect to any OmniGent server and run an agent turn using the
-# MAGIC high-level `SyncSessionsChat` helper — the same chat machinery the
-# MAGIC async SDK provides, but synchronous so it works in a Databricks
-# MAGIC notebook without an event loop.
+# MAGIC This quickstart connects directly to an OmniGent REST server, starts a
+# MAGIC durable session, shows its public events and durable items, prompts for
+# MAGIC real server-published approvals, and waits for delegated work to settle.
+# MAGIC The first run uses one high-level `SessionsChat.run(...)` call; later
+# MAGIC cells show how to continue and inspect the same session.
 # MAGIC
-# MAGIC You will see every public event the session emits: reasoning the
-# MAGIC server publishes, tool calls, tool output, sub-agent activity, and
-# MAGIC approval requests. The cell ends only after the agent's response
-# MAGIC completes **and** every delegated sub-agent in the session tree has
-# MAGIC settled.
-# MAGIC
-# MAGIC Requires Python 3.12+ and access to the target OmniGent server.
-# MAGIC [Databricks Runtime 11.3 LTS and newer uses the IPython kernel and
-# MAGIC supports interactive input from Python notebook
-# MAGIC cells](https://docs.databricks.com/aws/en/notebooks/ipython-kernel).
+# MAGIC The notebook displays reasoning and tool activity included in the
+# MAGIC server's public events.
 
 # COMMAND ----------
 
@@ -36,239 +30,190 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Connect to an OmniGent server
+# MAGIC ## 1. Connect to the OmniGent server
 # MAGIC
-# MAGIC The SDK works with any OmniGent server. In Databricks, derive the
-# MAGIC managed-server URL from the workspace host and pass the workspace's
-# MAGIC auth headers. For a standalone server, supply your own base URL and
-# MAGIC authentication.
+# MAGIC This example uses the managed OmniGent endpoint in the current
+# MAGIC Databricks workspace. `WorkspaceClient` supplies only the workspace URL
+# MAGIC and authentication; all agent operations go directly to OmniGent.
 
 # COMMAND ----------
 
 from urllib.parse import urlsplit
 
 from databricks.sdk import WorkspaceClient
-from omnigent_client import Omnigent
+from omnigent_client import AsyncOmnigent
 
 workspace = WorkspaceClient()
 workspace_url = urlsplit(workspace.config.host)
 if workspace_url.scheme != "https" or not workspace_url.netloc:
     raise RuntimeError("The current Databricks workspace has no secure URL.")
 
-# The browser UI is <workspace>/omnigent. Its REST API base is this path.
 OMNIGENT_BASE_URL = f"{workspace_url.scheme}://{workspace_url.netloc}/api/2.0/omnigent"
-client = Omnigent(
+client = AsyncOmnigent(
     base_url=OMNIGENT_BASE_URL,
     headers=workspace.config.authenticate(),
+    timeout=300.0,  # allows managed-sandbox cold starts on ordinary requests
 )
 
-# For another OmniGent server, use that server's own authentication instead:
-# client = Omnigent(base_url="https://omnigent.example.com")
+# The same SDK works with an OmniGent server hosted anywhere:
+# client = AsyncOmnigent(
+#     base_url="https://omnigent.example.com",
+#     headers={"Authorization": "Bearer <token>"},
+#     timeout=300.0,
+# )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Define what you want to see
+# MAGIC ## 2. Choose an agent
 # MAGIC
-# MAGIC `StreamHooks` are callbacks fired from the session's live event
-# MAGIC stream. Each hook fires for one lifecycle event: reasoning blocks,
-# MAGIC tool calls, messages, sub-agent spawns/completions, and approval
-# MAGIC requests. OmniGent never exposes a model's private hidden
-# MAGIC chain-of-thought — only reasoning the server deliberately publishes.
+# MAGIC Sessions use agents already registered on the connected server. Copy an
+# MAGIC `id` from this result into `AGENT_ID`.
 
 # COMMAND ----------
 
-from omnigent_client import StreamHooks
-
-
-def make_hooks():
-    """Return StreamHooks that print every public lifecycle event."""
-
-    def on_response_start(ctx):
-        print(f"\n[response started] {ctx.response.id} ({ctx.response.model})")
-
-    def on_reasoning_start(ctx):
-        print("\n[reasoning]")
-
-    def on_reasoning_end(ctx):
-        if ctx.reasoning_text:
-            print(ctx.reasoning_text)
-        if ctx.summary_text:
-            print(f"\n[summary] {ctx.summary_text}")
-
-    def on_message_start(ctx):
-        print("\n[assistant]")
-
-    def on_message_end(ctx):
-        for block in ctx.content:
-            if isinstance(block, dict) and block.get("type") in ("output_text", "text"):
-                print(block.get("text", ""), end="")
-        print()
-
-    def on_tool_call_start(ctx):
-        who = "client" if ctx.executed_by == "client" else "server"
-        print(f"\n[tool call · {who}] {ctx.name}({ctx.arguments})")
-
-    def on_tool_call_end(ctx):
-        preview = ctx.output[:200] if ctx.output else ""
-        print(f"[tool result] {ctx.name}: {preview}")
-
-    def on_sub_agent_spawned(ctx):
-        for sub in ctx.sub_agents:
-            print(f"\n[sub-agent spawned] {sub.agent_name} ({sub.response_id})")
-
-    def on_sub_agent_completed(ctx):
-        print(
-            f"\n[sub-agent done] {ctx.agent_name} — {ctx.status}"
-            + (f": {ctx.output_summary}" if ctx.output_summary else "")
-        )
-
-    def on_elicitation_request(ctx):
-        print(f"\n\n[approval requested] {ctx.message}")
-        if ctx.content_preview:
-            print(f"Preview: {ctx.content_preview}")
-        if ctx.url:
-            print(f"Open: {ctx.url}")
-        answer = input("Approve? [y/N]: ").strip().lower()
-        return answer in ("y", "yes")
-
-    return StreamHooks(
-        on_response_start=on_response_start,
-        on_reasoning_start=on_reasoning_start,
-        on_reasoning_end=on_reasoning_end,
-        on_message_start=on_message_start,
-        on_message_end=on_message_end,
-        on_tool_call_start=on_tool_call_start,
-        on_tool_call_end=on_tool_call_end,
-        on_sub_agent_spawned=on_sub_agent_spawned,
-        on_sub_agent_completed=on_sub_agent_completed,
-        on_elicitation_request=on_elicitation_request,
-    )
-
-
-hooks = make_hooks()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Find an agent
-# MAGIC
-# MAGIC OmniGent sessions use agents already registered on the server. Run
-# MAGIC this cell, then copy an `id` into the next cell.
-
-# COMMAND ----------
-
-agents = client.agents.list(limit=100, order="asc")
+agents = await client.agents.list(limit=100, order="asc")
 [(agent.id, agent.name) for agent in agents]
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## Run a turn and follow delegated work
-# MAGIC
-# MAGIC `client.sessions_chat(...)` creates the durable session, wires the
-# MAGIC hooks and agent-tools getter, and returns a `SyncSessionsChat`. The
-# MAGIC `send()` generator yields every public event until the response
-# MAGIC completes. After that, `tree_busy()` polls the sub-agent tree so
-# MAGIC delegated work is followed to completion. The 300-second timeout
-# MAGIC covers a managed sandbox cold start; it is not an agent-run deadline.
+AGENT_ID = "<registered-agent-id>"
 
 # COMMAND ----------
 
-import time
+# MAGIC %md
+# MAGIC ## 3. Choose what the notebook displays
+# MAGIC
+# MAGIC `show_event` receives canonical typed stream events. `show_item`
+# MAGIC receives canonical durable `SessionItem` values from the root or a
+# MAGIC descendant session. The approval callback runs only for a real
+# MAGIC `ElicitationRequestEvent`; ordinary assistant text never triggers it.
 
-AGENT_ID = "<registered-agent-id>"
-QUIET_WINDOW = 30.0  # seconds of subtree inactivity before declaring settled
-POLL_INTERVAL = 5.0  # seconds between tree-busy polls
+# COMMAND ----------
 
-chat = client.sessions_chat(
+from omnigent.protocol import ServerStreamEvent, SessionItem, UnknownEvent
+from omnigent_client import ElicitationRequestCtx, StreamHooks
+
+
+def show_event(event: ServerStreamEvent | UnknownEvent) -> None:
+    """Print every public event from the initial live response."""
+    print(f"\n[live · {event.type}]")
+    print(event.to_json(indent=2))
+
+
+def show_item(session_id: str, item: SessionItem) -> None:
+    """Print each newly observed durable item across the known session tree."""
+    print(f"\n[{session_id} · {item.type}]")
+    print(item.to_json(indent=2))
+
+
+def approve_or_decline(ctx: ElicitationRequestCtx) -> bool:
+    """Require an explicit decision for a server-published elicitation."""
+    print(f"\n[approval requested] {ctx.message}")
+    if ctx.content_preview:
+        print(f"Preview: {ctx.content_preview}")
+    if ctx.url:
+        print(f"Open: {ctx.url}")
+    return input("Approve? [y/N]: ").strip().lower() in {"y", "yes"}
+
+
+hooks = StreamHooks(on_elicitation_request=approve_or_decline)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 4. Run the task
+# MAGIC
+# MAGIC `sessions_chat(...)` creates one durable registered-agent session.
+# MAGIC `run(...)` then opens the stream before submitting input, displays the
+# MAGIC live response, resolves typed elicitations through the hook, follows
+# MAGIC typed items and child sessions, and returns after the known session tree
+# MAGIC has remained quiet for 60 seconds. Its overall default deadline is 20
+# MAGIC minutes. `host_type="managed"` asks this OmniGent server to provision its
+# MAGIC configured default managed sandbox; the notebook does not create or
+# MAGIC connect to that sandbox itself.
+
+# COMMAND ----------
+
+chat = await client.sessions_chat(
     agent_id=AGENT_ID,
-    hooks=hooks,
     host_type="managed",
-    timeout=300.0,
+    hooks=hooks,
+)
+print(f"Session: {chat.session_id}\n")
+
+session = await chat.run(
+    "Before changing files, request my approval. If I approve, create tree.py, "
+    "run it, and show me its output.",
+    on_event=show_event,
+    on_item=show_item,
+)
+print(f"\nSession tree settled; root status: {session.status}")
+
+# If this server exposes several managed providers and you must select one,
+# pass sandbox_provider="lakebox" to client.sessions_chat(...).
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Continue the same session
+# MAGIC
+# MAGIC Reuse `chat` to preserve the conversation and managed sandbox. The same
+# MAGIC approval, event, item, timeout, and quiet-window behavior applies.
+
+# COMMAND ----------
+
+session = await chat.run(
+    "Add a --max-depth option, run tree.py with --max-depth 2, and show me the output.",
+    on_event=show_event,
+    on_item=show_item,
+)
+print(f"\nSession tree settled; root status: {session.status}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 6. Inspect durable REST resources
+# MAGIC
+# MAGIC The stream is a live tail. Sessions, items, child sessions, agents, and
+# MAGIC files are ordinary typed REST resources that remain available later.
+
+# COMMAND ----------
+
+snapshot = await client.agents.sessions.retrieve(chat.session_id)
+items = await client.agents.sessions.items.list(
+    chat.session_id,
+    limit=100,
+    order="asc",
+)
+children = await client.agents.sessions.subagents.list(chat.session_id)
+session_agent = await client.agents.sessions.agent.retrieve(chat.session_id)
+
+print(
+    {
+        "session_id": snapshot.id,
+        "status": snapshot.status,
+        "agent": session_agent.name,
+        "loaded_items": len(items),
+        "loaded_children": len(children),
+    }
 )
 
-print(f"Session: {chat.session_id}\n")
-for event in chat.send(
-    "Before changing files, request my approval. If I approve, create tree.py, "
-    "run it, and show me its output."
-):
-    print(f"[{event.type}]")
-
-print("\nResponse completed. Following delegated work...")
-
-# After the response completes, poll the sub-agent tree until it settles.
-quiet_since = None
-while True:
-    busy = chat.tree_busy()
-    if busy:
-        quiet_since = None
-        time.sleep(POLL_INTERVAL)
-        continue
-    if quiet_since is None:
-        quiet_since = time.monotonic()
-    elif time.monotonic() - quiet_since >= QUIET_WINDOW:
-        break
-    time.sleep(POLL_INTERVAL)
-
-print("\n\nSession tree settled. All delegated work is complete.")
+# Other existing operations include:
+# await client.agents.sessions.files.list(chat.session_id)
+# await client.agents.sessions.files.upload(chat.session_id, "/path/to/file")
+# await client.agents.sessions.events.cancel(chat.session_id)
+# await client.agents.sessions.fork(chat.session_id)
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Continue the same session
+# MAGIC ## 7. Close local resources
 # MAGIC
-# MAGIC Send a follow-up to continue the conversation. This reuses the
-# MAGIC sandbox and conversation created above.
+# MAGIC Closing the client keeps the durable remote session. Delete it only when
+# MAGIC you intentionally want to remove the session and its managed sandbox.
 
 # COMMAND ----------
 
-for event in chat.send(
-    "Now add a --max-depth option, run tree.py with --max-depth 2, and show me the output."
-):
-    print(f"[{event.type}]")
-
-quiet_since = None
-while True:
-    busy = chat.tree_busy()
-    if busy:
-        quiet_since = None
-        time.sleep(POLL_INTERVAL)
-        continue
-    if quiet_since is None:
-        quiet_since = time.monotonic()
-    elif time.monotonic() - quiet_since >= QUIET_WINDOW:
-        break
-    time.sleep(POLL_INTERVAL)
-
-print("\n\nSession tree settled.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Inspect durable state
-# MAGIC
-# MAGIC A stream is a live tail; the session snapshot and items are durable
-# MAGIC REST resources that persist after the stream closes.
-
-# COMMAND ----------
-
-chat.refresh()
-items = client.agents.sessions.items.list(chat.session_id, limit=100, order="asc")
-
-print({"session_id": chat.session_id, "status": chat.status, "items": len(items)})
-[item.to_dict() for item in items]
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Finish
-# MAGIC
-# MAGIC Closing the client releases local HTTP resources but keeps the
-# MAGIC durable session. Uncomment the delete call only when you want to
-# MAGIC remove the remote session and its managed sandbox.
-
-# COMMAND ----------
-
-# client.agents.sessions.delete(chat.session_id)
-client.close()
+# await client.agents.sessions.delete(chat.session_id)
+await client.close()

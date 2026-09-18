@@ -35,7 +35,7 @@ import json
 import mimetypes
 import pathlib
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeVar, overload
 
@@ -366,6 +366,8 @@ class SessionsChat:
         # agent_id, so we cache the verdict to avoid hammering
         # ``client.agents.get`` on every ``send()`` call.
         self._tool_callables_validated: bool = False
+        # Presentation-only deduplication across repeated task-following calls.
+        self._observed_item_keys: set[tuple[str, str]] = set()
 
     @classmethod
     async def create(
@@ -438,7 +440,7 @@ class SessionsChat:
         agent_id: str,
         *,
         title: str | None = None,
-        labels: dict[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
         host_type: Literal["external", "managed"] = "external",
@@ -581,8 +583,10 @@ class SessionsChat:
         :param files: Optional local files to attach.
         :param on_event: Optional sync or async callback for live typed events.
         :param on_item: Optional sync or async callback receiving
-            ``(session_id, item)`` for newly observed durable typed items.
-        :param timeout: Overall deadline in seconds; ``None`` waits forever.
+            ``(session_id, item)`` for durable typed items not already
+            delivered to ``on_event`` or an earlier follow operation.
+        :param timeout: Overall stream-and-follow deadline in seconds; ``None``
+            waits forever.
         :param poll_interval: Delay between point-in-time REST snapshots.
         :param quiet_period: Required sustained idle window. Defaults to 60
             seconds because a response terminal event can precede a delegated
@@ -590,23 +594,47 @@ class SessionsChat:
         :param max_depth: Maximum child-session depth to follow.
         :returns: The final root :class:`Session` snapshot.
         """
-        seen_item_ids: set[str] = set()
-        async for event in self.send(input, files=files):
-            if on_event is not None:
-                await _call_hook(on_event, event)
-                if isinstance(event, OutputItemDoneEvent):
-                    item_id = event.item.get("id")
-                    if isinstance(item_id, str):
-                        seen_item_ids.add(item_id)
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative or None")
+        if poll_interval < 0:
+            raise ValueError("poll_interval must be non-negative")
+        if quiet_period < 0:
+            raise ValueError("quiet_period must be non-negative")
+        if max_depth < 0:
+            raise ValueError("max_depth must be non-negative")
 
-        return await self.wait_until_quiet(
-            on_item=on_item,
-            seen_item_ids=seen_item_ids,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            quiet_period=quiet_period,
-            max_depth=max_depth,
-        )
+        async def run_and_follow() -> Session:
+            seen_item_ids: set[str] = set()
+            async for event in self.send(input, files=files):
+                if on_event is not None:
+                    await _call_hook(on_event, event)
+                    if isinstance(event, OutputItemDoneEvent):
+                        item_id = event.item.get("id")
+                        if isinstance(item_id, str):
+                            seen_item_ids.add(item_id)
+                            self._observed_item_keys.add((self._session.id, item_id))
+
+            return await self.wait_until_quiet(
+                on_item=on_item,
+                seen_item_ids=seen_item_ids,
+                timeout=None,
+                poll_interval=poll_interval,
+                quiet_period=quiet_period,
+                max_depth=max_depth,
+            )
+
+        if timeout is None:
+            return await run_and_follow()
+        run_timeout = asyncio.timeout(timeout)
+        try:
+            async with run_timeout:
+                return await run_and_follow()
+        except TimeoutError as exc:
+            if not run_timeout.expired():
+                raise
+            raise TimeoutError(
+                f"Session run did not settle within {timeout:.0f} seconds: {self._session.id}"
+            ) from exc
 
     async def wait_until_quiet(
         self,
@@ -675,9 +703,12 @@ class SessionsChat:
                     order="asc",
                 )
                 async for item in _all_page_items(items_page):
-                    if item.id in observed_ids:
+                    item_key = (current_id, item.id)
+                    if item_key in self._observed_item_keys or item.id in observed_ids:
+                        self._observed_item_keys.add(item_key)
                         continue
                     observed_ids.add(item.id)
+                    self._observed_item_keys.add(item_key)
                     activity = True
                     if on_item is not None:
                         await _call_hook(on_item, current_id, item)
@@ -721,7 +752,9 @@ class SessionsChat:
                 )
 
             session_busy = any(
-                snapshot.status in {"running", "waiting"} for snapshot in snapshots.values()
+                snapshot.status in {"running", "waiting"}
+                or (snapshot.background_task_count or 0) > 0
+                for snapshot in snapshots.values()
             )
             descendants_busy = any(
                 child_summary_busy(child.model_dump(mode="python"))

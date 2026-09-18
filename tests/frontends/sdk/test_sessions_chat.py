@@ -2208,6 +2208,35 @@ async def test_run_follows_typed_paginated_tree_and_resolves_child_elicitation()
     assert namespace.follow_items.next_page_calls >= 1
     assert namespace.follow_subagents.next_page_calls >= 1
 
+    replayed_items: list[tuple[str, str]] = []
+    await chat.wait_until_quiet(
+        on_item=lambda session_id, item: replayed_items.append((session_id, item.id)),
+        timeout=2.0,
+        poll_interval=0.0,
+        quiet_period=0.0,
+    )
+    assert replayed_items == []
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_covers_stream_readiness_without_submitting_input() -> None:
+    """The run deadline starts before the stream-ready handshake."""
+    namespace = _GatedReadyNamespace(
+        session_obj=_make_session(session_id="conv_timeout"),
+        visible_events=[],
+    )
+    chat = SessionsChat(
+        namespace=namespace,
+        files_uploader=None,
+        files_getter=None,
+        session=namespace._session_obj,
+    )
+
+    with pytest.raises(TimeoutError, match="Session run did not settle within"):
+        await chat.run("do work", timeout=0.01)
+
+    assert namespace.post_event_calls == []
+
 
 # ── sub-agent lifecycle hooks ─────────────────────────────────────────
 

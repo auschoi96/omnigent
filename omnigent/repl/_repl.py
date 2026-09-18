@@ -5768,7 +5768,7 @@ async def _cmd_fork(
         host.output(Text.from_markup(f"  [bold red]Fork failed: {exc}[/]"))
         return
 
-    new_id = result["id"]
+    new_id = result.id
 
     # Switch the session adapter to the fork in-place.
     switch_fn = getattr(session, "switch_session", None)

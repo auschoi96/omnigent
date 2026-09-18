@@ -1,240 +1,307 @@
-"""Session-scoped files namespace — upload, list, get, delete."""
+"""Session-scoped file resources and compatibility adapters."""
 
 from __future__ import annotations
 
 import mimetypes
 import pathlib
+from collections.abc import Mapping, Sequence
+from os import PathLike
+from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
 
+from omnigent.protocol import (
+    CopyFilesRequest,
+    CopyFilesResponse,
+    SessionResourceDeleted,
+    SessionResourceObject,
+    SessionResourcePaginatedList,
+)
+
 from ._errors import raise_for_status, require_json_object, response_body
-from ._types import File, PaginatedList
+from ._pagination import AsyncCursorPage
+from ._types import File
+
+Timeout = float | httpx.Timeout | None
+Headers = Mapping[str, str] | None
+Query = Mapping[str, str | int | float | bool | None] | None
+
+
+def _timeout_option(timeout: Timeout) -> dict[str, Any]:
+    """Preserve the shared client's timeout unless this request overrides it."""
+    return {} if timeout is None else {"timeout": timeout}
+
+
+class AsyncSessionFilesResource:
+    """Async access to session-file REST routes."""
+
+    def __init__(self, http: httpx.AsyncClient, base_url: str) -> None:
+        self._http, self._base = http, base_url
+
+    def _path(self, session_id: str) -> str:
+        return f"{self._base}/v1/sessions/{quote(session_id, safe='')}/resources/files"
+
+    async def list(
+        self,
+        session_id: str,
+        *,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: Literal["asc", "desc"] = "desc",
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncCursorPage[SessionResourceObject]:
+        params: dict[str, str | int | float | bool | None] = dict(extra_query or {})
+        params.update(limit=limit, order=order)
+        if after is not None:
+            params["after"] = after
+        else:
+            params.pop("after", None)
+        if before is not None:
+            params["before"] = before
+        else:
+            params.pop("before", None)
+        resp = await self._http.get(
+            self._path(session_id),
+            params=params,
+            headers=extra_headers,
+            **_timeout_option(timeout),
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        wire = SessionResourcePaginatedList.model_validate(
+            require_json_object(resp, "GET /v1/sessions/{session_id}/resources/files")
+        )
+
+        async def fetch_next(cursor: str) -> AsyncCursorPage[SessionResourceObject]:
+            return await self.list(
+                session_id,
+                limit=limit,
+                after=cursor,
+                before=before,
+                order=order,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+
+        return AsyncCursorPage(
+            wire.data,
+            first_id=wire.first_id,
+            last_id=wire.last_id,
+            has_more=wire.has_more,
+            fetch_next_page=fetch_next,
+        )
+
+    async def upload(
+        self,
+        session_id: str,
+        path: str | PathLike[str],
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> SessionResourceObject:
+        local = pathlib.Path(path)
+        with local.open("rb") as stream:
+            resp = await self._http.post(
+                self._path(session_id),
+                params=extra_query,
+                headers=extra_headers,
+                files={"file": (local.name, stream, mimetypes.guess_type(str(local))[0])},
+                **_timeout_option(timeout),
+            )
+        raise_for_status(resp.status_code, response_body(resp))
+        return SessionResourceObject.model_validate(
+            require_json_object(resp, "POST /v1/sessions/{session_id}/resources/files")
+        )
+
+    async def retrieve(
+        self,
+        session_id: str,
+        file_id: str,
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> SessionResourceObject:
+        resp = await self._http.get(
+            f"{self._path(session_id)}/{quote(file_id, safe='')}",
+            params=extra_query,
+            headers=extra_headers,
+            **_timeout_option(timeout),
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return SessionResourceObject.model_validate(
+            require_json_object(resp, "GET /v1/sessions/{session_id}/resources/files/{file_id}")
+        )
+
+    async def content(
+        self,
+        session_id: str,
+        file_id: str,
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> bytes:
+        resp = await self._http.get(
+            f"{self._path(session_id)}/{quote(file_id, safe='')}/content",
+            params=extra_query,
+            headers=extra_headers,
+            **_timeout_option(timeout),
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return resp.content
+
+    async def download(
+        self,
+        session_id: str,
+        file_id: str,
+        to_path: str | PathLike[str],
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> pathlib.Path:
+        content = await self.content(
+            session_id,
+            file_id,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+        )
+        path = pathlib.Path(to_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    async def delete(
+        self,
+        session_id: str,
+        file_id: str,
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> SessionResourceDeleted:
+        resp = await self._http.delete(
+            f"{self._path(session_id)}/{quote(file_id, safe='')}",
+            params=extra_query,
+            headers=extra_headers,
+            **_timeout_option(timeout),
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return SessionResourceDeleted.model_validate(
+            require_json_object(resp, "DELETE /v1/sessions/{session_id}/resources/files/{file_id}")
+        )
+
+    async def copy(
+        self,
+        session_id: str,
+        *,
+        source_session_id: str,
+        file_ids: Sequence[str],
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> CopyFilesResponse:
+        body = CopyFilesRequest(source_session_id=source_session_id, file_ids=list(file_ids))
+        resp = await self._http.post(
+            f"{self._path(session_id)}:copy",
+            params=extra_query,
+            headers=extra_headers,
+            json=body.model_dump(mode="json"),
+            **_timeout_option(timeout),
+        )
+        raise_for_status(resp.status_code, response_body(resp))
+        return CopyFilesResponse.model_validate(
+            require_json_object(resp, "POST /v1/sessions/{session_id}/resources/files:copy")
+        )
 
 
 class FilesNamespace:
-    """
-    Factory for session-scoped file namespaces.
-
-    :param http: Shared async HTTP client.
-    :param base_url: Server base URL, e.g. ``"http://localhost:8080"``.
-    """
+    """Compatibility factory for session-bound file namespaces."""
 
     def __init__(self, http: httpx.AsyncClient, base_url: str) -> None:
-        """
-        Initialize the unbound files namespace.
-
-        :param http: Shared async HTTP client.
-        :param base_url: Server base URL, e.g. ``"http://localhost:8080"``.
-        :returns: None.
-        """
-        self._http = http
-        self._base = base_url
+        self._resource = AsyncSessionFilesResource(http, base_url)
 
     def for_session(self, session_id: str) -> SessionFilesNamespace:
-        """
-        Return a file namespace bound to one session.
-
-        ``/v1/files`` has been removed; callers must scope uploads and
-        downloads to the session/conversation that owns the file.
-
-        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-        :returns: A :class:`SessionFilesNamespace` bound to that session.
-        """
-        return SessionFilesNamespace(self._http, self._base, session_id)
+        return SessionFilesNamespace(self._resource, session_id)
 
     async def upload(self, path: str) -> File:
-        """Legacy global upload removed; use ``for_session(id).upload``."""
         raise RuntimeError(
             "/v1/files was removed; use client.files.for_session(session_id).upload(path)"
         )
 
     async def list(self, *args: object, **kwargs: object) -> list[File]:
-        """Legacy global list removed; use ``for_session(id).list``."""
         raise RuntimeError(
             "/v1/files was removed; use client.files.for_session(session_id).list()"
         )
 
     async def get(self, file_id: str) -> File:
-        """Legacy global get removed; use ``for_session(id).get``."""
         raise RuntimeError(
             "/v1/files was removed; use client.files.for_session(session_id).get(file_id)"
         )
 
     async def get_content(self, file_id: str) -> bytes:
-        """Legacy global content download removed; use ``for_session(id).get_content``."""
         raise RuntimeError(
             "/v1/files was removed; use client.files.for_session(session_id).get_content(file_id)"
         )
 
     async def download(self, file_id: str, to_path: str | pathlib.Path) -> pathlib.Path:
-        """Legacy global download removed; use ``for_session(id).download``."""
         raise RuntimeError(
             "/v1/files was removed; use "
             "client.files.for_session(session_id).download(file_id, path)"
         )
 
     async def delete(self, file_id: str) -> None:
-        """Legacy global delete removed; use ``for_session(id).delete``."""
         raise RuntimeError(
             "/v1/files was removed; use client.files.for_session(session_id).delete(file_id)"
         )
 
 
 class SessionFilesNamespace:
-    """
-    File operations scoped to a single session.
+    """Legacy session-bound adapter over ``AsyncSessionFilesResource``."""
 
-    :param http: Shared async HTTP client.
-    :param base_url: Server base URL, e.g. ``"http://localhost:8080"``.
-    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    """
-
-    def __init__(self, http: httpx.AsyncClient, base_url: str, session_id: str) -> None:
-        """
-        Initialize the session-scoped files namespace.
-
-        :param http: Shared async HTTP client.
-        :param base_url: Server base URL, e.g. ``"http://localhost:8080"``.
-        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-        :returns: None.
-        """
-        self._http = http
-        self._base = base_url
-        self._session_id = session_id
+    def __init__(self, resource: AsyncSessionFilesResource, session_id: str) -> None:
+        self._resource, self._session_id = resource, session_id
 
     @property
     def session_id(self) -> str:
-        """
-        The session/conversation id this namespace is bound to.
-
-        :returns: Session id, e.g. ``"conv_abc123"``.
-        """
         return self._session_id
 
-    @property
-    def _path(self) -> str:
-        """
-        Session-scoped files collection URL.
-
-        :returns: Fully qualified endpoint URL.
-        """
-        return f"{self._base}/v1/sessions/{quote(self._session_id, safe='')}/resources/files"
-
     @staticmethod
-    def _resource_to_file(data: dict[str, object]) -> File:
-        """
-        Convert a session file resource response to SDK ``File``.
-
-        :param data: JSON object returned by a session file endpoint.
-        :returns: The corresponding :class:`File`.
-        """
-        metadata = data.get("metadata")
-        metadata_dict = metadata if isinstance(metadata, dict) else {}
+    def _as_file(resource: SessionResourceObject) -> File:
+        metadata = resource.metadata
         return File.from_dict(
             {
-                "id": data.get("id", ""),
-                "filename": metadata_dict.get("filename", data.get("name", "")),
-                "bytes": metadata_dict.get("bytes", 0),
-                "created_at": metadata_dict.get("created_at", 0),
+                "id": resource.id,
+                "filename": metadata.get("filename", resource.name),
+                "bytes": metadata.get("bytes", 0),
+                "created_at": metadata.get("created_at", 0),
             }
         )
 
     async def upload(self, path: str) -> File:
-        """
-        Upload a local file into this session's file namespace.
-
-        :param path: Path to the local file, e.g. ``"./report.pdf"``.
-        :returns: The uploaded file metadata.
-        """
-        p = pathlib.Path(path)
-        content_type = mimetypes.guess_type(str(p))[0]
-        with open(p, "rb") as f:
-            resp = await self._http.post(
-                self._path,
-                files={"file": (p.name, f, content_type)},
-                timeout=30.0,
-            )
-        raise_for_status(resp.status_code, response_body(resp))
-        return self._resource_to_file(
-            require_json_object(resp, "POST /v1/sessions/{session_id}/resources/files")
-        )
+        return self._as_file(await self._resource.upload(self._session_id, path, timeout=30.0))
 
     async def list(
-        self,
-        *,
-        limit: int = 20,
-        after: str | None = None,
-        order: str = "desc",
+        self, *, limit: int = 20, after: str | None = None, order: str = "desc"
     ) -> list[File]:
-        """
-        List files owned by this session.
-
-        :param limit: Maximum number of files to return.
-        :param after: Cursor for forward pagination,
-            e.g. ``"file_abc123"``.
-        :param order: Sort order, e.g. ``"desc"``.
-        :returns: File metadata entries.
-        """
-        params: dict[str, str | int] = {"limit": limit, "order": order}
-        if after is not None:
-            params["after"] = after
-        resp = await self._http.get(self._path, params=params)
-        raise_for_status(resp.status_code, response_body(resp))
-        page = PaginatedList.from_dict(
-            require_json_object(resp, "GET /v1/sessions/{session_id}/resources/files")
-        )
-        return [self._resource_to_file(d) for d in page.data]
+        page = await self._resource.list(self._session_id, limit=limit, after=after, order=order)  # type: ignore[arg-type]
+        return [self._as_file(item) for item in page]
 
     async def get(self, file_id: str) -> File:
-        """
-        Get session file metadata by ID.
-
-        :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
-        :returns: File metadata.
-        """
-        resp = await self._http.get(f"{self._path}/{quote(file_id, safe='')}")
-        raise_for_status(resp.status_code, response_body(resp))
-        return self._resource_to_file(
-            require_json_object(resp, "GET /v1/sessions/{session_id}/resources/files/{file_id}")
-        )
+        return self._as_file(await self._resource.retrieve(self._session_id, file_id))
 
     async def get_content(self, file_id: str) -> bytes:
-        """
-        Download session file content.
-
-        :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
-        :returns: Raw file bytes.
-        """
-        resp = await self._http.get(
-            f"{self._path}/{quote(file_id, safe='')}/content",
-            timeout=30.0,
-        )
-        if resp.status_code >= 400:
-            raise_for_status(resp.status_code, response_body(resp))
-        return resp.content
+        return await self._resource.content(self._session_id, file_id, timeout=30.0)
 
     async def download(self, file_id: str, to_path: str | pathlib.Path) -> pathlib.Path:
-        """
-        Download file content and write it to disk.
-
-        :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
-        :param to_path: Local output path, e.g. ``"./out/report.pdf"``.
-        :returns: The path that was written.
-        """
-        content = await self.get_content(file_id)
-        path = pathlib.Path(to_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
-        return path
+        return await self._resource.download(self._session_id, file_id, to_path, timeout=30.0)
 
     async def delete(self, file_id: str) -> None:
-        """
-        Delete a session-scoped file.
-
-        :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
-        :returns: None.
-        """
-        resp = await self._http.delete(f"{self._path}/{quote(file_id, safe='')}")
-        if resp.status_code >= 400:
-            raise_for_status(resp.status_code, response_body(resp))
+        await self._resource.delete(self._session_id, file_id)

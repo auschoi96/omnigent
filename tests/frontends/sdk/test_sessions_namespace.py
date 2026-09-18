@@ -33,17 +33,19 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
+from omnigent_client import NOT_GIVEN
+from omnigent_client._client import AsyncAgentsResource
 from omnigent_client._errors import OmnigentError
 from omnigent_client._sessions import (
     Session,
     SessionsNamespace,
 )
 
-from omnigent.protocol import MessageData, UnknownEvent
+from omnigent.protocol import Interrupt, MessageData, UnknownEvent
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -178,8 +180,15 @@ async def test_create_posts_bundle_and_returns_typed_session() -> None:
             b"bundle-bytes",
             filename="agent.tar.gz",
             title="debug title",
+            project_id="project_123",
             labels={"env": "test"},
             reasoning_effort="high",
+            host_id="host_123",
+            workspace="https://example.com/repo.git",
+            terminal_launch_args=["--flag"],
+            parent_session_id="parent_123",
+            host_type="managed",
+            sandbox_provider="sandbox_1",
         )
     finally:
         await client.aclose()
@@ -193,9 +202,16 @@ async def test_create_posts_bundle_and_returns_typed_session() -> None:
     assert str(captured["content_type"]).startswith("multipart/form-data; boundary=")
     body = bytes(captured["body"])
     assert b'name="metadata"' in body
-    assert (
-        b'{"title": "debug title", "labels": {"env": "test"}, "reasoning_effort": "high"}' in body
-    )
+    assert b'"title": "debug title"' in body
+    assert b'"project_id": "project_123"' in body
+    assert b'"labels": {"env": "test"}' in body
+    assert b'"reasoning_effort": "high"' in body
+    assert b'"host_id": "host_123"' in body
+    assert b'"workspace": "https://example.com/repo.git"' in body
+    assert b'"terminal_launch_args": ["--flag"]' in body
+    assert b'"parent_session_id": "parent_123"' in body
+    assert b'"host_type": "managed"' in body
+    assert b'"sandbox_provider": "sandbox_1"' in body
     assert b'name="bundle"; filename="agent.tar.gz"' in body
     assert b"bundle-bytes" in body
 
@@ -1196,10 +1212,10 @@ async def test_fork_posts_correct_url_and_parses_response() -> None:
     assert body == {"title": "Fork of original"}, f"Expected body with title, got {body}"
 
     # Verify the response is parsed correctly.
-    assert result["id"] == "conv_fork"
-    assert result["agent_id"] == "ag_cloned"
-    assert result["status"] == "idle"
-    assert result["title"] == "Fork of original"
+    assert result.id == "conv_fork"
+    assert result.agent_id == "ag_cloned"
+    assert result.status == "idle"
+    assert result.title == "Fork of original"
 
 
 @pytest.mark.asyncio
@@ -1256,6 +1272,362 @@ async def test_fork_404_raises() -> None:
     try:
         with pytest.raises(OmnigentError):
             await ns.fork("conv_nonexistent")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_client_agents_sessions_is_identity_alias() -> None:
+    """The discoverable hierarchy must not create a second session runtime."""
+    from omnigent_client import OmnigentClient
+
+    client = OmnigentClient("http://127.0.0.1:1")
+    try:
+        assert client.sessions is client.agents.sessions
+        assert client.sessions.files is not None
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_retrieve_raw_response_executes_exactly_one_request() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert dict(request.url.params) == {
+            "include_items": "false",
+            "include_liveness": "false",
+            "refresh_state": "true",
+        }
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "req_123"},
+            json=_session_response_body(),
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        raw = await ns.with_raw_response.retrieve(
+            "conv_abc",
+            include_items=False,
+            include_liveness=False,
+            refresh_state=True,
+        )
+        assert raw.request_id == "req_123"
+        assert raw.parse().id == "conv_abc"
+        assert raw.parse().id == "conv_abc"
+        assert calls == 1
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_events_create_validates_batch_and_preserves_ack_order() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert [event["type"] for event in payload] == ["message", "interrupt"]
+        return httpx.Response(
+            202,
+            json=[{"queued": True, "item_id": "msg_1"}, {"queued": False}],
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        result = await ns.events.create(
+            "conv_abc",
+            events=(
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello"}],
+                    },
+                },
+                {"type": "interrupt", "data": {}},
+            ),
+        )
+        assert isinstance(result, list)
+        assert [ack.item_id for ack in result] == ["msg_1", None]
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_create_accepts_project_only_and_rejects_bundle_registered_fields() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(201, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create(project_id="proj_123", title="project session")
+        assert json.loads(requests[0].content) == {
+            "project_id": "proj_123",
+            "title": "project session",
+            "host_type": "external",
+        }
+        await ns.create(
+            agent_id="ag_123",
+            project_id="proj_123",
+            initial_items=[Interrupt()],
+            title="full inventory",
+            labels={"team": "sdk"},
+            parent_session_id="parent_123",
+            sub_agent_name="reviewer",
+            host_type="managed",
+            host_id="host_123",
+            sandbox_provider="sandbox_1",
+            workspace="https://example.com/one.git",
+            workspaces=["https://example.com/two.git"],
+            git={"branch_name": "feature/sdk"},
+            terminal_launch_args=["--flag"],
+            model_override="model-1",
+            reasoning_effort="high",
+            cost_control_mode_override="on",
+            subagent_routing_override="off",
+            harness_override="harness-1",
+            smart_routing_message="route this",
+        )
+        assert json.loads(requests[1].content) == {
+            "agent_id": "ag_123",
+            "project_id": "proj_123",
+            "title": "full inventory",
+            "labels": {"team": "sdk"},
+            "parent_session_id": "parent_123",
+            "sub_agent_name": "reviewer",
+            "host_type": "managed",
+            "host_id": "host_123",
+            "sandbox_provider": "sandbox_1",
+            "workspace": "https://example.com/one.git",
+            "workspaces": ["https://example.com/two.git"],
+            "git": {"branch_name": "feature/sdk"},
+            "terminal_launch_args": ["--flag"],
+            "model_override": "model-1",
+            "reasoning_effort": "high",
+            "cost_control_mode_override": "on",
+            "subagent_routing_override": "off",
+            "harness_override": "harness-1",
+            "smart_routing_message": "route this",
+            "initial_items": [{"type": "interrupt", "data": {}}],
+        }
+        for kwargs in ({"workspaces": ["repo"]}, {"initial_items": []}, {"git": {}}):
+            with pytest.raises(ValueError, match="bundle create does not support"):
+                await cast(Any, ns.create)(b"bundle", **kwargs)
+        with pytest.raises(ValueError, match="filename is only valid with bundle"):
+            await ns.create(  # type: ignore[call-overload]
+                agent_id="ag_123", filename="ignored.tar.gz"
+            )
+        assert len(requests) == 2
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,value,expected",
+    [
+        ("cost_control_mode_override", NOT_GIVEN, {"silent": False}),
+        (
+            "cost_control_mode_override",
+            None,
+            {"cost_control_mode_override": None, "silent": False},
+        ),
+        (
+            "cost_control_mode_override",
+            "off",
+            {"cost_control_mode_override": "off", "silent": False},
+        ),
+        ("subagent_routing_override", NOT_GIVEN, {"silent": False}),
+        ("subagent_routing_override", None, {"subagent_routing_override": None, "silent": False}),
+        ("subagent_routing_override", "on", {"subagent_routing_override": "on", "silent": False}),
+        ("share_workspace_files", NOT_GIVEN, {"silent": False}),
+        ("share_workspace_files", None, {"share_workspace_files": None, "silent": False}),
+        ("share_workspace_files", False, {"share_workspace_files": False, "silent": False}),
+        ("project_id", NOT_GIVEN, {"silent": False}),
+        ("project_id", None, {"project_id": None, "silent": False}),
+        ("project_id", "", {"project_id": "", "silent": False}),
+    ],
+)
+async def test_update_preserves_omitted_null_and_value_fields(
+    name: str, value: object, expected: dict[str, object]
+) -> None:
+    body: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body.update(json.loads(request.content))
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await cast(Any, ns.update)("conv_abc", **{name: value})
+        assert body == expected
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout, expected", [(None, 600.0), (17.0, 17.0)])
+async def test_events_stream_uses_sse_default_or_explicit_timeout(
+    timeout: float | None, expected: float
+) -> None:
+    observed: list[dict[str, float]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed.append(request.extensions["timeout"])
+        return httpx.Response(200, content="event: done\ndata: [DONE]\n\n")
+
+    ns, client = _make_namespace(handler)
+    try:
+        assert [event async for event in ns.events.stream("conv_abc", timeout=timeout)] == []
+        assert observed[0]["read"] == expected
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_bundle_create_forwards_options_to_create_and_retrieve() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(201, json={"session_id": "conv_abc"})
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await ns.create(
+            b"bundle",
+            timeout=9.0,
+            extra_headers={"x-test": "yes"},
+            extra_query={"trace": "one"},
+        )
+        assert len(requests) == 2
+        for request in requests:
+            assert request.headers["x-test"] == "yes"
+            assert request.url.params["trace"] == "one"
+            assert request.extensions["timeout"]["read"] == 9.0
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,value,expected",
+    [
+        ("model_override", NOT_GIVEN, {}),
+        ("model_override", None, {"model_override": None}),
+        ("model_override", "model-1", {"model_override": "model-1"}),
+        ("reasoning_effort", NOT_GIVEN, {}),
+        ("reasoning_effort", None, {"reasoning_effort": None}),
+        ("reasoning_effort", "high", {"reasoning_effort": "high"}),
+        ("terminal_launch_args", NOT_GIVEN, {}),
+        ("terminal_launch_args", None, {"terminal_launch_args": None}),
+        ("terminal_launch_args", ["--flag"], {"terminal_launch_args": ["--flag"]}),
+        ("workspace", NOT_GIVEN, {}),
+        ("workspace", None, {"workspace": None}),
+        ("workspace", "/repo", {"workspace": "/repo"}),
+    ],
+)
+async def test_fork_presence_sensitive_fields(
+    name: str, value: object, expected: dict[str, object]
+) -> None:
+    body: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body.update(json.loads(request.content))
+        return httpx.Response(201, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        await cast(Any, ns.fork)("conv_abc", **{name: value})
+        assert body == expected
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["agents", "sessions", "items", "subagents"])
+async def test_page_next_preserves_options_and_replaces_after(resource: str) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [],
+                "first_id": None,
+                "last_id": "cursor_2",
+                "has_more": "after" not in request.url.params,
+            },
+        )
+
+    ns, client = _make_namespace(handler)
+    common: dict[str, Any] = {
+        "limit": 7,
+        "before": "before_1",
+        "order": "asc",
+        "timeout": 11.0,
+        "extra_headers": {"x-page": "yes"},
+        "extra_query": {"custom": "kept", "limit": 999, "order": "bad", "after": "bad"},
+    }
+    try:
+        if resource == "agents":
+            page = await AsyncAgentsResource(client, "http://srv", ns).list(**common)
+        elif resource == "sessions":
+            page = await ns.list(
+                agent_id="ag_123",
+                agent_name="reviewer",
+                sort_by="updated_at",
+                search_query="needle",
+                include_archived=True,
+                kind="any",
+                project="project_123",
+                pinned=True,
+                visibility="shared",
+                **common,
+            )
+        elif resource == "items":
+            page = await ns.items.list("conv_abc", **common)
+        else:
+            page = await ns.subagents.list(
+                "conv_abc", tool="delegate", session_name="reviewer", **common
+            )
+        await page.get_next_page()
+        second = requests[1]
+        assert second.url.params["after"] == "cursor_2"
+        assert second.url.params["before"] == "before_1"
+        assert second.url.params["limit"] == "7"
+        assert second.url.params["order"] == "asc"
+        assert second.url.params["custom"] == "kept"
+        assert second.headers["x-page"] == "yes"
+        assert second.extensions["timeout"]["read"] == 11.0
+        if resource == "sessions":
+            assert dict(second.url.params) == {
+                "custom": "kept",
+                "limit": "7",
+                "order": "asc",
+                "after": "cursor_2",
+                "before": "before_1",
+                "sort_by": "updated_at",
+                "agent_id": "ag_123",
+                "agent_name": "reviewer",
+                "search_query": "needle",
+                "project": "project_123",
+                "include_archived": "true",
+                "kind": "any",
+                "pinned": "true",
+                "visibility": "shared",
+            }
+        elif resource == "subagents":
+            assert second.url.params["tool"] == "delegate"
+            assert second.url.params["session_name"] == "reviewer"
     finally:
         await client.aclose()
 

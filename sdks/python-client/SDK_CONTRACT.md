@@ -683,7 +683,7 @@ type-specific fields:
 | `compaction` | `summary`, `last_item_id`, `token_count`, optional `model`, `compacted_messages`, `window_id` |
 | `native_tool` | `item` |
 | `resource_event` | `event_type`, `resource_id`, `resource_type`, optional `resource` |
-| `routing_decision` | `model`, `applied`, `rationale`, optional `agent`, `harness`, `scope`, `decision_id`, `raw_model`, `attempted_override`, `router_source` |
+| `routing_decision` | `model`, `applied`, `rationale`, optional `agent`, `harness`, `scope`, `decision_id`, `raw_model`, `attempted_override`, `router_source`, `task_description` |
 | `slash_command` | `model`, `kind`, `name`, `arguments`, optional `output` |
 | `terminal_command` | `kind`, optional `input`, `stdout`, `stderr` |
 

@@ -30,6 +30,14 @@ class _OutputModel(BaseModel):
         extra="allow", json_schema_extra=_omit_explicit_additional_properties
     )
 
+    def to_dict(self, **kwargs: Any) -> dict[str, Any]:
+        """Return the same representation as :meth:`model_dump`."""
+        return self.model_dump(**kwargs)
+
+    def to_json(self, **kwargs: Any) -> str:
+        """Return the same representation as :meth:`model_dump_json`."""
+        return self.model_dump_json(**kwargs)
+
 
 class _StrictRequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -693,6 +701,7 @@ class _RoutingDecisionSessionItem(_SessionItemBase):
     raw_model: str | None = None
     attempted_override: str | None = None
     router_source: str | None = None
+    task_description: str | None = None
 
 
 class _SlashCommandSessionItem(_SessionItemBase):

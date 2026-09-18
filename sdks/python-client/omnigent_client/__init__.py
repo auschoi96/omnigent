@@ -60,7 +60,9 @@ from ._errors import (
 )
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
 from ._not_given import NOT_GIVEN, NotGiven
+from ._pagination import AsyncCursorPage
 from ._query import QueryResult, QueryStream
+from ._raw_response import APIResponse
 from ._server import LocalServer
 from ._session import Session
 from ._sessions import RegisteredAgent, SessionsNamespace
@@ -86,7 +88,9 @@ __all__ = [
     "MCP_ELICITATION_METHOD",
     "NOT_GIVEN",
     "TERMINAL_TASK_STATUSES",
+    "APIResponse",
     "AnyBlock",
+    "AsyncCursorPage",
     "BlockContext",
     "BlockStream",
     "CompactionBlock",

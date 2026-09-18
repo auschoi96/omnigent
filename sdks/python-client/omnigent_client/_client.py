@@ -7,15 +7,17 @@ from typing import Any, Literal, overload
 
 import httpx
 
+from omnigent.protocol import AgentObject, PaginatedList
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 
 from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._http import is_loopback_url
+from ._pagination import AsyncCursorPage
 from ._query import QueryResult, QueryStream
 from ._responses import ResponsesNamespace
 from ._session import Session
-from ._sessions import SessionsNamespace
+from ._sessions import Headers, Query, SessionsNamespace, Timeout, _options, _query
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
 
@@ -69,6 +71,57 @@ async def _refuse_cross_origin_redirects(response: httpx.Response) -> None:
         f"to {location}",
         response.status_code,
     )
+
+
+class AsyncAgentsResource:
+    """Read-only built-in agent catalog and its session resources."""
+
+    def __init__(
+        self, http: httpx.AsyncClient, base_url: str, sessions: SessionsNamespace
+    ) -> None:
+        self._http = http
+        self._base = base_url
+        self.sessions = sessions
+
+    async def list(
+        self,
+        *,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: Literal["asc", "desc"] = "desc",
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncCursorPage[AgentObject]:
+        params = _query(extra_query, limit=limit, order=order, after=after, before=before)
+        response = await self._http.get(
+            f"{self._base}/v1/agents", params=params, **_options(timeout, extra_headers)
+        )
+        from ._errors import raise_for_status, require_json_object, response_body
+
+        raise_for_status(response.status_code, response_body(response))
+        page = PaginatedList.model_validate(require_json_object(response, "GET /v1/agents"))
+        data = [AgentObject.model_validate(item) for item in page.data]
+
+        async def next_page(cursor: str) -> AsyncCursorPage[AgentObject]:
+            return await self.list(
+                limit=limit,
+                after=cursor,
+                before=before,
+                order=order,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+
+        return AsyncCursorPage(
+            data,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+            fetch_next_page=next_page,
+        )
 
 
 class OmnigentClient:
@@ -150,6 +203,7 @@ class OmnigentClient:
         )
 
         self.sessions = SessionsNamespace(self._http, self._base_url)
+        self.agents = AsyncAgentsResource(self._http, self._base_url, self.sessions)
         self.files = FilesNamespace(self._http, self._base_url)
         self.responses = ResponsesNamespace(self._http, self._base_url)
 

@@ -24,20 +24,33 @@ from __future__ import annotations
 import builtins
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, TypeVar, overload
 
 import httpx
 from pydantic import TypeAdapter
 
 from omnigent.protocol import (
     SERVER_STREAM_EVENT_TYPES,
+    AgentObject,
+    ChildSessionList,
+    ChildSessionSummary,
+    ConversationDeleted,
+    EventAcknowledgement,
+    PaginatedList,
+    ProjectSessionCreateRequest,
     PublicSessionEventInput,
     ServerStreamEvent,
+    SessionCreateMetadata,
+    SessionCreateRequest,
+    SessionForkRequest,
+    SessionGitOptions,
+    SessionItem,
     SessionList,
     SessionResponse,
     UnknownEvent,
+    UpdateSessionRequest,
 )
 from omnigent.protocol import (
     SessionListItem as ProtocolSessionListItem,
@@ -45,6 +58,9 @@ from omnigent.protocol import (
 
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
+from ._not_given import NOT_GIVEN, NotGiven
+from ._pagination import AsyncCursorPage
+from ._raw_response import APIResponse
 from ._timeouts import _SSE_TIMEOUT
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
@@ -83,6 +99,312 @@ _STREAM_READY_EVENT_TYPE: str = "session.heartbeat"
 SessionEventInput = PublicSessionEventInput
 Session = SessionResponse
 SessionListItem = ProtocolSessionListItem
+T = TypeVar("T")
+Timeout = float | httpx.Timeout | None
+Headers = Mapping[str, str] | None
+Query = Mapping[str, str | int | float | bool | None] | None
+
+
+def _present(**values: Any) -> dict[str, Any]:
+    """Return request fields whose value was not omitted."""
+    return {key: value for key, value in values.items() if not isinstance(value, NotGiven)}
+
+
+def _options(timeout: Timeout, extra_headers: Headers) -> dict[str, Any]:
+    options: dict[str, Any] = {"headers": extra_headers}
+    if timeout is not None:
+        options["timeout"] = timeout
+    return options
+
+
+def _query(extra_query: Query, **method: Any) -> dict[str, Any]:
+    params = dict(extra_query or {})
+    for key, value in method.items():
+        if value is None:
+            params.pop(key, None)
+        else:
+            params[key] = value
+    return params
+
+
+class AsyncEventsResource:
+    """Session event submission and live-tail streaming."""
+
+    def __init__(self, sessions: SessionsNamespace) -> None:
+        self._sessions = sessions
+
+    async def create(
+        self,
+        session_id: str,
+        *,
+        events: PublicSessionEventInput
+        | Mapping[str, Any]
+        | Sequence[PublicSessionEventInput | Mapping[str, Any]],
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> EventAcknowledgement | list[EventAcknowledgement]:
+        batch = (
+            list(events)
+            if isinstance(events, Sequence) and not isinstance(events, (str, bytes, bytearray))
+            else None
+        )
+        if batch is not None and not 1 <= len(batch) <= 100:
+            raise ValueError("events must contain between 1 and 100 entries")
+        source = batch if batch is not None else [events]
+        payloads = [
+            _PUBLIC_SESSION_EVENT_ADAPTER.validate_python(event).model_dump(
+                mode="json", by_alias=True, exclude_none=True
+            )
+            for event in source
+        ]
+        wire: Any = payloads if batch is not None else payloads[0]
+        response = await self._sessions._post_event_payload(
+            session_id,
+            wire,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+        )
+        if batch is not None:
+            if not isinstance(response, list):
+                raise OmnigentError(
+                    "POST /v1/sessions/{session_id}/events returned a non-list batch"
+                )
+            return [EventAcknowledgement.model_validate(item) for item in response]
+        return EventAcknowledgement.model_validate(response)
+
+    async def cancel(
+        self,
+        session_id: str,
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> EventAcknowledgement:
+        result = await self.create(
+            session_id,
+            events={"type": "interrupt", "data": {}},
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+        )
+        assert isinstance(result, EventAcknowledgement)
+        return result
+
+    def stream(
+        self,
+        session_id: str,
+        *,
+        idle: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
+        return self._sessions.stream(
+            session_id,
+            idle=idle,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+        )
+
+
+class AsyncItemsResource:
+    def __init__(self, sessions: SessionsNamespace) -> None:
+        self._sessions = sessions
+
+    async def list(
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+        before: str | None = None,
+        order: Literal["asc", "desc"] = "asc",
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncCursorPage[SessionItem]:
+        params = _query(extra_query, limit=limit, order=order, after=after, before=before)
+        response = await self._sessions._http.get(
+            f"{self._sessions._base}/v1/sessions/{session_id}/items",
+            params=params,
+            **_options(timeout, extra_headers),
+        )
+        raise_for_status(response.status_code, response_body(response))
+        page = PaginatedList.model_validate(
+            require_json_object(response, "GET /v1/sessions/{session_id}/items")
+        )
+        adapter: TypeAdapter[SessionItem] = TypeAdapter(SessionItem)
+        data = [adapter.validate_python(item) for item in page.data]
+
+        async def next_page(cursor: str) -> AsyncCursorPage[SessionItem]:
+            return await self.list(
+                session_id,
+                limit=limit,
+                after=cursor,
+                before=before,
+                order=order,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+
+        return AsyncCursorPage(
+            data,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+            fetch_next_page=next_page,
+        )
+
+
+class AsyncSubagentsResource:
+    def __init__(self, sessions: SessionsNamespace) -> None:
+        self._sessions = sessions
+
+    async def list(
+        self,
+        session_id: str,
+        *,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: Literal["asc", "desc"] = "desc",
+        tool: str | None = None,
+        session_name: str | None = None,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncCursorPage[ChildSessionSummary]:
+        params = _query(
+            extra_query,
+            limit=limit,
+            after=after,
+            before=before,
+            order=order,
+            tool=tool,
+            session_name=session_name,
+        )
+        response = await self._sessions._http.get(
+            f"{self._sessions._base}/v1/sessions/{session_id}/child_sessions",
+            params=params,
+            **_options(timeout, extra_headers),
+        )
+        raise_for_status(response.status_code, response_body(response))
+        page = ChildSessionList.model_validate(
+            require_json_object(response, "GET /v1/sessions/{session_id}/child_sessions")
+        )
+
+        async def next_page(cursor: str) -> AsyncCursorPage[ChildSessionSummary]:
+            return await self.list(
+                session_id,
+                limit=limit,
+                after=cursor,
+                before=before,
+                order=order,
+                tool=tool,
+                session_name=session_name,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+
+        return AsyncCursorPage(
+            page.data,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+            fetch_next_page=next_page,
+        )
+
+
+class AsyncSessionAgentResource:
+    def __init__(self, sessions: SessionsNamespace) -> None:
+        self._sessions = sessions
+
+    async def retrieve(
+        self,
+        session_id: str,
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AgentObject:
+        response = await self._sessions._http.get(
+            f"{self._sessions._base}/v1/sessions/{session_id}/agent",
+            params=extra_query,
+            **_options(timeout, extra_headers),
+        )
+        raise_for_status(response.status_code, response_body(response))
+        return AgentObject.model_validate(
+            require_json_object(response, "GET /v1/sessions/{session_id}/agent")
+        )
+
+    async def contents(
+        self,
+        session_id: str,
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> bytes:
+        response = await self._sessions._http.get(
+            f"{self._sessions._base}/v1/sessions/{session_id}/agent/contents",
+            params=extra_query,
+            **_options(timeout, extra_headers),
+        )
+        raise_for_status(response.status_code, response_body(response))
+        return response.content
+
+    async def update(
+        self,
+        session_id: str,
+        bundle: bytes,
+        *,
+        filename: str = "agent.tar.gz",
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AgentObject:
+        response = await self._sessions._http.put(
+            f"{self._sessions._base}/v1/sessions/{session_id}/agent",
+            files={"bundle": (filename, bundle, "application/gzip")},
+            params=extra_query,
+            **_options(timeout, extra_headers),
+        )
+        raise_for_status(response.status_code, response_body(response))
+        return AgentObject.model_validate(
+            require_json_object(response, "PUT /v1/sessions/{session_id}/agent")
+        )
+
+
+class _RawSessionsResource:
+    def __init__(self, sessions: SessionsNamespace) -> None:
+        self._sessions = sessions
+
+    async def retrieve(
+        self,
+        session_id: str,
+        *,
+        include_items: bool = True,
+        include_liveness: bool = True,
+        refresh_state: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> APIResponse[Session]:
+        response = await self._sessions._retrieve_response(
+            session_id,
+            include_items=include_items,
+            include_liveness=include_liveness,
+            refresh_state=refresh_state,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+        )
+        return APIResponse(response, self._sessions._parse_retrieve)
 
 
 @dataclass(frozen=True)
@@ -130,18 +452,95 @@ class SessionsNamespace:
         """
         self._http = http
         self._base = base_url
+        self.events = AsyncEventsResource(self)
+        self.items = AsyncItemsResource(self)
+        self.subagents = AsyncSubagentsResource(self)
+        self.agent = AsyncSessionAgentResource(self)
+        self.with_raw_response = _RawSessionsResource(self)
+        # Imported lazily so the existing file namespace remains the single
+        # implementation of session-scoped file routes.
+        from ._files import AsyncSessionFilesResource
 
+        self.files = AsyncSessionFilesResource(http, base_url)
+
+    @overload
     async def create(
         self,
         bundle: bytes,
         *,
         filename: str = "agent.tar.gz",
         title: str | None = None,
-        labels: dict[str, str] | None = None,
+        project_id: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        host_id: str | None = None,
+        workspace: str | None = None,
+        terminal_launch_args: Sequence[str] | None = None,
+        parent_session_id: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> Session: ...
+
+    @overload
+    async def create(
+        self,
+        *,
+        agent_id: str | None = None,
+        project_id: str | None = None,
+        initial_items: Sequence[PublicSessionEventInput] | None = None,
+        title: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        parent_session_id: str | None = None,
+        sub_agent_name: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        host_id: str | None = None,
+        sandbox_provider: str | None = None,
+        workspace: str | None = None,
+        workspaces: Sequence[str] | None = None,
+        git: SessionGitOptions | Mapping[str, object] | None = None,
+        terminal_launch_args: Sequence[str] | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
+        cost_control_mode_override: Literal["on", "off"] | None = None,
+        subagent_routing_override: Literal["on", "off"] | None = None,
+        harness_override: str | None = None,
+        smart_routing_message: str | None = None,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> Session: ...
+
+    async def create(
+        self,
+        bundle: bytes | None = None,
+        *,
+        agent_id: str | None = None,
+        filename: str | NotGiven = NOT_GIVEN,
+        title: str | None = None,
+        labels: Mapping[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
-        host_type: str = "external",
+        host_type: Literal["external", "managed"] = "external",
         sandbox_provider: str | None = None,
+        project_id: str | None = None,
+        parent_session_id: str | None = None,
+        sub_agent_name: str | None = None,
+        host_id: str | None = None,
+        workspaces: Sequence[str] | None = None,
+        git: SessionGitOptions | Mapping[str, object] | None = None,
+        terminal_launch_args: Sequence[str] | None = None,
+        model_override: str | None = None,
+        cost_control_mode_override: Literal["on", "off"] | None = None,
+        subagent_routing_override: Literal["on", "off"] | None = None,
+        harness_override: str | None = None,
+        smart_routing_message: str | None = None,
+        initial_items: Sequence[PublicSessionEventInput | Mapping[str, Any]] | None = None,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
     ) -> Session:
         """
         Create a new session from an uploaded agent bundle.
@@ -177,6 +576,78 @@ class SessionsNamespace:
         :raises OmnigentError: If the server returns a non-2xx
             status.
         """
+        if bundle is None and agent_id is None and project_id is None:
+            raise ValueError("Pass bundle, agent_id, or project_id")
+        if bundle is None and not isinstance(filename, NotGiven):
+            raise ValueError("filename is only valid with bundle create")
+        if bundle is not None and agent_id is not None:
+            raise ValueError("bundle and agent_id are mutually exclusive")
+        if bundle is None:
+            body = _present(
+                agent_id=agent_id if agent_id is not None else NOT_GIVEN,
+                project_id=project_id if project_id is not None else NOT_GIVEN,
+                title=title if title is not None else NOT_GIVEN,
+                labels=labels if labels is not None else NOT_GIVEN,
+                parent_session_id=parent_session_id
+                if parent_session_id is not None
+                else NOT_GIVEN,
+                sub_agent_name=sub_agent_name if sub_agent_name is not None else NOT_GIVEN,
+                host_type=host_type,
+                host_id=host_id if host_id is not None else NOT_GIVEN,
+                sandbox_provider=sandbox_provider if sandbox_provider is not None else NOT_GIVEN,
+                workspace=workspace if workspace is not None else NOT_GIVEN,
+                workspaces=workspaces if workspaces is not None else NOT_GIVEN,
+                git=git if git is not None else NOT_GIVEN,
+                terminal_launch_args=terminal_launch_args
+                if terminal_launch_args is not None
+                else NOT_GIVEN,
+                model_override=model_override if model_override is not None else NOT_GIVEN,
+                reasoning_effort=reasoning_effort if reasoning_effort is not None else NOT_GIVEN,
+                cost_control_mode_override=cost_control_mode_override
+                if cost_control_mode_override is not None
+                else NOT_GIVEN,
+                subagent_routing_override=subagent_routing_override
+                if subagent_routing_override is not None
+                else NOT_GIVEN,
+                harness_override=harness_override if harness_override is not None else NOT_GIVEN,
+                smart_routing_message=smart_routing_message
+                if smart_routing_message is not None
+                else NOT_GIVEN,
+                initial_items=initial_items if initial_items is not None else NOT_GIVEN,
+            )
+            request_type = (
+                ProjectSessionCreateRequest if project_id is not None else SessionCreateRequest
+            )
+            validated = request_type.model_validate(body)
+            body = validated.model_dump(mode="json", by_alias=True, exclude_unset=True)
+            if "initial_items" in validated.model_fields_set:
+                body["initial_items"] = [
+                    event.model_dump(mode="json", by_alias=True, exclude_none=True)
+                    for event in validated.initial_items
+                ]
+            response = await self._http.post(
+                f"{self._base}/v1/sessions",
+                json=body,
+                params=extra_query,
+                **_options(timeout, extra_headers),
+            )
+            raise_for_status(response.status_code, response_body(response))
+            return Session.model_validate(require_json_object(response, "POST /v1/sessions"))
+
+        registered_only = {
+            "sub_agent_name": sub_agent_name,
+            "workspaces": workspaces,
+            "git": git,
+            "model_override": model_override,
+            "cost_control_mode_override": cost_control_mode_override,
+            "subagent_routing_override": subagent_routing_override,
+            "harness_override": harness_override,
+            "smart_routing_message": smart_routing_message,
+            "initial_items": initial_items,
+        }
+        invalid = [name for name, value in registered_only.items() if value is not None]
+        if invalid:
+            raise ValueError(f"bundle create does not support: {', '.join(invalid)}")
         metadata: dict[str, Any] = {}
         if title is not None:
             metadata["title"] = title
@@ -190,15 +661,35 @@ class SessionsNamespace:
             metadata["host_type"] = host_type
         if sandbox_provider is not None:
             metadata["sandbox_provider"] = sandbox_provider
+        for key, value in {
+            "project_id": project_id,
+            "parent_session_id": parent_session_id,
+            "host_id": host_id,
+            "terminal_launch_args": terminal_launch_args,
+        }.items():
+            if value is not None:
+                metadata[key] = value
+        metadata = SessionCreateMetadata.model_validate(metadata).model_dump(
+            mode="json", by_alias=True, exclude_unset=True
+        )
+        assert bundle is not None
+        wire_filename = "agent.tar.gz" if isinstance(filename, NotGiven) else filename
         resp = await self._http.post(
             f"{self._base}/v1/sessions",
             data={"metadata": json.dumps(metadata)},
-            files={"bundle": (filename, bundle, "application/gzip")},
+            files={"bundle": (wire_filename, bundle, "application/gzip")},
+            params=extra_query,
+            **_options(timeout, extra_headers),
         )
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
         session_id = str(created["session_id"])
-        return await self.get(session_id)
+        return await self.retrieve(
+            session_id,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+        )
 
     async def create_from_agent_id(
         self,
@@ -232,19 +723,13 @@ class SessionsNamespace:
         :raises OmnigentError: If the server returns a non-2xx
             status.
         """
-        body: dict[str, Any] = {"agent_id": agent_id}
-        if title is not None:
-            body["title"] = title
-        if labels is not None:
-            body["labels"] = labels
-        if reasoning_effort is not None:
-            body["reasoning_effort"] = reasoning_effort
-        if workspace is not None:
-            body["workspace"] = workspace
-        resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
-        raise_for_status(resp.status_code, response_body(resp))
-        created = require_json_object(resp, "POST /v1/sessions")
-        return Session.model_validate(created)
+        return await self.create(
+            agent_id=agent_id,
+            title=title,
+            labels=labels,
+            reasoning_effort=reasoning_effort,
+            workspace=workspace,
+        )
 
     async def resolve_agent(self, agent_name: str) -> RegisteredAgent:
         """
@@ -367,10 +852,18 @@ class SessionsNamespace:
         before: str | None = None,
         agent_id: str | None = None,
         agent_name: str | None = None,
-        order: str = "desc",
-        sort_by: str = "created_at",
+        order: Literal["asc", "desc"] = "desc",
+        sort_by: Literal["created_at", "updated_at"] = "created_at",
         include_archived: bool = False,
-    ) -> list[SessionListItem]:
+        search_query: str | None = None,
+        kind: Literal["default", "sub_agent", "any"] = "default",
+        project: str | None = None,
+        pinned: bool = False,
+        visibility: Literal["all", "mine", "shared", "archived"] = "all",
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> AsyncCursorPage[SessionListItem]:
         """
         List sessions with cursor-based pagination.
 
@@ -398,7 +891,18 @@ class SessionsNamespace:
             that cursor — restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status.
         """
-        params: dict[str, str | int] = {"limit": limit, "order": order, "sort_by": sort_by}
+        params = _query(
+            extra_query,
+            limit=limit,
+            order=order,
+            sort_by=sort_by,
+            after=after,
+            before=before,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            search_query=search_query,
+            project=project,
+        )
         if after is not None:
             params["after"] = after
         if before is not None:
@@ -409,13 +913,60 @@ class SessionsNamespace:
             params["agent_name"] = agent_name
         if include_archived:
             params["include_archived"] = "true"
+        else:
+            params.pop("include_archived", None)
+        if search_query is not None:
+            params["search_query"] = search_query
+        if kind != "default":
+            params["kind"] = kind
+        else:
+            params.pop("kind", None)
+        if project is not None:
+            params["project"] = project
+        if pinned:
+            params["pinned"] = "true"
+        else:
+            params.pop("pinned", None)
+        if visibility != "all":
+            params["visibility"] = visibility
+        else:
+            params.pop("visibility", None)
         resp = await self._http.get(
             f"{self._base}/v1/sessions",
             params=params,
+            **_options(timeout, extra_headers),
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions")
-        return SessionList.model_validate(body).data
+        page = SessionList.model_validate(body)
+
+        async def next_page(cursor: str) -> AsyncCursorPage[SessionListItem]:
+            return await self.list(
+                limit=limit,
+                after=cursor,
+                before=before,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                order=order,
+                sort_by=sort_by,
+                include_archived=include_archived,
+                search_query=search_query,
+                kind=kind,
+                project=project,
+                pinned=pinned,
+                visibility=visibility,
+                timeout=timeout,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            )
+
+        return AsyncCursorPage(
+            page.data,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+            fetch_next_page=next_page,
+        )
 
     async def bind_runner(
         self,
@@ -765,7 +1316,54 @@ class SessionsNamespace:
         nodes = await self.child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
         return any(child_summary_busy(node) for node in nodes)
 
-    async def get(self, session_id: str) -> Session:
+    async def _retrieve_response(
+        self,
+        session_id: str,
+        *,
+        include_items: bool = True,
+        include_liveness: bool = True,
+        refresh_state: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> httpx.Response:
+        params: dict[str, Any] = dict(extra_query or {})
+        if not include_items:
+            params["include_items"] = "false"
+        else:
+            params.pop("include_items", None)
+        if not include_liveness:
+            params["include_liveness"] = "false"
+        else:
+            params.pop("include_liveness", None)
+        if refresh_state:
+            params["refresh_state"] = "true"
+        else:
+            params.pop("refresh_state", None)
+        return await self._http.get(
+            f"{self._base}/v1/sessions/{session_id}",
+            params=params or None,
+            **_options(timeout, extra_headers),
+        )
+
+    @staticmethod
+    def _parse_retrieve(response: httpx.Response) -> Session:
+        raise_for_status(response.status_code, response_body(response))
+        return Session.model_validate(
+            require_json_object(response, "GET /v1/sessions/{session_id}")
+        )
+
+    async def retrieve(
+        self,
+        session_id: str,
+        *,
+        include_items: bool = True,
+        include_liveness: bool = True,
+        refresh_state: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> Session:
         """
         Fetch the current snapshot of a session.
 
@@ -780,11 +1378,84 @@ class SessionsNamespace:
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
         """
-        resp = await self._http.get(
-            f"{self._base}/v1/sessions/{session_id}",
+        response = await self._retrieve_response(
+            session_id,
+            include_items=include_items,
+            include_liveness=include_liveness,
+            refresh_state=refresh_state,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
         )
-        raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(require_json_object(resp, "GET /v1/sessions/{session_id}"))
+        return self._parse_retrieve(response)
+
+    async def get(self, session_id: str) -> Session:
+        """Compatibility alias for :meth:`retrieve`."""
+        return await self.retrieve(session_id)
+
+    async def update(
+        self,
+        session_id: str,
+        *,
+        runner_id: str | None | NotGiven = NOT_GIVEN,
+        title: str | None | NotGiven = NOT_GIVEN,
+        labels: Mapping[str, str] | None | NotGiven = NOT_GIVEN,
+        reasoning_effort: str | None | NotGiven = NOT_GIVEN,
+        model_override: str | None | NotGiven = NOT_GIVEN,
+        collaboration_mode: str | None | NotGiven = NOT_GIVEN,
+        permission_mode: str | None | NotGiven = NOT_GIVEN,
+        approval_mode: str | None | NotGiven = NOT_GIVEN,
+        cost_control_mode_override: Literal["on", "off"] | None | NotGiven = NOT_GIVEN,
+        subagent_routing_override: Literal["on", "off"] | None | NotGiven = NOT_GIVEN,
+        share_workspace_files: bool | None | NotGiven = NOT_GIVEN,
+        external_session_id: str | None | NotGiven = NOT_GIVEN,
+        terminal_launch_args: Sequence[str] | None | NotGiven = NOT_GIVEN,
+        archived: bool | None | NotGiven = NOT_GIVEN,
+        project_id: str | None | NotGiven = NOT_GIVEN,
+        silent: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> Session:
+        body = _present(**locals())
+        body.pop("self", None)
+        body.pop("session_id", None)
+        body.pop("timeout", None)
+        body.pop("extra_headers", None)
+        body.pop("extra_query", None)
+        body = UpdateSessionRequest.model_validate(body).model_dump(
+            mode="json", by_alias=True, exclude_unset=True
+        )
+        response = await self._http.patch(
+            f"{self._base}/v1/sessions/{session_id}",
+            json=body,
+            params=extra_query,
+            **_options(timeout, extra_headers),
+        )
+        raise_for_status(response.status_code, response_body(response))
+        return Session.model_validate(
+            require_json_object(response, "PATCH /v1/sessions/{session_id}")
+        )
+
+    async def delete(
+        self,
+        session_id: str,
+        *,
+        delete_branch: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> ConversationDeleted:
+        params = _query(extra_query, delete_branch=str(delete_branch).lower())
+        response = await self._http.delete(
+            f"{self._base}/v1/sessions/{session_id}",
+            params=params,
+            **_options(timeout, extra_headers),
+        )
+        raise_for_status(response.status_code, response_body(response))
+        return ConversationDeleted.model_validate(
+            require_json_object(response, "DELETE /v1/sessions/{session_id}")
+        )
 
     async def post_event(
         self,
@@ -813,20 +1484,32 @@ class SessionsNamespace:
         """
         validated = _PUBLIC_SESSION_EVENT_ADAPTER.validate_python(event)
         payload = validated.model_dump(mode="json", by_alias=True, exclude_none=True)
-        return await self._post_event_payload(session_id, payload)
+        result = await self._post_event_payload(session_id, payload)
+        if not isinstance(result, dict):
+            raise OmnigentError("single event submission returned a batch acknowledgement")
+        return result
 
     async def _post_event_payload(
         self,
         session_id: str,
-        event: dict[str, Any],
-    ) -> dict[str, Any]:
+        event: dict[str, Any] | builtins.list[dict[str, Any]],
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> dict[str, Any] | builtins.list[dict[str, Any]]:
         """Post an already-validated public or SDK-composed control event."""
         resp = await self._http.post(
             f"{self._base}/v1/sessions/{session_id}/events",
             json=event,
+            params=extra_query,
+            **_options(timeout, extra_headers),
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return require_json_object(resp, "POST /v1/sessions/{session_id}/events")
+        value = resp.json()
+        if not isinstance(value, (dict, list)):
+            raise OmnigentError("POST /v1/sessions/{session_id}/events returned invalid JSON")
+        return value
 
     async def resolve_elicitation(
         self,
@@ -875,8 +1558,20 @@ class SessionsNamespace:
         source_session_id: str,
         *,
         title: str | None = None,
+        agent_id: str | None = None,
         up_to_response_id: str | None = None,
-    ) -> dict[str, Any]:
+        model_override: str | None | NotGiven = NOT_GIVEN,
+        reasoning_effort: str | None | NotGiven = NOT_GIVEN,
+        terminal_launch_args: Sequence[str] | None | NotGiven = NOT_GIVEN,
+        codex_bypass_sandbox: bool = False,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
+        workspace: str | None | NotGiven = NOT_GIVEN,
+        side_chat: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> Session:
         """
         Fork an existing session into a new session.
 
@@ -900,22 +1595,42 @@ class SessionsNamespace:
             not exist; 400 if the source has no agent binding or
             *up_to_response_id* names no response in the source.
         """
-        body: dict[str, Any] = {}
-        if title is not None:
-            body["title"] = title
-        if up_to_response_id is not None:
-            body["up_to_response_id"] = up_to_response_id
+        body = _present(
+            title=title if title is not None else NOT_GIVEN,
+            agent_id=agent_id if agent_id is not None else NOT_GIVEN,
+            up_to_response_id=up_to_response_id if up_to_response_id is not None else NOT_GIVEN,
+            model_override=model_override,
+            reasoning_effort=reasoning_effort,
+            terminal_launch_args=terminal_launch_args,
+            codex_bypass_sandbox=codex_bypass_sandbox if codex_bypass_sandbox else NOT_GIVEN,
+            host_type=host_type if host_type != "external" else NOT_GIVEN,
+            sandbox_provider=sandbox_provider if sandbox_provider is not None else NOT_GIVEN,
+            workspace=workspace,
+            side_chat=side_chat if side_chat else NOT_GIVEN,
+        )
+        # Validate strict fields without erasing whether a caller omitted them.
+        body = SessionForkRequest.model_validate(body).model_dump(
+            mode="json", by_alias=True, exclude_unset=True
+        )
         resp = await self._http.post(
             f"{self._base}/v1/sessions/{source_session_id}/fork",
             json=body,
+            params=extra_query,
+            **_options(timeout, extra_headers),
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return require_json_object(
-            resp,
-            f"POST /v1/sessions/{source_session_id}/fork",
+        return Session.model_validate(
+            require_json_object(resp, f"POST /v1/sessions/{source_session_id}/fork")
         )
 
-    async def compact(self, session_id: str) -> None:
+    async def compact(
+        self,
+        session_id: str,
+        *,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
+    ) -> EventAcknowledgement:
         """
         Request explicit context compaction for a session.
 
@@ -928,10 +1643,16 @@ class SessionsNamespace:
             ``"conv_abc123"``.
         :raises OmnigentError: If the server returns a non-2xx status.
         """
-        await self._post_event_payload(
+        result = await self._post_event_payload(
             session_id,
             {"type": "compact", "data": {}},
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
         )
+        if not isinstance(result, dict):
+            raise OmnigentError("compact returned a batch acknowledgement")
+        return EventAcknowledgement.model_validate(result)
 
     async def interrupt(self, session_id: str) -> None:
         """
@@ -957,6 +1678,11 @@ class SessionsNamespace:
     async def stream(
         self,
         session_id: str,
+        *,
+        idle: bool = False,
+        timeout: Timeout = None,
+        extra_headers: Headers = None,
+        extra_query: Query = None,
     ) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
         """
         Live-tail the session's SSE event stream.
@@ -984,6 +1710,10 @@ class SessionsNamespace:
             self._http,
             self._base,
             session_id,
+            idle=idle,
+            timeout=timeout,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
         ):
             yield event
 
@@ -1037,6 +1767,11 @@ async def _stream_session_events(
     http: httpx.AsyncClient,
     base_url: str,
     session_id: str,
+    *,
+    idle: bool = False,
+    timeout: Timeout = None,
+    extra_headers: Headers = None,
+    extra_query: Query = None,
 ) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
     """
     Open a single SSE connection and yield parsed
@@ -1058,10 +1793,16 @@ async def _stream_session_events(
     :raises httpx.TooManyRedirects: If on-origin redirects loop past
         httpx's limit.
     """
+    params = _query(extra_query, idle="true" if idle else None)
+    stream_options: dict[str, Any] = {
+        "headers": extra_headers,
+        "timeout": _SSE_TIMEOUT if timeout is None else timeout,
+    }
     async with http.stream(
         "GET",
         f"{base_url}/v1/sessions/{session_id}/stream",
-        timeout=_SSE_TIMEOUT,
+        params=params or None,
+        **stream_options,
     ) as resp:
         if resp.status_code >= 400:
             await resp.aread()

@@ -331,6 +331,7 @@ _FLAT_ITEM_CASES: tuple[tuple[str, dict[str, Any]], ...] = (
             "raw_model": "gpt-5-6-sol",
             "attempted_override": "gpt-5-5",
             "router_source": "oss-llm",
+            "task_description": "Review auth flows",
         },
     ),
     (
@@ -503,3 +504,16 @@ def test_unknown_event_is_output_only_and_retains_the_raw_event() -> None:
         TypeAdapter(protocol.ServerStreamEvent).validate_python(raw)
     with pytest.raises(ValidationError):
         TypeAdapter(protocol.PublicSessionEventInput).validate_python(raw)
+
+
+def test_output_models_offer_thin_dict_and_json_aliases() -> None:
+    """SDK-style aliases retain Pydantic options and additive fields."""
+    model = protocol.EventAcknowledgement.model_validate(
+        {"queued": True, "item_id": None, "future_field": "retained"}
+    )
+
+    assert model.to_dict(exclude_none=True) == {
+        "queued": True,
+        "future_field": "retained",
+    }
+    assert json.loads(model.to_json(exclude_none=True)) == model.to_dict(exclude_none=True)

@@ -22,12 +22,11 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
+from typing import Literal, Protocol, SupportsIndex, SupportsInt, TypeVar, cast
 
 import httpx
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
-from websockets.typing import Subprotocol
 
 from omnigent._platform import (
     IS_POSIX,
@@ -45,15 +44,11 @@ from omnigent.debug_logging import (
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
-from omnigent.harness_availability import (
-    HARNESS_BINARY_MISSING,
-    HarnessAvailability,
-)
+from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
-    HOST_IDENTITY_SUBPROTOCOL,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -67,7 +62,6 @@ from omnigent.host.frames import (
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
-    HostIdentityFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
@@ -99,7 +93,6 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
-    host_subprotocol_has_async_capabilities,
     workspace_missing_message,
 )
 from omnigent.host.git_worktree import (
@@ -180,6 +173,7 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 class _WaitidInfo(Protocol):
@@ -1050,9 +1044,10 @@ class HostProcess:
         # to retry credential discovery.
         self._auth_token_factory: Callable[[], str | None] | None = None
         self._auth_token_factory_resolved = False
-        # This host's owning user, supplied by a negotiated server over the
-        # authenticated tunnel. Injected into every runner and published to
-        # OMNIGENT_USER_ID so host/runner debug-log rows carry it.
+        # This host's owning user, resolved once after the first accepted tunnel
+        # upgrade (GET /v1/me). Injected into every runner it spawns and published
+        # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
+        # resolved, or on a single-user server / managed host where it is absent.
         self._owner_user_id: str | None = None
         # The fronting Databricks workspace id for this server, resolved once from
         # the server URL (its ?o= selector or the stored login record) — the same
@@ -1127,9 +1122,12 @@ class HostProcess:
         # The orphan reaper skips its sweep while this is >0 so it never
         # ``wait()``s a child that ``subprocess.run`` is about to reap itself —
         # stealing it would corrupt that command's returncode to 0 (#1782).
-        # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
-        # because both the mutation and the reaper run on the event loop.
+        # Mutated only on the event loop by the guard helpers below, so a plain
+        # counter is sufficient.
         self._owned_subprocess_ops = 0
+        # Keep cancellation-shielded worker tasks alive until they release the
+        # orphan-reaper guard after their subprocesses have actually finished.
+        self._host_subprocess_tasks: set[asyncio.Task[object]] = set()
         # Copy-on-write runner forkserver, on by default; set
         # OMNIGENT_RUNNER_ZYGOTE=0 (or false/no/off) to opt out onto the direct
         # Popen path. POSIX-only (needs os.fork + AF_UNIX fd-passing); the host
@@ -1307,6 +1305,27 @@ class HostProcess:
             yield
         finally:
             self._owned_subprocess_ops -= 1
+
+    async def _run_host_subprocess_in_thread(self, operation: Callable[[], _T]) -> _T:
+        """Run a subprocess-owning operation off-loop without losing its exit status.
+
+        Cancellation stops waiting for the result but cannot stop a worker
+        thread. Keep the orphan reaper paused until the worker itself finishes.
+        """
+        self._owned_subprocess_ops += 1
+        task = asyncio.create_task(asyncio.to_thread(operation))
+        retained_task = cast("asyncio.Task[object]", task)
+        self._host_subprocess_tasks.add(retained_task)
+
+        def _release(completed: asyncio.Task[_T]) -> None:
+            self._host_subprocess_tasks.discard(cast("asyncio.Task[object]", completed))
+            self._owned_subprocess_ops -= 1
+            if not completed.cancelled():
+                # A canceled caller no longer retrieves a later worker error.
+                completed.exception()
+
+        task.add_done_callback(_release)
+        return await asyncio.shield(task)
 
     def _reap_orphans_waitid(self) -> int:
         """Peek-and-reap using ``os.waitid(WNOWAIT)`` (Linux/POSIX).
@@ -3496,7 +3515,7 @@ class HostProcess:
     ) -> dict[str, HarnessAvailability] | None:
         """Collect harness readiness without letting a probe break the channel."""
         try:
-            return await asyncio.to_thread(configured_harness_map)
+            return await self._run_host_subprocess_in_thread(configured_harness_map)
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
@@ -3625,18 +3644,6 @@ class HostProcess:
                 transport.abort()
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
-
-    async def _lifecycle_is_current(self) -> bool:
-        """Recheck daemon ownership before publishing connection state."""
-        if self._lifecycle_lost.is_set():
-            return False
-        if self._lifecycle_lock is None:
-            return True
-        if await asyncio.to_thread(self._lifecycle_lock.still_owner):
-            return True
-        self._lifecycle_lost.set()
-        self._abort_live_tunnel()
-        return False
 
     async def run(self) -> None:
         """Run the host process with reconnection.
@@ -3978,7 +3985,10 @@ class HostProcess:
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
         url = self._tunnel_url()
-        headers = self._build_connect_headers()
+        # Credential discovery may invoke the Databricks CLI. Keep it off the
+        # event loop so startup capability discovery can make progress at the
+        # same time instead of starting only after authentication completes.
+        headers = await self._run_host_subprocess_in_thread(self._build_connect_headers)
 
         _logger.info("Connecting to %s", url)
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
@@ -3990,7 +4000,6 @@ class HostProcess:
             ws_cm = websockets.asyncio.client.connect(
                 url,
                 additional_headers=headers,
-                subprotocols=[Subprotocol(HOST_IDENTITY_SUBPROTOCOL)],
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
                 open_timeout=(
@@ -4029,11 +4038,7 @@ class HostProcess:
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
-            if getattr(ws, "subprotocol", None) != HOST_IDENTITY_SUBPROTOCOL:
-                # An old server cannot send the authenticated identity frame.
-                # Preserve its historical ordering so the first runner's logs
-                # are attributed before the host becomes launchable.
-                await self._ensure_owner_user_id()
+            await self._ensure_owner_user_id(headers=headers)
             await self._serve_frames(ws)
         except BaseException as exc:
             disconnect_error = exc
@@ -4058,7 +4063,7 @@ class HostProcess:
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
 
-    async def _ensure_owner_user_id(self) -> None:
+    async def _ensure_owner_user_id(self, *, headers: dict[str, str] | None = None) -> None:
         """Resolve this host's owning user once and publish it for attribution.
 
         Best-effort ``GET /v1/me`` (the same call the CLI resume picker uses),
@@ -4067,16 +4072,26 @@ class HostProcess:
         this host spawns) and in ``OMNIGENT_USER_ID`` (so the host's own
         debug-log rows carry it). A single-user server / managed host answers no
         owner, and any failure is swallowed -- attribution must never disrupt the
-        host, and those rows simply ship ``user_id = NULL``.
+        host, and those rows simply ship ``user_id = NULL``. The accepted
+        tunnel's request headers may be supplied so this lookup reuses the
+        same credential resolution rather than probing authentication twice.
+
+        :param headers: Auth and routing headers already built for the tunnel.
         """
         if self._owner_user_id is not None:
             return
         try:
             from omnigent.resume_dispatch import _resolve_current_user_id
 
-            headers = self._build_connect_headers()
+            request_headers = headers
+            if request_headers is None:
+                request_headers = await self._run_host_subprocess_in_thread(
+                    self._build_connect_headers
+                )
             owner = await asyncio.to_thread(
-                _resolve_current_user_id, base_url=self._server_url, headers=headers
+                _resolve_current_user_id,
+                base_url=self._server_url,
+                headers=request_headers,
             )
         except Exception:  # noqa: BLE001 — attribution is best-effort
             return
@@ -4164,13 +4179,9 @@ class HostProcess:
         return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
-        """Register with negotiated readiness semantics, then service the connection."""
+        """Wait for bounded startup discovery, register, then service the connection."""
         self._start_capability_discovery()
-        async_capabilities = host_subprotocol_has_async_capabilities(
-            getattr(ws, "subprotocol", None)
-        )
-        capabilities_pending = async_capabilities and not self._capabilities_initialized
-        if not capabilities_pending and self._capability_init_task is not None:
+        if self._capability_init_task is not None:
             await asyncio.shield(self._capability_init_task)
         _tel_opt_out = False
         try:
@@ -4187,17 +4198,14 @@ class HostProcess:
                 _tel_install_id = _get_install_id()
         except Exception:  # noqa: BLE001
             pass
-        if not await self._lifecycle_is_current():
-            raise asyncio.CancelledError
         hello = HostHelloFrame(
             version=VERSION,
             frame_protocol_version=1,
             name=self._identity.name,
             runners=self._alive_runner_ids(),
-            configured_harnesses=None if capabilities_pending else self._configured_harnesses,
-            gateway_inference=None if capabilities_pending else self._gateway_inference,
+            configured_harnesses=self._configured_harnesses,
+            gateway_inference=self._gateway_inference,
             interactive_shells=self._interactive_shells,
-            capabilities_pending=capabilities_pending,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
         )
@@ -4207,15 +4215,7 @@ class HostProcess:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
         self._ws = ws
-        readiness_task = asyncio.create_task(
-            self._harness_readiness_loop(
-                ws,
-                capabilities_pending=capabilities_pending,
-                published_configured=hello.configured_harnesses,
-                published_gateway=hello.gateway_inference,
-            ),
-            name="host-harness-readiness",
-        )
+        readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
         # waiting on a harness probe. Cache-fresh reconnects are a no-op.
@@ -4248,8 +4248,7 @@ class HostProcess:
                     # loop exits or reconnects, so handle them inline. Ordinary
                     # request frames run concurrently below; exceptions raised
                     # on those detached tasks are intentionally contained.
-                    if self._handle_connection_control_frame(raw):
-                        continue
+                    self._raise_connection_error_from_raw(raw)
                     # Each request frame is handled on its own task so a slow
                     # handler (a model-options CLI exec, a long git walk) can't
                     # head-of-line block the frames behind it — measured
@@ -4270,38 +4269,10 @@ class HostProcess:
     async def _harness_readiness_loop(
         self,
         ws: websockets.asyncio.client.ClientConnection,
-        *,
-        capabilities_pending: bool = False,
-        published_configured: dict[str, HarnessAvailability] | None = None,
-        published_gateway: dict[str, bool] | None = None,
     ) -> None:
         """Refresh advisory capabilities without endangering the tunnel."""
-        if not capabilities_pending and published_configured is None and published_gateway is None:
-            published_configured = self._configured_harnesses
-            published_gateway = self._gateway_inference
-        if capabilities_pending:
-            discovery = self._capability_init_task
-            if discovery is not None:
-                try:
-                    await asyncio.shield(discovery)
-                except Exception:  # noqa: BLE001 — periodic refresh can recover
-                    _logger.warning(
-                        "Startup capability discovery failed after registration",
-                        exc_info=True,
-                    )
-            if not await self._lifecycle_is_current():
-                return
-            await ws.send(
-                encode_host_frame(
-                    HostHarnessReadinessFrame(
-                        configured_harnesses=self._configured_harnesses,
-                        gateway_inference=self._gateway_inference,
-                        capabilities_pending=False,
-                    )
-                )
-            )
-            published_configured = self._configured_harnesses
-            published_gateway = self._gateway_inference
+        published_configured = self._configured_harnesses
+        published_gateway = self._gateway_inference
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
@@ -4341,7 +4312,6 @@ class HostProcess:
                         HostHarnessReadinessFrame(
                             configured_harnesses=configured,
                             gateway_inference=gateway,
-                            capabilities_pending=False,
                         )
                     )
                 )
@@ -4355,22 +4325,14 @@ class HostProcess:
             raise HostRetryableConnectionError(message)
         raise HostConnectError(message)
 
-    def _handle_connection_control_frame(self, raw: str) -> bool:
-        """Handle ordered connection metadata before request-task dispatch."""
+    def _raise_connection_error_from_raw(self, raw: str) -> None:
+        """Handle connection-level frames before request-task dispatch."""
         try:
             frame = decode_host_frame(raw)
         except ValueError:
-            return False
+            return
         if isinstance(frame, HostConnectionErrorFrame):
             self._raise_connection_error(frame)
-        if isinstance(frame, HostIdentityFrame):
-            self._owner_user_id = frame.user_id
-            if frame.user_id:
-                os.environ[USER_ID_ENV_VAR] = frame.user_id
-            else:
-                os.environ.pop(USER_ID_ENV_VAR, None)
-            return True
-        return False
 
     def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
         """Handle one inbound frame on its own task, off the receive loop.

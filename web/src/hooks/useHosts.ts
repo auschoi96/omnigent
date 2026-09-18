@@ -1,10 +1,4 @@
-import {
-  type QueryClient,
-  useMutation,
-  useMutationState,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -26,8 +20,6 @@ export interface Host {
    * "nothing configured".
    */
   configured_harnesses?: Record<string, boolean | string> | null;
-  /** Startup readiness state; null/undefined means a legacy host. */
-  capabilities_pending?: boolean | null;
   /**
    * Whether each harness family's launch on this host resolves an
    * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
@@ -54,31 +46,6 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   // HostBadge) back into seeing them so it can label sandbox sessions.
   if (includeSandbox) return body.hosts;
   return body.hosts.filter((h) => !h.sandbox_provider);
-}
-
-async function fetchHostDetails(hostId: string): Promise<Host> {
-  const res = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return (await res.json()) as Host;
-}
-
-function hostDetailsQueryKey(hostId: string): readonly ["host-detail", string] {
-  return ["host-detail", hostId];
-}
-
-function patchCachedHostReadiness(
-  queryClient: QueryClient,
-  hostId: string,
-  configuredHarnesses: Record<string, boolean | string>,
-) {
-  queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
-    hosts?.map((host) =>
-      host.host_id === hostId ? { ...host, configured_harnesses: configuredHarnesses } : host,
-    ),
-  );
-  queryClient.setQueryData<Host>(hostDetailsQueryKey(hostId), (host) =>
-    host ? { ...host, configured_harnesses: configuredHarnesses } : host,
-  );
 }
 
 interface UseHostsOptions {
@@ -115,17 +82,6 @@ export function useHosts(options: UseHostsOptions = {}) {
     staleTime: refetchOnFocus ? 0 : 30_000,
     refetchOnWindowFocus: refetchOnFocus,
     refetchInterval: enabled ? 60_000 : false,
-  });
-}
-
-/** Live capability state for one host, routed to the replica owning its tunnel. */
-export function useHostDetails(hostId: string | null, enabled = true) {
-  return useQuery({
-    queryKey: hostDetailsQueryKey(hostId ?? ""),
-    queryFn: () => fetchHostDetails(hostId as string),
-    enabled: enabled && hostId !== null,
-    staleTime: 15_000,
-    refetchInterval: enabled && hostId !== null ? 60_000 : false,
   });
 }
 
@@ -233,7 +189,11 @@ export function useInstallHarness(hostId: string) {
       // callbacks fire per-mutation from the Mutation object, so a concurrent
       // second install can't orphan the first one's cache patch — unlike the
       // observer's per-call callbacks, which the later mutate() overwrites.
-      patchCachedHostReadiness(queryClient, hostId, result.configured_harnesses);
+      queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
+        hosts?.map((h) =>
+          h.host_id === hostId ? { ...h, configured_harnesses: result.configured_harnesses } : h,
+        ),
+      );
     },
   });
 }
@@ -322,10 +282,11 @@ export function useStoreCredential(hostId: string) {
     // react-query fires both — don't consolidate them, or the cache patch here
     // is lost.
     onSuccess: (result) => {
-      patchCachedHostReadiness(queryClient, hostId, result.configured_harnesses);
-      // Credential changes can also change gateway backing, which the mutation
-      // response does not include. Refresh the live replica-local snapshot.
-      void queryClient.invalidateQueries({ queryKey: hostDetailsQueryKey(hostId) });
+      queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
+        hosts?.map((h) =>
+          h.host_id === hostId ? { ...h, configured_harnesses: result.configured_harnesses } : h,
+        ),
+      );
       // A written/adopted credential changes what's adoptable — refetch it.
       void queryClient.invalidateQueries({ queryKey: ["detected-credentials", hostId] });
     },

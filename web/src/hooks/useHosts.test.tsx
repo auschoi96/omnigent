@@ -5,7 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   useDetectedCredentials,
-  useHostDetails,
   useHostModelOptions,
   useHosts,
   useInstallHarness,
@@ -282,34 +281,6 @@ describe("useHosts", () => {
   });
 });
 
-describe("useHostDetails", () => {
-  it("fetches live state through the host-scoped endpoint", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        host_id: "host_1",
-        name: "Laptop",
-        owner: "alice",
-        status: "online",
-        capabilities_pending: true,
-        gateway_inference: null,
-      }),
-    );
-
-    const { result } = renderHook(() => useHostDetails("host_1"), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/hosts/host_1");
-    expect(result.current.data?.capabilities_pending).toBe(true);
-  });
-
-  it("does not fetch without a selected host", async () => {
-    renderHook(() => useHostDetails(null), { wrapper });
-    await Promise.resolve();
-
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-});
-
 describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () => {
   // Reproduces the "switch harness mid-install" bug: the setup dialog is one
   // persistent instance sharing a single install mutation observer. That
@@ -341,13 +312,6 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
       ["hosts", { includeSandbox: false }],
       [{ host_id: HOST, name: "Laptop", owner: "alice", status: "online" }],
     );
-    client.setQueryData(["host-detail", HOST], {
-      host_id: HOST,
-      name: "Laptop",
-      owner: "alice",
-      status: "online",
-      capabilities_pending: false,
-    });
 
     const { result } = renderHook(
       () => ({
@@ -389,10 +353,6 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
       { includeSandbox: false },
     ]);
     expect(hosts?.[0].configured_harnesses?.["codex-native"]).toBe("needs-auth");
-    expect(
-      client.getQueryData<{ configured_harnesses?: Record<string, unknown> }>(["host-detail", HOST])
-        ?.configured_harnesses?.["codex-native"],
-    ).toBe("needs-auth");
 
     // Resolve Pi: it clears too and its response (again the full map) reflects
     // both harnesses' final readiness.
@@ -536,13 +496,6 @@ describe("useStoreCredential", () => {
       ["hosts", { includeSandbox: false }],
       [{ host_id: "host_1", name: "Laptop", owner: "alice", status: "online" }],
     );
-    client.setQueryData(["host-detail", "host_1"], {
-      host_id: "host_1",
-      name: "Laptop",
-      owner: "alice",
-      status: "online",
-      gateway_inference: { "codex-native": false },
-    });
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
     const { result } = renderHook(() => useStoreCredential("host_1"), { wrapper: sharedWrapper });
@@ -555,13 +508,6 @@ describe("useStoreCredential", () => {
       { includeSandbox: false },
     ]);
     expect(hosts?.[0].configured_harnesses?.["codex-native"]).toBe(true);
-    expect(
-      client.getQueryData<{ configured_harnesses?: Record<string, unknown> }>([
-        "host-detail",
-        "host_1",
-      ])?.configured_harnesses?.["codex-native"],
-    ).toBe(true);
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["host-detail", "host_1"] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["detected-credentials", "host_1"] });
   });
 });

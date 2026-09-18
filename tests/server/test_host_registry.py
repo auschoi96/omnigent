@@ -73,28 +73,6 @@ def test_register_and_get() -> None:
     assert fetched.hello.name == "test-host"
 
 
-def test_capability_state_distinguishes_modern_and_legacy_tunnels() -> None:
-    """Only a negotiated tunnel exposes authoritative pending state."""
-    registry = HostRegistry()
-    legacy = _make_hello("legacy")
-    registry.register("host_legacy", FakeWebSocket(), legacy, owner="alice")
-
-    modern = _make_hello("modern")
-    modern.capabilities_pending = True
-    registry.register(
-        "host_modern",
-        FakeWebSocket(),
-        modern,
-        owner="alice",
-        async_capabilities=True,
-    )
-
-    assert registry.capabilities_pending("host_legacy") is None
-    assert not registry.has_async_capabilities("host_legacy")
-    assert registry.capabilities_pending("host_modern") is True
-    assert registry.has_async_capabilities("host_modern")
-
-
 def test_interactive_shells_survive_disconnect() -> None:
     """A runner can outlive its host tunnel without losing the shell snapshot."""
     registry = HostRegistry()
@@ -458,8 +436,14 @@ def test_exit_reports_get_is_unscoped() -> None:
     assert reports.get("runner_unknown") is None
 
 
-def test_gateway_inference_registry_cache_survives_a_tunnel_flap() -> None:
-    """The replica-local cache keeps a host report across a tunnel flap."""
+def test_gateway_inference_is_reported_not_persisted() -> None:
+    """The map a host reports is held per host id and survives a tunnel flap.
+
+    Nothing about gateway backing reaches the database, so the registry is the
+    only place a routing decision can read it. A host that disconnects keeps its
+    last report (a flap must not blank a known answer); a fresh registry — a
+    restarted server — knows nothing until the host reconnects and re-reports.
+    """
     bare = "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
     registry = HostRegistry()
     assert registry.gateway_inference(bare) is None

@@ -12,7 +12,6 @@ from omnigent.gateway_inference import (
     CODEX_GATEWAY_HARNESSES,
     claude_gateway_inference_backed,
     codex_gateway_inference_backed,
-    gateway_inference_harness_supported,
     gateway_inference_map,
     gateway_inference_state,
     not_gateway_backed,
@@ -531,22 +530,6 @@ def test_not_gateway_backed_names_only_the_explicit_false_arms() -> None:
     # Unknown keeps every option: an older host must not silently lose routing.
     assert not_gateway_backed(None, arms) == []
     assert not_gateway_backed({"claude-native": True}, arms) == []
-
-
-def test_gateway_inference_state_normalizes_measured_families_only() -> None:
-    gateway = {"claude-native": True, "codex-native": False}
-
-    assert gateway_inference_state(gateway, "claude-sdk") is None
-    # Preserve the historical family lookup, but do not use a spec-less native
-    # probe to fail closed for the separately configured SDK harness.
-    assert gateway_inference_state(gateway, "codex") is False
-    assert gateway_inference_harness_supported("claude-sdk") is False
-    assert gateway_inference_harness_supported("codex") is False
-    assert gateway_inference_harness_supported("codex-native") is True
-    # SDK agents and Pi can select providers in their specs. Their absent map
-    # entries remain unknown instead of being invented from host defaults.
-    assert gateway_inference_state(gateway, "pi") is None
-    assert gateway_inference_harness_supported("pi") is False
 
 
 @pytest.mark.parametrize(

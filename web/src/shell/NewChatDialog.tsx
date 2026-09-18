@@ -235,13 +235,7 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
-import {
-  fetchHosts,
-  useHostDetails,
-  useHostModelOptions,
-  useHosts,
-  type Host,
-} from "@/hooks/useHosts";
+import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { useSkills } from "@/hooks/useSkills";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
@@ -1558,10 +1552,11 @@ export function AgentHarnessPicker({
       : "";
     const summary = details || entrySummaries?.[agent.id] || "Default";
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
-    const unavailableReason = harnessUnavailableReasonOnHost(agent.harness, host);
-    const checking = unavailableReason === "pending";
     const unavailable = harnessUnconfiguredOnHost(agent.harness, host);
-    const warning = harnessWarningBadgeText(unavailableReason, collapsedBadge);
+    const warning = harnessWarningBadgeText(
+      harnessUnavailableReasonOnHost(agent.harness, host),
+      collapsedBadge,
+    );
     return (
       <HarnessPickerEntry
         key={agent.id}
@@ -1588,16 +1583,7 @@ export function AgentHarnessPicker({
         summaryTestId={`new-chat-landing-agent-summary-${agent.id}`}
         editTestId={`new-chat-landing-agent-config-${agent.id}`}
         warning={
-          checking ? (
-            <span
-              title={warning}
-              aria-label={warning}
-              data-testid={`new-chat-landing-agent-checking-${agent.id}`}
-              className="flex size-4 shrink-0 items-center justify-center text-muted-foreground"
-            >
-              <Spinner className="size-3.5" aria-hidden="true" />
-            </span>
-          ) : unavailable ? (
+          unavailable && (
             <span
               title={warning}
               aria-label={warning}
@@ -1606,7 +1592,7 @@ export function AgentHarnessPicker({
             >
               <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
             </span>
-          ) : null
+          )
         }
       />
     );
@@ -2437,7 +2423,6 @@ export function NewChatLandingScreen() {
           : managedSandboxesEnabled || (hosts ?? []).some((host) => host.status === "online")));
   const noExecutionTargetSelected =
     !sandboxSelected && selectedHostId === null && !executionTargetSelectionPending;
-  const { data: selectedHostDetails } = useHostDetails(selectedHostId, hostSelected);
   const {
     data: hostClaudeModelOptions,
     isLoading: hostClaudeModelsLoading,
@@ -3174,40 +3159,13 @@ export function NewChatLandingScreen() {
   // The selected native harness, used to persist/seed its option knobs (mode /
   // model / effort), which are harness-specific. null for non-native agents,
   // which have no knobs to remember.
-  const selectedHostFromList = allHosts.find((h) => h.host_id === selectedHostId);
-  const selectedHost = useMemo(
-    () =>
-      selectedHostFromList === undefined
-        ? undefined
-        : selectedHostDetails === undefined
-          ? selectedHostFromList
-          : {
-              ...selectedHostFromList,
-              configured_harnesses: selectedHostDetails.configured_harnesses,
-              capabilities_pending: selectedHostDetails.capabilities_pending,
-              gateway_inference: selectedHostDetails.gateway_inference,
-            },
-    [selectedHostDetails, selectedHostFromList],
-  );
+  const selectedHost = allHosts.find((h) => h.host_id === selectedHostId);
 
-  const hostCapabilitiesPending =
-    !sandboxSelected &&
-    selectedHostId !== null &&
-    (selectedHostFromList?.capabilities_pending === true ||
-      selectedHostDetails?.capabilities_pending === true);
   // Warn-only readiness signal for the agent picker: only meaningful when
   // a connected host is selected (a sandbox provisions its own tooling).
   // Selection stays allowed — the host re-checks at launch and the create
   // call surfaces a specific error if the harness really can't run.
-  const harnessWarningHost = useMemo(
-    () =>
-      !sandboxSelected
-        ? hostCapabilitiesPending && selectedHost
-          ? { ...selectedHost, capabilities_pending: true }
-          : selectedHost
-        : undefined,
-    [sandboxSelected, hostCapabilitiesPending, selectedHost],
-  );
+  const harnessWarningHost = !sandboxSelected ? selectedHost : undefined;
   // Smart Routing as a Model choice is offered on the two native harnesses
   // whose running CLI accepts a per-turn model switch (the server injects
   // ``/model`` when cost_control_mode_override is "on"). Everything else routes
@@ -3236,10 +3194,8 @@ export function NewChatLandingScreen() {
   );
   const isEntryConfigurable = (agent: AvailableAgent) =>
     agentHasModelSettings(agent) || agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
-  // Keep an already-selected route visible while the host refreshes its
-  // temporary snapshot. Create waits below; a completed incompatible snapshot
-  // clears the choice through the normal eligibility effect.
-  const routingOn = costControlMode === "on" && (smartRoutingEligible || hostCapabilitiesPending);
+  // Only an eligible harness can display active per-turn Smart Routing.
+  const routingOn = smartRoutingEligible && costControlMode === "on";
   // Both fully-auto flavors own harness and model, but only top-level Smart
   // Routing changes the composer identity; a bundle keeps its agent identity.
   const autoRoutingSelected =
@@ -3616,7 +3572,7 @@ export function NewChatLandingScreen() {
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
       <>
-        {(smartRoutingEligible || routingOn) && (
+        {smartRoutingEligible && (
           <>
             <DropdownMenuCheckboxItem
               checked={routingOn}
@@ -4018,9 +3974,6 @@ export function NewChatLandingScreen() {
   // switch itself (the router always routes), so it's left alone.
   useEffect(() => {
     if (!selectedNativeHarness || autoRoutingSelected) return;
-    // Keep a restored routing choice intact while the host replaces its
-    // temporary fail-closed snapshot. Completion re-runs this effect.
-    if (hostCapabilitiesPending) return;
     // A *valid* project-configured default model is an explicit pin: a
     // remembered routing "on" must not re-enter routing and clear it (the
     // setter drops the model pick when routing turns on). An invalid stored
@@ -4040,7 +3993,6 @@ export function NewChatLandingScreen() {
     projectDefaultModelValid,
     setCostControlMode,
     pickerEdits,
-    hostCapabilitiesPending,
   ]);
   // Top-level Smart Routing pins permissions to Default (no override sent), so
   // entering it resets the mode rather than restoring one: nothing is remembered
@@ -4126,8 +4078,7 @@ export function NewChatLandingScreen() {
     agents !== undefined &&
     info !== "loading" &&
     !hostsLoading &&
-    (sandboxSelected || selectedHost !== undefined || allHosts.length === 0) &&
-    !hostCapabilitiesPending;
+    (sandboxSelected || selectedHost !== undefined || allHosts.length === 0);
   // A restored (or newly unsupported) Smart Routing pick with no row behind it —
   // routing disabled server-side, or either native arm missing on this host —
   // would strand a "Smart Routing" chip the user can't switch away from. Drop
@@ -4670,7 +4621,6 @@ export function NewChatLandingScreen() {
     pickerSelectionError === null &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
-    !(hostCapabilitiesPending && (autoRoutingSelected || costControlMode === "on")) &&
     !creating;
 
   // Why submit is disabled, surfaced as the button's tooltip. Checked in the
@@ -4681,27 +4631,25 @@ export function NewChatLandingScreen() {
     ? null
     : pendingSkillCompletion
       ? "Loading skills…"
-      : hostCapabilitiesPending && (autoRoutingSelected || costControlMode === "on")
-        ? "Checking host capabilities…"
-        : pickerLoading || workspaceLoading
-          ? "Loading session configuration…"
-          : pickerSelectionError
-            ? pickerSelectionError
-            : sandboxSelected && sandboxRepoOverCap
-              ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-                  maxSandboxRepos === 1 ? "repository" : "repositories"
-                } — remove the extras`
-              : sandboxSelected && !sandboxRepoValid
-                ? "Please enter a valid repository URL"
-                : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                  ? "Selected host is unavailable. Reconnect it or choose another host."
-                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                    ? "Please choose a host and working directory"
-                    : configuredAgentUnavailable && selectedAgent == null
-                      ? "This project's configured agent is unavailable — pick an agent to continue"
-                      : message.trim().length === 0 && files.length === 0
-                        ? "Enter a message to get started"
-                        : null;
+      : pickerLoading || workspaceLoading
+        ? "Loading session configuration…"
+        : pickerSelectionError
+          ? pickerSelectionError
+          : sandboxSelected && sandboxRepoOverCap
+            ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+                maxSandboxRepos === 1 ? "repository" : "repositories"
+              } — remove the extras`
+            : sandboxSelected && !sandboxRepoValid
+              ? "Please enter a valid repository URL"
+              : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                ? "Selected host is unavailable. Reconnect it or choose another host."
+                : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                  ? "Please choose a host and working directory"
+                  : configuredAgentUnavailable && selectedAgent == null
+                    ? "This project's configured agent is unavailable — pick an agent to continue"
+                    : message.trim().length === 0 && files.length === 0
+                      ? "Enter a message to get started"
+                      : null;
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =

@@ -365,7 +365,6 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           return;
         case "hosts_changed":
           void queryClient.invalidateQueries({ queryKey: ["hosts"] });
-          void queryClient.invalidateQueries({ queryKey: ["host-detail"] });
           void queryClient.invalidateQueries({ queryKey: ["session-agent"] });
           return;
         case "projects_changed":

@@ -29,7 +29,6 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
-    HOST_IDENTITY_SUBPROTOCOL,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -37,7 +36,6 @@ from omnigent.host.frames import (
     HostFsResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
-    HostIdentityFrame,
     HostImportLocalDoneFrame,
     HostImportLocalSessionFrame,
     HostInstallHarnessResultFrame,
@@ -54,7 +52,6 @@ from omnigent.host.frames import (
     HostStoreSecretResultFrame,
     decode_host_frame,
     encode_host_frame,
-    host_subprotocol_has_async_capabilities,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -254,13 +251,7 @@ def create_host_tunnel_router(
                 )
                 return
 
-        requested_subprotocols = ws.scope.get("subprotocols") or []
-        selected_subprotocol = (
-            HOST_IDENTITY_SUBPROTOCOL
-            if HOST_IDENTITY_SUBPROTOCOL in requested_subprotocols
-            else None
-        )
-        await ws.accept(subprotocol=selected_subprotocol)
+        await ws.accept()
         conn: HostConnection | None = None
         host_persisted = False
         stage = "hello"
@@ -303,23 +294,11 @@ def create_host_tunnel_router(
                 ws,
                 frame,
                 owner=tunnel_owner,
-                async_capabilities=host_subprotocol_has_async_capabilities(selected_subprotocol),
             )
-            # Delivered on the handshake, never persisted: host-scoped reads
-            # reach this registry through the same host-id slice key.
+            # Delivered on the handshake, never persisted: a replica that just
+            # started learns the host's gateway backing here, so a server
+            # restart converges as soon as each host reconnects.
             host_registry.record_gateway_inference(host_id, frame.gateway_inference)
-            if selected_subprotocol == HOST_IDENTITY_SUBPROTOCOL:
-                # Authentication already resolved the owner before the upgrade.
-                # Return it on the existing tunnel before any request frame, so
-                # client-side logs need no separate GET /v1/me round trip.
-                host_registry.send_text(
-                    conn,
-                    encode_host_frame(
-                        HostIdentityFrame(
-                            user_id=(tunnel_owner if tunnel_owner != RESERVED_USER_LOCAL else None)
-                        )
-                    ),
-                )
             stage = "connected"
             _logger.info(
                 "Host %s connected (version=%s, name=%s, runners=%s)",
@@ -506,31 +485,6 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         await ws.send_text(data)
 
 
-async def _repair_current_harness_readiness(
-    host_id: str,
-    host_store: HostStore,
-    host_registry: HostRegistry,
-) -> None:
-    """Converge the DB row after a superseded connection finished a late write."""
-    while True:
-        current = host_registry.get(host_id)
-        if current is None:
-            return
-        configured = (
-            dict(current.hello.configured_harnesses)
-            if current.hello.configured_harnesses is not None
-            else None
-        )
-        await asyncio.to_thread(
-            host_store.update_harness_readiness,
-            host_id,
-            configured,
-        )
-        latest = host_registry.get(host_id)
-        if latest is current and latest.hello.configured_harnesses == configured:
-            return
-
-
 async def _receive_loop(
     ws: WebSocket,
     conn: HostConnection,
@@ -609,19 +563,16 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostHarnessReadinessFrame):
-            if not host_registry.stage_capability_update(conn, frame):
-                continue
             await asyncio.to_thread(
                 host_store.update_harness_readiness,
                 host_id,
                 frame.configured_harnesses,
             )
-            if not host_registry.finish_capability_update(
-                conn,
-                capabilities_pending=frame.capabilities_pending,
-            ):
-                await _repair_current_harness_readiness(host_id, host_store, host_registry)
-                continue
+            conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            conn.hello.gateway_inference = (
+                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
+            )
+            host_registry.record_gateway_inference(host_id, frame.gateway_inference)
             if on_host_update is not None:
                 try:
                     await on_host_update(host_id, conn.owner)

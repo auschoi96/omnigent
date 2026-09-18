@@ -29,8 +29,6 @@ import sqlalchemy as sa
 
 from omnigent.db.db_models import SqlConversation
 from omnigent.db.utils import generate_agent_id
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.host.frames import HostHelloFrame
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY, ROUTING_DECISION_LABEL_KEY
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._sessions.common import (
@@ -1031,28 +1029,6 @@ def _host(
     )
 
 
-def _register_modern_host(
-    registry: HostRegistry,
-    *,
-    pending: bool,
-    gateway: dict[str, bool] | None = None,
-) -> None:
-    """Install a negotiated tunnel in the process-global test registry."""
-    registry.register(
-        _GATEWAY_HOST_ID,
-        cast("Any", object()),
-        HostHelloFrame(
-            version="test",
-            frame_protocol_version=1,
-            name="test-host",
-            capabilities_pending=pending,
-        ),
-        owner="local",
-        async_capabilities=True,
-    )
-    registry.record_gateway_inference(_GATEWAY_HOST_ID, gateway)
-
-
 @pytest.mark.parametrize(
     ("host", "expected"),
     [
@@ -1074,31 +1050,21 @@ def test_installed_native_harnesses_follows_host_readiness(
     assert _installed_native_harnesses(host) == expected
 
 
-@pytest.mark.parametrize("capabilities_pending", [True, False])
-def test_modern_unknown_readiness_has_no_smart_routing_candidates(
-    capabilities_pending: bool,
-    gateway_host_registry: HostRegistry,
-) -> None:
-    """Pending or failed modern discovery cannot invent an installed arm."""
-    _register_modern_host(gateway_host_registry, pending=capabilities_pending)
-    assert _installed_native_harnesses(_host(None)) == []
-
-
 # ── Credential-provider gating ──────────────────────────────────────────────
 #
 # Routing rewrites the launch model to a gateway catalog id, so a pane whose CLI
 # resolves credentials somewhere else (a personal Claude/ChatGPT subscription,
 # Bedrock) cannot run the pick. The host reports that per family on its connect
-# handshake. Modern tunnels fail closed on unknown; legacy hosts still treat
-# only an explicit ``False`` as unavailable.
+# handshake and the server holds the map in memory; only an explicit ``False``
+# gates, so a host that has reported nothing keeps every option.
 
 
 @pytest.fixture(autouse=True)
 def gateway_host_registry() -> Iterator[HostRegistry]:
     """Install a fresh process-global host registry, as app startup does.
 
-    Gateway backing is cached in the tunnel-owning replica. A test with no
-    registered tunnel exercises legacy fail-open behavior.
+    Gateway backing is reported on the host's connect handshake and held here,
+    so a test with no report models a replica that has not heard from the host.
     """
     registry = HostRegistry()
     set_server_host_registry(registry)
@@ -1159,34 +1125,6 @@ def test_ungatewayed_native_harnesses_without_a_host(
     assert _ungatewayed_native_harnesses(None, AUTO_NATIVE_ROUTING_HARNESSES) == []
 
 
-def test_modern_partial_gateway_snapshot_fails_closed_for_missing_families(
-    gateway_host_registry: HostRegistry,
-) -> None:
-    from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
-
-    _register_modern_host(
-        gateway_host_registry,
-        pending=False,
-        gateway={"claude-native": True},
-    )
-    host = _host({"claude-native": True, "codex-native": True})
-    assert _ungatewayed_native_harnesses(host, AUTO_NATIVE_ROUTING_HARNESSES) == ["codex-native"]
-
-
-def test_modern_gateway_snapshot_leaves_spec_configured_sdk_harnesses_unmeasured(
-    gateway_host_registry: HostRegistry,
-) -> None:
-    from omnigent.server.routes._sessions.orchestration import _ungatewayed_native_harnesses
-    from omnigent.server.smart_routing import _AUTO_ROUTING_HARNESSES
-
-    _register_modern_host(
-        gateway_host_registry,
-        pending=False,
-        gateway={"claude-native": False, "codex-native": False},
-    )
-    assert _ungatewayed_native_harnesses(_host(None), _AUTO_ROUTING_HARNESSES) == []
-
-
 def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
     """A request whose host store serves *host* and whose registry is empty."""
     return SimpleNamespace(
@@ -1197,103 +1135,6 @@ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
             )
         )
     )
-
-
-async def test_capability_dependent_routing_waits_across_host_replacement() -> None:
-    """Smart-routing gates cannot escape through a pending reconnect."""
-    from omnigent.server.routes._sessions.orchestration import (
-        _host_with_current_capabilities,
-        _wait_for_initial_host_capabilities,
-    )
-
-    first = SimpleNamespace(
-        hello=SimpleNamespace(
-            capabilities_pending=True,
-            configured_harnesses=None,
-        ),
-        capabilities_ready=asyncio.Event(),
-    )
-    second = SimpleNamespace(
-        hello=SimpleNamespace(
-            capabilities_pending=True,
-            configured_harnesses=None,
-        ),
-        capabilities_ready=asyncio.Event(),
-    )
-    current = [first]
-    request = SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(
-                host_registry=SimpleNamespace(get=lambda host_id: current[0]),
-            )
-        )
-    )
-    host = _host({"claude-native": True})
-    wait_task = asyncio.create_task(
-        _wait_for_initial_host_capabilities(cast("Any", host), cast("Any", request))
-    )
-    await asyncio.sleep(0)
-    assert not wait_task.done()
-
-    current[0] = second
-    first.capabilities_ready.set()
-    await asyncio.sleep(0)
-    assert not wait_task.done()
-
-    second.hello.configured_harnesses = {"codex-native": True}
-    second.hello.capabilities_pending = False
-    second.capabilities_ready.set()
-    assert await asyncio.wait_for(wait_task, timeout=1.0) is True
-    snapshot = _host_with_current_capabilities(
-        host,
-        cast("Any", request.app.state.host_registry),
-    )
-    assert snapshot is not None
-    assert snapshot.configured_harnesses == {"codex-native": True}
-
-
-async def test_capability_dependent_routing_fails_closed_on_timeout() -> None:
-    """A wedged startup probe never restores unknown-as-ready routing."""
-    from omnigent.server.routes._sessions import orchestration
-
-    conn = SimpleNamespace(
-        hello=SimpleNamespace(capabilities_pending=True),
-        capabilities_ready=asyncio.Event(),
-    )
-    request = SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(
-                host_registry=SimpleNamespace(get=lambda host_id: conn),
-            )
-        )
-    )
-    host = SimpleNamespace(host_id="host_1")
-
-    with patch.object(orchestration, "_INITIAL_HOST_CAPABILITY_WAIT_S", 0.01):
-        ready = await orchestration._wait_for_initial_host_capabilities(
-            cast("Any", host),
-            cast("Any", request),
-        )
-
-    assert ready is False
-
-
-async def test_capability_wait_without_a_local_tunnel_reports_host_unavailable() -> None:
-    """A capability-dependent create preserves the host-miss classification."""
-    from omnigent.server.routes._sessions.orchestration import (
-        _wait_for_initial_host_capabilities,
-    )
-
-    request = SimpleNamespace(
-        app=SimpleNamespace(
-            state=SimpleNamespace(
-                host_registry=SimpleNamespace(get=lambda host_id: None),
-            )
-        )
-    )
-    with pytest.raises(OmnigentError) as exc_info:
-        await _wait_for_initial_host_capabilities(cast("Any", _host(None)), cast("Any", request))
-    assert exc_info.value.code == ErrorCode.CONFLICT
 
 
 @pytest.mark.parametrize(
@@ -1476,14 +1317,7 @@ async def test_top_level_smart_routing_create_is_rejected_when_no_router_can_ser
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
     ungatewayed = _host_reporting({"claude-native": True, "codex-native": False})
-    with (
-        patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed),
-        patch.object(
-            orchestration,
-            "_wait_for_initial_host_capabilities",
-            AsyncMock(return_value=True),
-        ),
-    ):
+    with patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed):
         created = await _create_smart_routing_session(client, wrappers, routing_client, oss=False)
 
     assert created.status_code == 400, created.text
@@ -1509,11 +1343,6 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
             "_pre_session_model_catalog",
             AsyncMock(return_value=dict(_OFF_GATEWAY_CATALOG)),
         ),
-        patch.object(
-            orchestration,
-            "_wait_for_initial_host_capabilities",
-            AsyncMock(return_value=True),
-        ),
     ):
         created = await _create_smart_routing_session(client, wrappers, routing_client, oss=True)
 
@@ -1523,63 +1352,6 @@ async def test_top_level_smart_routing_create_succeeds_off_the_gateway_with_the_
     items = (await client.get(f"/v1/sessions/{created.json()['id']}/items")).json()["data"]
     decisions = [i for i in items if i["type"] == "routing_decision"]
     assert decisions and decisions[0]["router_source"] == "oss-llm"
-
-
-async def test_explicit_model_pin_skips_gateway_capability_gate(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """A pinned model disables routing, so capability state cannot reject it."""
-    from omnigent.server.routes._sessions import orchestration
-
-    wrappers = await _native_wrappers(client, db_uri)
-    routing_client = FakeRoutingClient(RoutingResult(model=GPT_MODEL, rationale="unused"))
-    with patch.object(
-        orchestration,
-        "_routing_host_for_create",
-        side_effect=AssertionError("explicit pins must not read host capabilities"),
-    ):
-        created = await _create_fixed_harness_session(
-            client,
-            wrappers["claude-native"],
-            routing_client,
-            model_override=CLAUDE_MODEL,
-            oss=False,
-        )
-
-    assert created.status_code == 201, created.text
-    assert created.json()["model_override"] == CLAUDE_MODEL
-    assert routing_client.offered == []
-
-
-async def test_fixed_harness_capability_timeout_falls_back_to_its_default_model(
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """A bounded capability wait cannot prevent a fixed-harness terminal."""
-    from omnigent.server.routes._sessions import orchestration
-
-    wrappers = await _native_wrappers(client, db_uri)
-    routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="unused"))
-    with patch.object(
-        orchestration,
-        "_wait_for_initial_host_capabilities",
-        AsyncMock(return_value=False),
-    ):
-        created = await _create_fixed_harness_session(
-            client,
-            wrappers["claude-native"],
-            routing_client,
-            oss=True,
-        )
-
-    assert created.status_code == 201, created.text
-    assert created.json()["model_override"] is None
-    assert routing_client.offered == []
-    decisions = _routing_decision_items(db_uri, created.json()["id"])
-    assert len(decisions) == 1
-    assert decisions[0]["applied"] is False
-    assert "still being checked" in decisions[0]["rationale"]
 
 
 @pytest.mark.parametrize("harness", list(AUTO_NATIVE_ROUTING_HARNESSES))
@@ -1593,14 +1365,7 @@ async def test_fixed_harness_routing_create_is_rejected_when_no_router_can_serve
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
     ungatewayed = _host_reporting({harness: False})
-    with (
-        patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed),
-        patch.object(
-            orchestration,
-            "_wait_for_initial_host_capabilities",
-            AsyncMock(return_value=True),
-        ),
-    ):
+    with patch.object(orchestration, "_routing_host_for_create", return_value=ungatewayed):
         created = await _create_fixed_harness_session(
             client, wrappers[harness], routing_client, oss=False
         )
@@ -1629,11 +1394,6 @@ async def test_fixed_harness_routing_create_succeeds_off_the_gateway_with_the_ju
             orchestration,
             "_pre_session_model_catalog",
             AsyncMock(return_value={harness: [pick]}),
-        ),
-        patch.object(
-            orchestration,
-            "_wait_for_initial_host_capabilities",
-            AsyncMock(return_value=True),
         ),
     ):
         created = await _create_fixed_harness_session(
@@ -1685,11 +1445,6 @@ async def test_a_pane_create_routes_with_the_judge_when_the_router_is_not_enable
             "_pre_session_model_catalog",
             AsyncMock(return_value={harness: [pick]}),
         ),
-        patch.object(
-            orchestration,
-            "_wait_for_initial_host_capabilities",
-            AsyncMock(return_value=True),
-        ),
     ):
         created = await client.post("/v1/sessions", json=body)
 
@@ -1723,15 +1478,8 @@ async def test_fixed_harness_create_is_allowed_when_its_own_family_is_backed(
 
     wrappers = await _native_wrappers(client, db_uri)
     routing_client = FakeRoutingClient(RoutingResult(model=CLAUDE_MODEL, rationale="sized task"))
-    with (
-        patch.object(
-            orchestration, "_routing_host_for_create", return_value=_host_reporting(gateway)
-        ),
-        patch.object(
-            orchestration,
-            "_wait_for_initial_host_capabilities",
-            AsyncMock(return_value=True),
-        ),
+    with patch.object(
+        orchestration, "_routing_host_for_create", return_value=_host_reporting(gateway)
     ):
         created = await _create_fixed_harness_session(
             client, wrappers["claude-native"], routing_client, **extra

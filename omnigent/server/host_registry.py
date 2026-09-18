@@ -31,7 +31,7 @@ from cachetools import TTLCache
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHarnessReadinessFrame, HostHelloFrame, HostSkillsResultFrame
+from omnigent.host.frames import HostHelloFrame, HostSkillsResultFrame
 
 _logger = logging.getLogger(__name__)
 
@@ -180,8 +180,6 @@ class HostConnection:
         ``"host_a1b2c3d4..."``.
     :param ws: The live WebSocket to this host.
     :param hello: The hello frame the host sent on connect.
-    :param async_capabilities: Whether this tunnel negotiated early capability
-        discovery. Legacy tunnels have no meaningful pending state.
     :param owner: Authenticated user who established the tunnel,
         e.g. ``"alice@example.com"``. ``None`` when auth is
         disabled (single-user mode).
@@ -262,9 +260,6 @@ class HostConnection:
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
-    :param capabilities_ready: Set once a negotiated early-registration host
-        has published its initial readiness snapshot, or when this connection
-        is replaced/removed so waiters can re-resolve the current generation.
     """
 
     workspace_id: int
@@ -275,7 +270,6 @@ class HostConnection:
     outbound_queue: asyncio.Queue[str | None]
     connected_at: float
     last_frame_at: float
-    async_capabilities: bool = False
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -325,7 +319,6 @@ class HostConnection:
     pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
         default_factory=dict,
     )
-    capabilities_ready: asyncio.Event = field(default_factory=asyncio.Event)
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
     # Each item is a ("session", dict) or ("done", dict) tuple.
@@ -352,7 +345,8 @@ class HostRegistry:
         # host_id alone: the map describes the machine's local config, so the
         # same machine connected to two workspaces reports the same answer.
         # Kept across a host disconnect (a tunnel flap shouldn't blank a known
-        # answer) and relearned from the handshake after a process restart.
+        # answer) and lost with the process, which is the point — a restarted
+        # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
 
@@ -363,8 +357,6 @@ class HostRegistry:
         hello: HostHelloFrame,
         owner: str | None,
         workspace_id: int | None = None,
-        *,
-        async_capabilities: bool = False,
     ) -> HostConnection:
         """Register a host connection (newest wins).
 
@@ -388,8 +380,6 @@ class HostRegistry:
             (``0`` in single-tenant deployments); captured into the
             connection so ``send_text`` need not read request context
             from the sender loop.
-        :param async_capabilities: Whether the selected tunnel protocol carries
-            an authoritative pending/completed capability state.
         :returns: The new :class:`HostConnection`. Its ``host_id`` is
             the canonical form (see :func:`_canonical_host_id`).
         """
@@ -405,10 +395,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
-            async_capabilities=async_capabilities,
         )
-        if not hello.capabilities_pending:
-            conn.capabilities_ready.set()
         with self._lock:
             key = (ws_id, host_id)
             old = self._hosts.get(key)
@@ -418,7 +405,6 @@ class HostRegistry:
                     ws_id,
                     host_id,
                 )
-                old.capabilities_ready.set()
                 old.outbound_queue.put_nowait(None)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -460,7 +446,6 @@ class HostRegistry:
             removed = self._hosts.pop(key)
         # Without this the route handler's loops keep running and its ping loop
         # keeps the host row online, even though the host is now unreachable.
-        removed.capabilities_ready.set()
         removed.outbound_queue.put_nowait(None)
         return True
 
@@ -475,50 +460,6 @@ class HostRegistry:
             if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
                 return False
             conn.last_frame_at = time.time()
-            return True
-
-    def stage_capability_update(
-        self,
-        conn: HostConnection,
-        frame: HostHarnessReadinessFrame,
-    ) -> bool:
-        """Stage a readiness frame only if its tunnel is still current.
-
-        Completion stays pending until the durable host row is updated. This
-        lets routing waiters safely re-read the row after their event fires.
-        """
-        with self._lock:
-            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
-                return False
-            conn.hello.configured_harnesses = (
-                dict(frame.configured_harnesses)
-                if frame.configured_harnesses is not None
-                else None
-            )
-            conn.hello.gateway_inference = (
-                dict(frame.gateway_inference) if frame.gateway_inference is not None else None
-            )
-            if frame.gateway_inference is None:
-                self._gateway_inference.pop(conn.host_id, None)
-            else:
-                self._gateway_inference[conn.host_id] = dict(frame.gateway_inference)
-            if frame.capabilities_pending:
-                conn.hello.capabilities_pending = True
-            return True
-
-    def finish_capability_update(
-        self,
-        conn: HostConnection,
-        *,
-        capabilities_pending: bool,
-    ) -> bool:
-        """Publish staged completion if *conn* still owns this host."""
-        with self._lock:
-            if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
-                return False
-            conn.hello.capabilities_pending = capabilities_pending
-            if not capabilities_pending:
-                conn.capabilities_ready.set()
             return True
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:
@@ -560,18 +501,6 @@ class HostRegistry:
         if conn is None:
             return False
         return conn.hello.telemetry_opt_out
-
-    def capabilities_pending(self, host_id: str, workspace_id: int | None = None) -> bool | None:
-        """Return negotiated startup state, or ``None`` for legacy/remote hosts."""
-        conn = self.get(host_id, workspace_id)
-        if conn is None or not conn.async_capabilities:
-            return None
-        return conn.hello.capabilities_pending
-
-    def has_async_capabilities(self, host_id: str, workspace_id: int | None = None) -> bool:
-        """Return whether this replica owns a negotiated capability tunnel."""
-        conn = self.get(host_id, workspace_id)
-        return conn is not None and conn.async_capabilities
 
     def get_host_installation_id(
         self, host_id: str, workspace_id: int | None = None
@@ -618,8 +547,8 @@ class HostRegistry:
 
         :param host_id: Host identifier, in any accepted spelling.
         :returns: A copy of the reported map, or ``None`` when this replica has
-            never had a report from the host. Capability-aware callers use the
-            negotiated tunnel version to distinguish modern from legacy unknown.
+            never had a report from the host — unknown, which readers treat as
+            gateway-backed rather than unavailable.
         """
         with self._lock:
             reported = self._gateway_inference.get(_canonical_host_id(host_id))

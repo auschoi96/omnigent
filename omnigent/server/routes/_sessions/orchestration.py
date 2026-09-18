@@ -17,7 +17,6 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from dataclasses import replace
 from typing import Any, Literal, cast
 
 import httpx
@@ -5287,34 +5286,8 @@ async def _forward_event_to_runner(
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed.
     :returns: The store-assigned id of the persisted item.
-    :raises OmnigentError: If an auto-harness turn cannot safely resolve its
-        target before the bounded capability wait expires.
     """
     import uuid
-
-    # An auto-harness prompt cannot be delivered until its concrete harness is
-    # known. Join startup discovery before persisting the item so a timeout is
-    # a clean, retryable request failure rather than an unconsumed history row.
-    _auto_text: str | None = None
-    _auto_host: Host | None = None
-    if conv.harness_override == "auto" and body.type == "message":
-        _auto_text = _extract_user_text_for_routing(body)
-        if _auto_text:
-            from omnigent.server.routes._sessions.common import get_server_host_registry
-
-            _auto_host = await _session_routing_host(conv, host_store)
-            if not await _wait_for_host_capabilities(
-                _auto_host,
-                get_server_host_registry(),
-            ):
-                raise OmnigentError(
-                    "Host harness capabilities are still being checked; retry shortly.",
-                    code=ErrorCode.RUNNER_UNAVAILABLE,
-                )
-            _auto_host = _host_with_current_capabilities(
-                _auto_host,
-                get_server_host_registry(),
-            )
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     item = _build_new_item(body, turn_id, created_by=created_by)
@@ -5467,20 +5440,18 @@ async def _forward_event_to_runner(
             route_session_harness,
         )
 
+        _auto_text = _extract_user_text_for_routing(body)
         if _auto_text:
             _auto_resolved_this_turn = True
             # The router may land this session on any auto-routing harness, so
             # every one of them must be gateway-backed for the workspace router
             # to serve the pick; otherwise the built-in judge does.
-            _auto_backed = _gateway_backed(_auto_host, _AUTO_ROUTING_HARNESSES)
+            _auto_backed = _gateway_backed(
+                await _session_routing_host(conv, host_store), _AUTO_ROUTING_HARNESSES
+            )
             # For a forced-auto child, route against the parent's catalog (full
             # spawnable-worker map) rather than the child's leaf "self" catalog.
-            (
-                _auto_harness,
-                _auto_model,
-                _auto_verdict,
-                _auto_error,
-            ) = await route_session_harness(
+            _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
                 _auto_text,
                 session_id=session_id,
                 catalog_session_id=conv.parent_conversation_id,
@@ -5488,10 +5459,10 @@ async def _forward_event_to_runner(
                 gateway_backed=_auto_backed,
                 allow_static_fallback=_auto_backed,
             )
-            # Always clear the "auto" sentinel even when routing returned no
-            # harness (unavailable/failed) so the branch doesn't re-run on every
-            # subsequent turn.
             try:
+                # Always clear the "auto" sentinel even when routing
+                # returned no harness (unavailable/failed) so the branch
+                # doesn't re-run on every subsequent turn.
                 _conv_updates: dict[str, Any] = (
                     {"harness_override": _auto_harness}
                     if _auto_harness is not None
@@ -5622,9 +5593,6 @@ async def _forward_event_to_runner(
                 _child_host = await _session_routing_host(conv, host_store)
                 if _child_host is None and _parent_conv is not None:
                     _child_host = await _session_routing_host(_parent_conv, host_store)
-                _child_host = await _session_routing_host_after_capabilities(
-                    _child_host,
-                )
                 _child_backed = _gateway_backed(_child_host, _child_gateway_harnesses)
                 # Route against the PARENT's catalog: it enumerates the
                 # spawnable workers (claude_code/codex/pi) with full model
@@ -5682,11 +5650,9 @@ async def _forward_event_to_runner(
                 _harness = _resolve_harness(conv)
                 # A turn cannot change harness, so only this session's own
                 # family has to be gateway-backed for the workspace router.
-                _turn_host = await _session_routing_host(conv, host_store)
-                _turn_host = await _session_routing_host_after_capabilities(
-                    _turn_host,
+                _turn_backed = _gateway_backed(
+                    await _session_routing_host(conv, host_store), (_harness or "",)
                 )
-                _turn_backed = _gateway_backed(_turn_host, (_harness or "",))
                 # ``_or_decline``: a routing outage returns an error string
                 # rather than raising. Raised here it became a 500 on the
                 # events POST, so a router that was merely down cost the user
@@ -6318,11 +6284,9 @@ async def _dispatch_session_event_to_runner_impl(
                 # This pane's own family decides which router can serve it: off
                 # the gateway the built-in judge routes off the pane's picker
                 # vocabulary, which is the only reachable candidate set anyway.
-                _native_host = await _session_routing_host(conv, host_store)
-                _native_host = await _session_routing_host_after_capabilities(
-                    _native_host,
+                _native_backed = _gateway_backed(
+                    await _session_routing_host(conv, host_store), (_harness or "",)
                 )
-                _native_backed = _gateway_backed(_native_host, (_harness or "",))
                 # ``_or_decline``: a routing outage must not 500 the message
                 # POST. The pane keeps its own model and the card says why.
                 (
@@ -8029,12 +7993,7 @@ def _native_subagent_wrapper_labels(
 # session landing on a missing or unauthenticated binary would fail to open its
 # terminal, so those harnesses are never offered to Smart Routing.
 _NATIVE_UNAVAILABLE_READINESS: frozenset[object] = frozenset(
-    {
-        False,
-        HARNESS_BINARY_MISSING,
-        HARNESS_NEEDS_AUTH,
-        HARNESS_VERSION_TOO_LOW,
-    }
+    {False, HARNESS_BINARY_MISSING, HARNESS_NEEDS_AUTH, HARNESS_VERSION_TOO_LOW}
 )
 
 
@@ -8054,10 +8013,6 @@ def _installed_native_harnesses(host: Host | None) -> list[str]:
 
     readiness = getattr(host, "configured_harnesses", None) if host is not None else None
     if not readiness:
-        from omnigent.server.routing_backend import host_has_async_capabilities
-
-        if host_has_async_capabilities(host):
-            return []
         return list(AUTO_NATIVE_ROUTING_HARNESSES)
     return [
         harness
@@ -8079,25 +8034,10 @@ def _ungatewayed_native_harnesses(host: Host | None, harnesses: Sequence[str]) -
     :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
     :returns: The not-backed ids, in the order given.
     """
-    from omnigent.gateway_inference import (
-        gateway_inference_harness_supported,
-        gateway_inference_state,
-        not_gateway_backed,
-    )
-    from omnigent.server.routing_backend import (
-        host_has_async_capabilities,
-        reported_gateway_inference,
-    )
+    from omnigent.gateway_inference import not_gateway_backed
+    from omnigent.server.routing_backend import reported_gateway_inference
 
-    gateway = reported_gateway_inference(host)
-    if host_has_async_capabilities(host):
-        return [
-            harness
-            for harness in harnesses
-            if gateway_inference_harness_supported(harness)
-            and gateway_inference_state(gateway, harness) is not True
-        ]
-    return not_gateway_backed(gateway, harnesses)
+    return not_gateway_backed(reported_gateway_inference(host), harnesses)
 
 
 def _gateway_backed(host: Host | None, harnesses: Sequence[str]) -> bool:
@@ -8195,24 +8135,6 @@ async def _session_routing_host(
         return None
 
 
-async def _session_routing_host_after_capabilities(
-    host: Host | None,
-    host_registry: HostRegistry | None = None,
-) -> Host | None:
-    """Join local pending discovery and apply its ready in-memory snapshot.
-
-    A running-session request may land on a replica without the host tunnel.
-    That remains legacy/unknown rather than becoming an error; only a local
-    negotiated connection can contribute a wait to a Smart Routing turn.
-    """
-    if host_registry is None:
-        from omnigent.server.routes._sessions.common import get_server_host_registry
-
-        host_registry = get_server_host_registry()
-    await _wait_for_host_capabilities(host, host_registry, fail_on_absent=False)
-    return _host_with_current_capabilities(host, host_registry)
-
-
 async def _spawn_gateway_backed(
     request: Request,
     conv: Conversation,
@@ -8226,12 +8148,7 @@ async def _spawn_gateway_backed(
     :returns: ``True`` unless the host explicitly reports one as not backed.
     """
     host_store = getattr(request.app.state, "host_store", None)
-    host = await _session_routing_host(conv, host_store)
-    host = await _session_routing_host_after_capabilities(
-        host,
-        getattr(request.app.state, "host_registry", None),
-    )
-    return _gateway_backed(host, harnesses)
+    return _gateway_backed(await _session_routing_host(conv, host_store), harnesses)
 
 
 def _harness_labels(harnesses: Sequence[str]) -> str:
@@ -8320,10 +8237,6 @@ async def _reject_ungatewayed_model_routing(
 
     if body.cost_control_mode_override != "on":
         return
-    # An explicit model pin suppresses create-time and first-turn routing. It
-    # does not need the workspace router or host capability discovery.
-    if body.model_override is not None:
-        return
     if body.parent_session_id is not None or body.sub_agent_name is not None:
         return
     harness = await asyncio.to_thread(
@@ -8336,15 +8249,6 @@ async def _reject_ungatewayed_model_routing(
     if _oss_routing_available():
         return
     host = await _routing_host_for_create(body, request, user_id)
-    if not await _wait_for_initial_host_capabilities(host, request):
-        raise OmnigentError(
-            "The selected host is still checking harness capabilities; retry shortly.",
-            code=ErrorCode.INVALID_INPUT,
-        )
-    host = _host_with_current_capabilities(
-        host,
-        getattr(request.app.state, "host_registry", None),
-    )
     if not _ungatewayed_native_harnesses(host, (harness,)):
         return
     raise OmnigentError(_ungatewayed_model_routing_error(harness), code=ErrorCode.INVALID_INPUT)
@@ -8466,79 +8370,6 @@ async def _routing_host_for_create(
         user_id=user_id,
         host_id=body.host_id,
         host_store=host_store,
-    )
-
-
-_INITIAL_HOST_CAPABILITY_WAIT_S = 15.0
-
-
-async def _wait_for_host_capabilities(
-    host: Host | None,
-    host_registry: HostRegistry | None,
-    *,
-    fail_on_absent: bool = True,
-) -> bool:
-    """Join negotiated host discovery before consuming live capability state."""
-    if host is None or host_registry is None:
-        return True
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _INITIAL_HOST_CAPABILITY_WAIT_S
-    while True:
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            if not fail_on_absent:
-                return True
-            # A host-keyed request can still miss after a sharding rebalance.
-            # Preserve the standard wrong-replica/offline classification so
-            # clients can re-address instead of receiving a false probe delay.
-            from omnigent.server.routes._host_launch import host_absent_error
-
-            raise host_absent_error(host)
-        if not conn.hello.capabilities_pending:
-            return True
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            return False
-        try:
-            await asyncio.wait_for(conn.capabilities_ready.wait(), timeout=remaining)
-        except TimeoutError:
-            return False
-
-
-def _host_with_current_capabilities(
-    host: Host | None,
-    host_registry: HostRegistry | None,
-) -> Host | None:
-    """Overlay the ready capability map from the current tunnel generation.
-
-    Call immediately after :func:`_wait_for_host_capabilities`, without an
-    intervening await. The registry snapshot is then from the same generation
-    the barrier accepted, and no extra database round trip can admit a pending
-    replacement between the wait and capability consumption.
-    """
-    if host is None or host_registry is None:
-        return host
-    conn = host_registry.get(host.host_id)
-    if conn is None or conn.hello.capabilities_pending:
-        return host
-    configured = conn.hello.configured_harnesses
-    return replace(
-        host,
-        configured_harnesses=dict(configured) if configured is not None else None,
-    )
-
-
-async def _wait_for_initial_host_capabilities(
-    host: Host | None,
-    request: Request,
-) -> bool:
-    """Join negotiated host discovery before capability-dependent routing.
-
-    :returns: ``True`` when routing may consume host capability state, or
-        ``False`` when discovery did not finish within the bounded wait.
-    """
-    return await _wait_for_host_capabilities(
-        host, getattr(request.app.state, "host_registry", None)
     )
 
 
@@ -8722,12 +8553,6 @@ async def _resolve_fixed_native_model_routing(
     from omnigent.server.smart_routing import models_in_family, route_session_harness
 
     host = await _routing_host_for_create(body, request, user_id)
-    if not await _wait_for_initial_host_capabilities(host, request):
-        return None, None, "Host harness capabilities are still being checked; using the default."
-    host = _host_with_current_capabilities(
-        host,
-        getattr(request.app.state, "host_registry", None),
-    )
     # Off the gateway the built-in judge answers, and the static table's
     # ``databricks-*`` ids are unreachable — the host's pre-launch catalog is the
     # only provider-accurate candidate source.
@@ -8799,17 +8624,6 @@ async def _resolve_native_smart_routing(
     )
 
     host = await _routing_host_for_create(body, request, user_id)
-    if not await _wait_for_initial_host_capabilities(host, request):
-        return (
-            None,
-            None,
-            None,
-            "Host harness capabilities are still being checked; retry shortly.",
-        )
-    host = _host_with_current_capabilities(
-        host,
-        getattr(request.app.state, "host_registry", None),
-    )
     # Both arms must be gateway-backed before the WORKSPACE router may choose
     # between them: an arm off the gateway cannot run its picks, and the pick is
     # made after the create commits, so there is no safe half-menu. That only

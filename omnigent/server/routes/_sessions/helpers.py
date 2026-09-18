@@ -5689,7 +5689,7 @@ async def _launch_runner_on_host_locked(
             session_id=conv.id,
             # Canonical harness (see _resolve_harness) so the host runs the
             # same configuration check it does at create-time launch. None
-            # (agent not resolvable) skips the targeted check.
+            # (agent not resolvable) skips the host-side check — fail open.
             harness=_resolve_harness(conv),
         )
     )

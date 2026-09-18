@@ -215,33 +215,6 @@ describe("hostBacksHarnessWithGateway", () => {
     expect(hostBacksHarnessWithGateway(undefined, "codex-native")).toBe(true);
     expect(hostBacksHarnessWithGateway(null, "codex-native")).toBe(true);
   });
-
-  it("withholds gateway routing during negotiated capability discovery", () => {
-    expect(
-      hostBacksHarnessWithGateway(
-        { gateway_inference: null, capabilities_pending: true },
-        "codex-native",
-      ),
-    ).toBe(false);
-  });
-
-  it("fails closed after a modern host completes with an unknown family", () => {
-    expect(
-      hostBacksHarnessWithGateway(
-        { gateway_inference: { "claude-native": true }, capabilities_pending: false },
-        "codex-native",
-      ),
-    ).toBe(false);
-  });
-
-  it("accepts only an explicit true from a modern host", () => {
-    expect(
-      hostBacksHarnessWithGateway(
-        { gateway_inference: { "codex-native": true }, capabilities_pending: false },
-        "codex-native",
-      ),
-    ).toBe(true);
-  });
 });
 
 describe("smartRoutingDroppedMessage", () => {

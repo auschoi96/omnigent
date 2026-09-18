@@ -187,8 +187,11 @@ def reported_gateway_inference(
 ) -> dict[str, bool] | None:
     """The gateway-inference map *host* last reported over its tunnel.
 
-    Read from this replica's live :class:`~omnigent.server.host_registry.HostRegistry`.
-    Host-scoped requests are slice-keyed to the replica that owns the tunnel.
+    Read from this replica's live :class:`~omnigent.server.host_registry.HostRegistry`,
+    which the host fills on its connect handshake — nothing about gateway
+    backing is persisted, so a replica that has not seen the host (a fresh
+    process, another replica) simply reads unknown until it reconnects and
+    re-reports.
 
     :param host: The session's target host row, or ``None``.
     :returns: The reported map, or ``None`` when nothing has been reported here.
@@ -199,20 +202,9 @@ def reported_gateway_inference(
     from omnigent.server.routes._sessions.common import get_server_host_registry
 
     registry = get_server_host_registry()
-    return registry.gateway_inference(host_id) if registry is not None else None
-
-
-def host_has_async_capabilities(
-    host: Any,  # type: ignore[explicit-any]  # a Host row, or None for a sandbox
-) -> bool:
-    """Whether this replica owns a modern capability-reporting host tunnel."""
-    host_id = getattr(host, "host_id", None) if host is not None else None
-    if not isinstance(host_id, str):
-        return False
-    from omnigent.server.routes._sessions.common import get_server_host_registry
-
-    registry = get_server_host_registry()
-    return registry is not None and registry.has_async_capabilities(host_id)
+    if registry is None:
+        return None
+    return registry.gateway_inference(host_id)
 
 
 def gateway_backs_all(
@@ -221,29 +213,18 @@ def gateway_backs_all(
 ) -> bool:
     """Whether *host* backs every one of *harnesses* with the workspace AI gateway.
 
-    Unknown reads as backed only for legacy hosts. A host that supports the
-    negotiated capability snapshot must affirm every family; a failed or
-    incomplete modern probe fails closed.
+    Unknown reads as backed: a host that reports nothing, an older build, one
+    bound to another replica, or none bound at all all land here, and
+    withholding the external router there would downgrade every deployment that
+    cannot yet answer.
 
     :param host: The session's target host, or ``None``.
     :param harnesses: Harness ids to check, e.g. ``("claude-native",)``.
-    :returns: Whether every harness is known to be gateway-backed.
+    :returns: ``True`` unless the host explicitly reports one as not backed.
     """
     from omnigent.gateway_inference import not_gateway_backed
 
-    gateway = reported_gateway_inference(host)
-    if host_has_async_capabilities(host):
-        from omnigent.gateway_inference import (
-            gateway_inference_harness_supported,
-            gateway_inference_state,
-        )
-
-        return all(
-            not gateway_inference_harness_supported(harness)
-            or gateway_inference_state(gateway, harness) is True
-            for harness in harnesses
-        )
-    return not not_gateway_backed(gateway, harnesses)
+    return not not_gateway_backed(reported_gateway_inference(host), harnesses)
 
 
 def backends_from_caps(caps: Any) -> RoutingBackends:  # type: ignore[explicit-any]  # RuntimeCaps-shaped

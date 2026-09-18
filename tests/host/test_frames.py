@@ -21,7 +21,6 @@ from omnigent.host.frames import (
     HostFsWriteFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
-    HostIdentityFrame,
     HostImportedLocalSession,
     HostImportLocalByIdFrame,
     HostImportLocalDoneFrame,
@@ -417,24 +416,6 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
-def test_pending_capability_frames_round_trip() -> None:
-    """Negotiated startup can publish fail-closed state and explicit completion."""
-    hello = HostHelloFrame(
-        version="0.1.0",
-        frame_protocol_version=1,
-        name="corey-laptop",
-        configured_harnesses=None,
-        capabilities_pending=True,
-    )
-    assert decode_host_frame(encode_host_frame(hello)) == hello
-
-    completed = HostHarnessReadinessFrame(
-        configured_harnesses=None,
-        capabilities_pending=False,
-    )
-    assert decode_host_frame(encode_host_frame(completed)) == completed
-
-
 def test_connection_error_frame_round_trip() -> None:
     """Connection errors preserve the server stage and exception message."""
     original = HostConnectionErrorFrame(
@@ -444,13 +425,6 @@ def test_connection_error_frame_round_trip() -> None:
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert decoded == original
-
-
-@pytest.mark.parametrize("user_id", ["alice@example.com", None])
-def test_identity_frame_round_trip(user_id: str | None) -> None:
-    """Authenticated and anonymous tunnel owners survive the wire."""
-    original = HostIdentityFrame(user_id=user_id)
-    assert decode_host_frame(encode_host_frame(original)) == original
 
 
 def test_harness_readiness_frame_round_trip() -> None:

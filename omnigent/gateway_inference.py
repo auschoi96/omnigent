@@ -16,10 +16,7 @@ from typing import Final
 _logger = logging.getLogger(__name__)
 
 # Every spelling the Claude family travels under on the wire.
-CLAUDE_GATEWAY_HARNESSES: Final[tuple[str, ...]] = (
-    "claude-native",
-    "native-claude",
-)
+CLAUDE_GATEWAY_HARNESSES: Final[tuple[str, ...]] = ("claude-native", "native-claude")
 
 # Every spelling the Codex family travels under on the wire.
 CODEX_GATEWAY_HARNESSES: Final[tuple[str, ...]] = ("codex", "codex-native", "native-codex")
@@ -143,30 +140,6 @@ def gateway_inference_state(
     return None
 
 
-def gateway_inference_harness_supported(harness: str) -> bool:
-    """Whether the host capability probe measures *harness*'s family.
-
-    Only native Claude and Codex launches are fully determined by host config.
-    SDK agents and Pi can select providers in their agent specs, so the
-    spec-less host probe cannot measure them. Treating an absent key as a
-    failed modern probe would disable otherwise valid auto-routing paths.
-    """
-    from omnigent.harness_aliases import is_native_harness
-
-    return is_native_harness(harness) and _known_family_spellings(harness) is not None
-
-
-def _known_family_spellings(harness: str) -> tuple[str, ...] | None:
-    """Return the measured family spellings for *harness*, if any."""
-    from omnigent.harness_aliases import canonicalize_harness
-
-    canonical = canonicalize_harness(harness) or harness
-    for spellings in (CLAUDE_GATEWAY_HARNESSES, CODEX_GATEWAY_HARNESSES):
-        if canonical in spellings or harness in spellings:
-            return spellings
-    return None
-
-
 def _family_spellings(harness: str) -> tuple[str, ...]:
     """Every key a host may have reported *harness*'s family under.
 
@@ -178,12 +151,12 @@ def _family_spellings(harness: str) -> tuple[str, ...]:
     :param harness: Harness id in any spelling, e.g. ``"native-codex"``.
     :returns: The family's spellings, or just *harness* when it is in neither.
     """
-    family = _known_family_spellings(harness)
-    if family is not None:
-        return family
     from omnigent.harness_aliases import canonicalize_harness
 
     canonical = canonicalize_harness(harness) or harness
+    for spellings in (CLAUDE_GATEWAY_HARNESSES, CODEX_GATEWAY_HARNESSES):
+        if canonical in spellings or harness in spellings:
+            return spellings
     return (canonical, harness)
 
 

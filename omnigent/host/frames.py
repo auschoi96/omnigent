@@ -39,17 +39,6 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
-# Negotiated on the WebSocket upgrade. A host registers before capability
-# discovery only when the server selects this protocol. It also carries the
-# authenticated server → host identity frame that replaces the legacy /v1/me
-# lookup. Omission keeps both legacy ordering guarantees during rolling upgrades.
-HOST_IDENTITY_SUBPROTOCOL = "omnigent.host-async-capabilities.v2"
-
-
-def host_subprotocol_has_async_capabilities(subprotocol: str | None) -> bool:
-    """Return whether *subprotocol* includes early registration."""
-    return subprotocol == HOST_IDENTITY_SUBPROTOCOL
-
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
     """Build the canonical text of a workspace-missing launch refusal.
@@ -100,7 +89,6 @@ class HostFrameKind(str, Enum):
 
     HELLO = "host.hello"
     CONNECTION_ERROR = "host.connection_error"
-    IDENTITY = "host.identity"
     HARNESS_READINESS = "host.harness_readiness"
     LAUNCH_RUNNER = "host.launch_runner"
     LAUNCH_RUNNER_RESULT = "host.launch_runner_result"
@@ -172,8 +160,6 @@ class HostHelloFrame:
     :param interactive_shells: Ordered interactive shells installed on this
         machine, with its login shell first. ``None`` means an older host did
         not report an inventory.
-    :param capabilities_pending: Whether the readiness maps are a temporary
-        fail-closed snapshot that will be replaced after startup discovery.
     """
 
     version: str
@@ -183,7 +169,6 @@ class HostHelloFrame:
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     gateway_inference: dict[str, bool] | None = None
     interactive_shells: list[str] | None = None
-    capabilities_pending: bool = False
     telemetry_opt_out: bool = False
     installation_id: str | None = None
 
@@ -203,20 +188,6 @@ class HostConnectionErrorFrame:
 
 
 @dataclass
-class HostIdentityFrame:
-    """Server → host: authenticated owner for client-side log attribution.
-
-    Sent only on the negotiated identity protocol, immediately after
-    registration and before any request frame. ``None`` preserves anonymous
-    single-user behavior.
-
-    :param user_id: Authenticated tunnel owner, e.g. ``"alice@example.com"``.
-    """
-
-    user_id: str | None
-
-
-@dataclass
 class HostHarnessReadinessFrame:
     """Host's refreshed per-harness readiness while the tunnel stays open.
 
@@ -228,15 +199,10 @@ class HostHarnessReadinessFrame:
         ``omnigent.gateway_inference``). A family that could not be evaluated
         is omitted. ``None`` means unknown (an older host that doesn't report
         it) — never treat it as "nothing is gateway-backed".
-    :param capabilities_pending: ``False`` on the initial completion update.
-        The explicit marker permits ``configured_harnesses=None`` when the
-        best-effort probe failed, distinguishing completion from a malformed
-        legacy frame.
     """
 
-    configured_harnesses: dict[str, HarnessAvailability] | None
+    configured_harnesses: dict[str, HarnessAvailability]
     gateway_inference: dict[str, bool] | None = None
-    capabilities_pending: bool = False
 
 
 @dataclass
@@ -1109,7 +1075,6 @@ class HostImportLocalDoneFrame:
 HostFrame = (
     HostHelloFrame
     | HostConnectionErrorFrame
-    | HostIdentityFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
     | HostLaunchRunnerResultFrame
@@ -1197,7 +1162,6 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
                 "interactive_shells": frame.interactive_shells,
-                "capabilities_pending": frame.capabilities_pending,
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
             }
@@ -1211,20 +1175,12 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "retryable": frame.retryable,
             }
         )
-    if isinstance(frame, HostIdentityFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.IDENTITY.value,
-                "user_id": frame.user_id,
-            }
-        )
     if isinstance(frame, HostHarnessReadinessFrame):
         return _encode_payload(
             {
                 "kind": HostFrameKind.HARNESS_READINESS.value,
                 "configured_harnesses": frame.configured_harnesses,
                 "gateway_inference": frame.gateway_inference,
-                "capabilities_pending": frame.capabilities_pending,
             }
         )
     if isinstance(frame, HostLaunchRunnerFrame):
@@ -1670,8 +1626,6 @@ def _decode_known_host_frame(
                 error=_required_str(msg, "error"),
                 retryable=_required_bool(msg, "retryable"),
             )
-        case HostFrameKind.IDENTITY:
-            return HostIdentityFrame(user_id=_optional_nullable_str(msg, "user_id"))
         case HostFrameKind.HARNESS_READINESS:
             return _decode_harness_readiness(msg)
         case HostFrameKind.LAUNCH_RUNNER:
@@ -1784,7 +1738,6 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
             if msg.get("interactive_shells") is not None
             else None
         ),
-        capabilities_pending=bool(msg.get("capabilities_pending", False)),
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
     )
@@ -1792,26 +1745,19 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
 
 def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     """Decode a live harness-readiness refresh frame."""
-    pending_marker = msg.get("capabilities_pending")
-    has_pending_marker = isinstance(pending_marker, bool)
     raw = msg.get("configured_harnesses")
-    if not isinstance(raw, dict) and not has_pending_marker:
+    if not isinstance(raw, dict):
         raise ValueError("harness readiness frame requires a configured_harnesses object")
     configured_harnesses = _optional_str_availability_map(msg, "configured_harnesses")
-    if configured_harnesses is None and not has_pending_marker:
+    if configured_harnesses is None:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    if (
-        isinstance(raw, dict)
-        and configured_harnesses is not None
-        and len(configured_harnesses) != len(raw)
-    ):
+    if len(configured_harnesses) != len(raw):
         raise ValueError("harness readiness frame contains an unsupported availability state")
-    if not configured_harnesses and not has_pending_marker:
+    if not configured_harnesses:
         raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
     return HostHarnessReadinessFrame(
         configured_harnesses=configured_harnesses,
         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
-        capabilities_pending=bool(pending_marker) if has_pending_marker else False,
     )
 
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 
 import pytest
 from asgiref.testing import ApplicationCommunicator
@@ -13,18 +12,15 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
-from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
-    HOST_IDENTITY_SUBPROTOCOL,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
-    HostIdentityFrame,
     HostLaunchRunnerResultFrame,
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.stores.host_store import HostStore
@@ -39,7 +35,6 @@ def _websocket_scope(
     path: str,
     *,
     client_host: str = "127.0.0.1",
-    subprotocols: list[str] | None = None,
 ) -> dict[str, object]:
     """Build an ASGI WebSocket scope for a test path.
 
@@ -58,15 +53,13 @@ def _websocket_scope(
         "headers": [],
         "client": (client_host, 50000),
         "server": ("testserver", 80),
-        "subprotocols": subprotocols or [],
+        "subprotocols": [],
     }
 
 
 async def _connect_route(
     app: FastAPI,
     path: str,
-    *,
-    subprotocols: list[str] | None = None,
 ) -> ApplicationCommunicator:
     """Connect an ASGI WebSocket communicator to the host tunnel.
 
@@ -74,16 +67,10 @@ async def _connect_route(
     :param path: WebSocket path.
     :returns: The connected ASGI communicator.
     """
-    communicator = ApplicationCommunicator(
-        app,
-        _websocket_scope(path, subprotocols=subprotocols),
-    )
+    communicator = ApplicationCommunicator(app, _websocket_scope(path))
     await communicator.send_input({"type": "websocket.connect"})
     accepted = await communicator.receive_output(timeout=1.0)
     assert accepted["type"] == "websocket.accept", f"Expected {path} to accept; got {accepted!r}"
-    if subprotocols:
-        expected = HOST_IDENTITY_SUBPROTOCOL if HOST_IDENTITY_SUBPROTOCOL in subprotocols else None
-        assert accepted.get("subprotocol") == expected
     return communicator
 
 
@@ -437,209 +424,6 @@ async def test_host_tunnel_refreshes_harness_readiness_without_reconnect(
     assert updates == [_HOST_ID]
 
 
-async def test_host_tunnel_negotiates_and_completes_async_capabilities(
-    host_app: tuple[FastAPI, HostRegistry, HostStore],
-) -> None:
-    """The server opts in explicitly and unblocks capability waiters on update."""
-    app, registry, _store = host_app
-    comm = await _connect_route(
-        app,
-        _TUNNEL_PATH,
-        subprotocols=[HOST_IDENTITY_SUBPROTOCOL],
-    )
-    await comm.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostHelloFrame(
-                    version="0.1.0-test",
-                    frame_protocol_version=1,
-                    name="test-laptop",
-                    configured_harnesses=None,
-                    capabilities_pending=True,
-                )
-            ),
-        }
-    )
-    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
-    conn = registry.get(_HOST_ID)
-    assert conn is not None
-    assert conn.hello.capabilities_pending
-    assert not conn.capabilities_ready.is_set()
-    assert registry.capabilities_pending(_HOST_ID) is True
-
-    await comm.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostHarnessReadinessFrame(
-                    configured_harnesses={"claude-native": True},
-                    gateway_inference={"claude-native": True},
-                    capabilities_pending=False,
-                )
-            ),
-        }
-    )
-    await asyncio.wait_for(conn.capabilities_ready.wait(), timeout=1.0)
-    assert not conn.hello.capabilities_pending
-    assert registry.capabilities_pending(_HOST_ID) is False
-    assert registry.gateway_inference(_HOST_ID) == {"claude-native": True}
-
-
-async def test_superseded_readiness_write_cannot_overwrite_reconnect(
-    host_app: tuple[FastAPI, HostRegistry, HostStore],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A delayed frame from connection A converges back to connection B's state."""
-    app, registry, store = host_app
-    first = await _connect_route(
-        app,
-        _TUNNEL_PATH,
-        subprotocols=[HOST_IDENTITY_SUBPROTOCOL],
-    )
-    await first.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostHelloFrame(
-                    version="first",
-                    frame_protocol_version=1,
-                    name="test-laptop",
-                    capabilities_pending=True,
-                )
-            ),
-        }
-    )
-    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=2.0)
-    first_conn = registry.get(_HOST_ID)
-    assert first_conn is not None
-
-    original_update = store.update_harness_readiness
-    first_write_started = threading.Event()
-    release_first_write = threading.Event()
-    call_count = 0
-    call_lock = threading.Lock()
-
-    def delayed_update(
-        host_id: str,
-        configured_harnesses: dict[str, HarnessAvailability] | None,
-    ) -> None:
-        nonlocal call_count
-        with call_lock:
-            call_count += 1
-            this_call = call_count
-        if this_call == 1:
-            first_write_started.set()
-            release_first_write.wait(timeout=2.0)
-        original_update(host_id, configured_harnesses)
-
-    monkeypatch.setattr(store, "update_harness_readiness", delayed_update)
-    await first.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostHarnessReadinessFrame(
-                    configured_harnesses={"claude-native": False},
-                    gateway_inference={"claude-native": False},
-                    capabilities_pending=False,
-                )
-            ),
-        }
-    )
-    assert await asyncio.to_thread(first_write_started.wait, 1.0)
-
-    second = await _connect_route(
-        app,
-        _TUNNEL_PATH,
-        subprotocols=[HOST_IDENTITY_SUBPROTOCOL],
-    )
-    await second.send_input(
-        {
-            "type": "websocket.receive",
-            "text": encode_host_frame(
-                HostHelloFrame(
-                    version="second",
-                    frame_protocol_version=1,
-                    name="test-laptop",
-                    configured_harnesses={"claude-native": True},
-                    gateway_inference={"claude-native": True},
-                    capabilities_pending=False,
-                )
-            ),
-        }
-    )
-
-    async def _wait_replaced() -> None:
-        while registry.get(_HOST_ID) is first_conn:
-            await asyncio.sleep(0.01)
-
-    await asyncio.wait_for(_wait_replaced(), timeout=2.0)
-    release_first_write.set()
-
-    async def _wait_repaired() -> None:
-        while True:
-            host = store.get_host(_HOST_ID)
-            if host is not None and host.configured_harnesses == {"claude-native": True}:
-                return
-            await asyncio.sleep(0.01)
-
-    await asyncio.wait_for(_wait_repaired(), timeout=2.0)
-    current = registry.get(_HOST_ID)
-    assert current is not None and current is not first_conn
-    assert current.hello.configured_harnesses == {"claude-native": True}
-    assert registry.gateway_inference(_HOST_ID) == {"claude-native": True}
-
-    await second.send_input({"type": "websocket.disconnect", "code": 1000})
-
-
-async def test_negotiated_identity_preserves_anonymous_single_user_mode(
-    host_app: tuple[FastAPI, HostRegistry, HostStore],
-) -> None:
-    """An auth-disabled server does not invent a user attribution value."""
-    app, registry, _store = host_app
-    comm = await _connect_route(
-        app,
-        _TUNNEL_PATH,
-        subprotocols=[HOST_IDENTITY_SUBPROTOCOL],
-    )
-    await _send_hello_and_wait(comm, registry)
-
-    identity_message = await comm.receive_output(timeout=1.0)
-    assert identity_message["type"] == "websocket.send"
-    assert decode_host_frame(identity_message["text"]) == HostIdentityFrame(user_id=None)
-
-
-async def test_negotiated_identity_preserves_anonymous_managed_host_mode(
-    host_app: tuple[FastAPI, HostRegistry, HostStore],
-) -> None:
-    """A managed token does not turn the local owner sentinel into attribution."""
-    app, registry, store = host_app
-    store.register_managed_host(
-        host_id=_HOST_ID,
-        name=f"managed-{_HOST_ID}",
-        user_id=RESERVED_USER_LOCAL,
-        token="local-managed-token",
-        provider="modal",
-        sandbox_id="sb-local",
-        token_expires_at=now_epoch() + 3600,
-    )
-    scope = _managed_scope(_TUNNEL_PATH, "local-managed-token")
-    scope["subprotocols"] = [HOST_IDENTITY_SUBPROTOCOL]
-    communicator = ApplicationCommunicator(app, scope)
-    await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
-    assert accepted["type"] == "websocket.accept"
-    assert accepted.get("subprotocol") == HOST_IDENTITY_SUBPROTOCOL
-
-    try:
-        await _send_hello_and_wait(communicator, registry, name=f"managed-{_HOST_ID}")
-        identity_message = await communicator.receive_output(timeout=1.0)
-        assert identity_message["type"] == "websocket.send"
-        assert decode_host_frame(identity_message["text"]) == HostIdentityFrame(user_id=None)
-    finally:
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-
-
 async def test_host_tunnel_sets_offline_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
 ) -> None:
@@ -824,23 +608,6 @@ def _owned_app(
         prefix="/v1",
     )
     return app, registry, store
-
-
-async def test_negotiated_identity_uses_the_authenticated_tunnel_owner(db_uri: str) -> None:
-    """Multi-user hosts receive attribution on the existing authenticated tunnel."""
-    app, registry, _store = _owned_app(db_uri, authed_user="alice@example.com")
-    comm = await _connect_route(
-        app,
-        _TUNNEL_PATH,
-        subprotocols=[HOST_IDENTITY_SUBPROTOCOL],
-    )
-    await _send_hello_and_wait(comm, registry)
-
-    identity_message = await comm.receive_output(timeout=1.0)
-    assert identity_message["type"] == "websocket.send"
-    assert decode_host_frame(identity_message["text"]) == HostIdentityFrame(
-        user_id="alice@example.com"
-    )
 
 
 async def test_cross_owner_refused_with_409_before_accept(db_uri: str) -> None:

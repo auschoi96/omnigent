@@ -60,6 +60,7 @@ from ._sessions_chat import SessionsChat, SessionToolCallInfo, ToolCallable
 from ._stream import BlockStream, format_tool_args_brief
 from ._sync_client import Omnigent
 from ._sync_sessions import SessionEventStream
+from ._sync_sessions_chat import SyncQueryStream, SyncSessionsChat
 from ._tool_handler import (
     ElicitationRequestCtx,
     StreamHooks,
@@ -126,6 +127,8 @@ __all__ = [
     "StreamHooks",
     "StreamProtocolError",
     "SyncCursorPage",
+    "SyncQueryStream",
+    "SyncSessionsChat",
     "TextChunk",
     "TextDone",
     "ToolCallDenied",

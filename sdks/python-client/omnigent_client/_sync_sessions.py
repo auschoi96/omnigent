@@ -37,6 +37,7 @@ from omnigent.protocol import (
     SessionResponse,
 )
 
+from ._child_status import child_summary_busy
 from ._errors import (
     OmnigentError,
     SessionCompositionError,
@@ -74,6 +75,11 @@ from ._sessions_shared import (
 from ._timeouts import _SSE_TIMEOUT
 
 _ELICITATION_STATE_ADAPTER: TypeAdapter[ElicitationState] = TypeAdapter(ElicitationState)
+
+# Levels of the sub-agent tree to descend by default. Mirrors the async
+# SessionsNamespace._DEFAULT_SUBTREE_DEPTH so sync and async subtree rollups
+# agree.
+_DEFAULT_SUBTREE_DEPTH: int = 3
 
 
 class SessionEventStream:
@@ -1066,6 +1072,70 @@ class SyncSessionsResource:
 
     def get(self, session_id: str) -> SessionResponse:
         return self.retrieve(session_id)
+
+    def child_sessions_tree(
+        self,
+        session_id: str,
+        *,
+        max_depth: int = _DEFAULT_SUBTREE_DEPTH,
+        limit: int = 100,
+    ) -> builtins.list[dict[str, Any]]:
+        """List the whole sub-agent subtree under *session_id*, flattened.
+
+        Sync counterpart of the async
+        SessionsNamespace.child_sessions_tree.  Recurses breadth-first
+        to *max_depth*.  Each returned row is a ChildSessionSummary dict
+        with an added parent_id key recording the session it was queried
+        under.  *session_id* itself is not included.
+
+        :param session_id: Root parent session identifier.
+        :param max_depth: Levels to descend (1 = direct children only).
+        :param limit: Per-level page size.
+        :returns: Flattened list of child-session summary dicts.
+        :raises OmnigentError: On non-2xx status.
+        """
+        nodes: list[dict[str, Any]] = []
+        seen: set[str] = {session_id}
+        frontier: list[str] = [session_id]
+        depth = 0
+        while frontier and depth < max_depth:
+            next_frontier: list[str] = []
+            for parent_id in frontier:
+                page = self.subagents.list(parent_id, limit=limit)
+                for child in page.data:
+                    row = child.model_dump()
+                    sid = row.get("id")
+                    if not isinstance(sid, str) or sid in seen:
+                        continue
+                    seen.add(sid)
+                    nodes.append({**row, "parent_id": parent_id})
+                    next_frontier.append(sid)
+            frontier = next_frontier
+            depth += 1
+        return nodes
+
+    def subtree_busy(
+        self,
+        session_id: str,
+        *,
+        max_depth: int = _DEFAULT_SUBTREE_DEPTH,
+        limit: int = 100,
+    ) -> bool:
+        """Whether any sub-agent anywhere under *session_id* is still working.
+
+        Sync counterpart of the async SessionsNamespace.subtree_busy.
+        Applies the canonical child_summary_busy predicate — the same
+        "busy" definition the CLI badge and web SubagentsPanel use.
+        Point-in-time (no subscription); re-call for a fresh value.
+
+        :param session_id: Root parent session identifier.
+        :param max_depth: Levels to descend.
+        :param limit: Per-level page size.
+        :returns: True while any descendant is busy.
+        :raises OmnigentError: On non-2xx status.
+        """
+        nodes = self.child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
+        return any(child_summary_busy(node) for node in nodes)
 
     def update(
         self,

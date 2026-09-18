@@ -21,8 +21,11 @@ from ._http import (
     restore_injected_client_policy,
 )
 from ._pagination import SyncCursorPage
+from ._sessions_chat import ToolCallable
 from ._sessions_shared import Headers, Query, Timeout, query_params, request_options
 from ._sync_sessions import SyncSessionsResource
+from ._sync_sessions_chat import SyncSessionsChat
+from ._tool_handler import StreamHooks
 
 
 class SyncAgentsResource:
@@ -141,8 +144,61 @@ class Omnigent:
                 self._injected_client_lease.close()
             raise
 
+    def sessions_chat(
+        self,
+        agent_id: str,
+        *,
+        tool_callables: dict[str, ToolCallable] | None = None,
+        hooks: StreamHooks | None = None,
+        **create_kwargs: Any,
+    ) -> SyncSessionsChat:
+        """Create a sync sessions chat helper bound to a new registered-agent session.
+
+        Counterpart of the async :meth:`OmnigentClient.sessions_chat` but
+        synchronous — no event loop required. Wires the sync sessions
+        namespace and agent-tools getter automatically. File upload/get
+        callables are not wired by default; pass them to the
+        :class:`SyncSessionsChat` constructor directly if needed.
+
+        :param agent_id: Durable agent identifier.
+        :param tool_callables: Optional name -> callable map for client-side
+            tools. Validated against the agent spec on the first send.
+        :param hooks: Optional :class:`StreamHooks` fired from stream events.
+        :param create_kwargs: Forwarded to :meth:`SyncSessionsResource.create`
+            (e.g. ``host_type="managed"``, ``timeout=300.0``).
+        :returns: A :class:`SyncSessionsChat` ready for use.
+        """
+        return SyncSessionsChat.create_registered(
+            self.sessions,
+            agent_id=agent_id,
+            tool_callables=tool_callables,
+            agent_tools_getter=self._fetch_agent_tools,
+            hooks=hooks,
+            **create_kwargs,
+        )
+
+    def _fetch_agent_tools(
+        self, agent_id: str, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch the spec-declared tool entries for a session's agent.
+
+        Sync counterpart of :meth:`OmnigentClient._fetch_agent_tools`.
+        Reads the tool list off the raw agent JSON from
+        ``GET /v1/sessions/{session_id}/agent``.
+        """
+        if session_id is None:
+            return []
+        path = f"{self._base_url}/v1/sessions/{session_id}/agent"
+        resp = self._http.get(path)
+        if resp.status_code != 200:
+            return []
+        agent_data = resp.json()
+        tools = agent_data.get("tools")
+        if isinstance(tools, list):
+            return [t for t in tools if isinstance(t, dict)]
+        return []
+
     def close(self) -> None:
-        """Close an SDK-owned HTTP client; injected clients remain caller-owned."""
         if self._owns_http:
             self._http.close()
         elif self._injected_client_policy is not None:

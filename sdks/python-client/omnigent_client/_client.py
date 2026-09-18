@@ -342,11 +342,44 @@ class OmnigentClient:
             return await session.query(input, files=files, stream=True)
         return await session.query(input, files=files)
 
+    @overload
     async def sessions_chat(
         self,
         bundle: bytes,
         *,
         filename: str = "agent.tar.gz",
+        tool_callables: dict[str, ToolCallable] | None = None,
+        hooks: StreamHooks | None = None,
+    ) -> SessionsChat: ...
+
+    @overload
+    async def sessions_chat(
+        self,
+        *,
+        agent_id: str,
+        filename: Literal["agent.tar.gz"] = "agent.tar.gz",
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
+        tool_callables: dict[str, ToolCallable] | None = None,
+        hooks: StreamHooks | None = None,
+    ) -> SessionsChat: ...
+
+    async def sessions_chat(
+        self,
+        bundle: bytes | None = None,
+        *,
+        agent_id: str | None = None,
+        filename: str = "agent.tar.gz",
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
         tool_callables: dict[str, ToolCallable] | None = None,
         hooks: StreamHooks | None = None,
     ) -> SessionsChat:
@@ -358,6 +391,8 @@ class OmnigentClient:
 
         :param bundle: Gzipped agent tarball bytes uploaded through
             multipart ``POST /v1/sessions``.
+        :param agent_id: Durable id of an agent already registered on the
+            server. Pass either ``bundle`` or ``agent_id``, never both.
         :param filename: Filename for the multipart upload, e.g.
             ``"agent.tar.gz"``.
         :param tool_callables: Optional mapping from tool name to
@@ -372,6 +407,41 @@ class OmnigentClient:
         :returns: A :class:`SessionsChat` ready for use.
         :raises OmnigentError: If session creation fails.
         """
+        if bundle is not None and agent_id is not None:
+            raise ValueError("bundle and agent_id are mutually exclusive")
+        if bundle is None and agent_id is None:
+            raise ValueError("Pass bundle or agent_id")
+        if agent_id is not None:
+            if filename != "agent.tar.gz":
+                raise ValueError("filename is only valid with bundle")
+            return await SessionsChat.create_for_agent(
+                namespace=self.sessions,
+                agent_id=agent_id,
+                title=title,
+                labels=labels,
+                reasoning_effort=reasoning_effort,
+                workspace=workspace,
+                host_type=host_type,
+                sandbox_provider=sandbox_provider,
+                files_namespace=self.files,
+                tool_callables=tool_callables,
+                agent_tools_getter=self._fetch_agent_tools,
+                hooks=hooks,
+            )
+
+        registered_options = {
+            "title": title,
+            "labels": labels,
+            "reasoning_effort": reasoning_effort,
+            "workspace": workspace,
+            "sandbox_provider": sandbox_provider,
+        }
+        invalid = [name for name, value in registered_options.items() if value is not None]
+        if host_type != "external":
+            invalid.append("host_type")
+        if invalid:
+            raise ValueError("bundle sessions_chat does not support: " + ", ".join(invalid))
+        assert bundle is not None
         return await SessionsChat.create(
             namespace=self.sessions,
             bundle=bundle,

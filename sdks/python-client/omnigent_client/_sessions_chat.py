@@ -34,9 +34,10 @@ import inspect
 import json
 import mimetypes
 import pathlib
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, overload
+from typing import Any, Literal, Protocol, TypeVar, overload
 
 from omnigent.protocol import (
     CompletedEvent,
@@ -53,6 +54,7 @@ from omnigent.protocol import (
     ServerStreamEvent,
     SessionChildSessionUpdatedEvent,
     SessionCreatedEvent,
+    SessionItem,
     SessionStatusEvent,
     UnknownEvent,
 )
@@ -60,6 +62,7 @@ from omnigent.protocol import (
 from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
 from ._files import FilesNamespace
+from ._pagination import AsyncCursorPage
 from ._query import QueryResult, QueryStream
 from ._sessions import (
     _RESPONSE_TERMINAL_EVENT_TYPES,
@@ -126,6 +129,16 @@ SessionStreamEvent = ServerStreamEvent | UnknownEvent
 # value (typically ``"server"``) are server-executed and require
 # no callable on the SDK side.
 _RUNTIME_CLIENT: str = "client"
+
+# A response terminal event is only a turn boundary. Delegated work can create
+# later parent turns, so the high-level runner requires a sustained quiet
+# window before reporting that the known task tree has settled.
+_DEFAULT_QUIET_PERIOD_S: float = 60.0
+_DEFAULT_RUN_TIMEOUT_S: float = 1200.0
+_DEFAULT_POLL_INTERVAL_S: float = 1.0
+_DEFAULT_FOLLOW_DEPTH: int = 3
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -418,6 +431,61 @@ class SessionsChat:
             hooks=hooks,
         )
 
+    @classmethod
+    async def create_for_agent(
+        cls,
+        namespace: SessionsNamespace,
+        agent_id: str,
+        *,
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
+        files_uploader: _FilesUploader | None = None,
+        files_getter: _FilesGetter | None = None,
+        files_namespace: FilesNamespace | None = None,
+        tool_callables: dict[str, ToolCallable] | None = None,
+        agent_tools_getter: _AgentToolsGetter | None = None,
+        hooks: StreamHooks | None = None,
+    ) -> SessionsChat:
+        """Create a chat helper for an agent already registered on the server.
+
+        This is the registered-agent counterpart to :meth:`create`. It uses the
+        existing JSON ``POST /v1/sessions`` path and then wires the same file,
+        tool, and hook machinery as bundle-created chats.
+
+        :param namespace: The :class:`SessionsNamespace` to delegate to.
+        :param agent_id: Durable id of an agent registered on the server.
+        :param host_type: ``"external"`` or ``"managed"``.
+        :param sandbox_provider: Optional managed-sandbox provider.
+        :returns: A :class:`SessionsChat` bound to the created session.
+        """
+        session = await namespace.create(
+            agent_id=agent_id,
+            title=title,
+            labels=labels,
+            reasoning_effort=reasoning_effort,
+            workspace=workspace,
+            host_type=host_type,
+            sandbox_provider=sandbox_provider,
+        )
+        assert isinstance(session, Session)
+        if files_namespace is not None:
+            session_files = files_namespace.for_session(session.id)
+            files_uploader = session_files.upload
+            files_getter = session_files.get
+        return cls(
+            namespace=namespace,
+            files_uploader=files_uploader,
+            files_getter=files_getter,
+            session=session,
+            tool_callables=tool_callables,
+            agent_tools_getter=agent_tools_getter,
+            hooks=hooks,
+        )
+
     @property
     def session_id(self) -> str:
         """
@@ -487,6 +555,193 @@ class SessionsChat:
         :raises OmnigentError: On non-2xx status.
         """
         return await self._namespace.subtree_busy(self._session.id, max_depth=max_depth)
+
+    async def run(
+        self,
+        input: str | list[dict[str, Any]],
+        *,
+        files: list[str] | None = None,
+        on_event: Callable[[SessionStreamEvent], Awaitable[None] | None] | None = None,
+        on_item: Callable[[str, SessionItem], Awaitable[None] | None] | None = None,
+        timeout: float | None = _DEFAULT_RUN_TIMEOUT_S,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL_S,
+        quiet_period: float = _DEFAULT_QUIET_PERIOD_S,
+        max_depth: int = _DEFAULT_FOLLOW_DEPTH,
+    ) -> Session:
+        """Send one input and follow its known session tree until it settles.
+
+        Live events from the initial response are delivered to ``on_event``.
+        After that response ends, durable typed items and child-session state
+        are followed through the existing session resources. Real server
+        elicitations continue to use this chat's
+        :class:`~omnigent_client.StreamHooks`; the SDK never treats ordinary
+        assistant text as an approval request.
+
+        :param input: User text or content-block list.
+        :param files: Optional local files to attach.
+        :param on_event: Optional sync or async callback for live typed events.
+        :param on_item: Optional sync or async callback receiving
+            ``(session_id, item)`` for newly observed durable typed items.
+        :param timeout: Overall deadline in seconds; ``None`` waits forever.
+        :param poll_interval: Delay between point-in-time REST snapshots.
+        :param quiet_period: Required sustained idle window. Defaults to 60
+            seconds because a response terminal event can precede a delegated
+            child completion or a later parent auto-wake.
+        :param max_depth: Maximum child-session depth to follow.
+        :returns: The final root :class:`Session` snapshot.
+        """
+        seen_item_ids: set[str] = set()
+        async for event in self.send(input, files=files):
+            if on_event is not None:
+                await _call_hook(on_event, event)
+                if isinstance(event, OutputItemDoneEvent):
+                    item_id = event.item.get("id")
+                    if isinstance(item_id, str):
+                        seen_item_ids.add(item_id)
+
+        return await self.wait_until_quiet(
+            on_item=on_item,
+            seen_item_ids=seen_item_ids,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            quiet_period=quiet_period,
+            max_depth=max_depth,
+        )
+
+    async def wait_until_quiet(
+        self,
+        *,
+        on_item: Callable[[str, SessionItem], Awaitable[None] | None] | None = None,
+        seen_item_ids: set[str] | None = None,
+        timeout: float | None = _DEFAULT_RUN_TIMEOUT_S,
+        poll_interval: float = _DEFAULT_POLL_INTERVAL_S,
+        quiet_period: float = _DEFAULT_QUIET_PERIOD_S,
+        max_depth: int = _DEFAULT_FOLLOW_DEPTH,
+    ) -> Session:
+        """Follow durable root and descendant state until it stays quiet.
+
+        This is a transparent composition of ``retrieve``, ``items.list`` and
+        ``subagents.list``. Cursor pages are exhausted through
+        :class:`AsyncCursorPage`; items and events keep their canonical
+        ``omnigent.protocol`` types. There is no atomic whole-tree completion
+        signal, so this method returns only after all sessions known within
+        ``max_depth`` remain non-busy for ``quiet_period`` seconds.
+
+        :param on_item: Optional callback receiving ``(session_id, item)`` for
+            each newly observed durable item.
+        :param seen_item_ids: Optional item-id set to seed and update. Useful
+            when live ``response.output_item.done`` events were already shown.
+        :param timeout: Overall deadline in seconds; ``None`` waits forever.
+        :param poll_interval: Delay between point-in-time REST snapshots.
+        :param quiet_period: Required sustained idle window; defaults to 60s.
+        :param max_depth: Maximum child-session depth to follow.
+        :returns: The final root :class:`Session` snapshot.
+        :raises OmnigentError: If the root session reports failure.
+        :raises TimeoutError: If the tree does not settle before ``timeout``.
+        """
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative or None")
+        if poll_interval < 0:
+            raise ValueError("poll_interval must be non-negative")
+        if quiet_period < 0:
+            raise ValueError("quiet_period must be non-negative")
+        if max_depth < 0:
+            raise ValueError("max_depth must be non-negative")
+
+        root_session_id = self._session.id
+        known_depths: dict[str, int] = {root_session_id: 0}
+        observed_ids = seen_item_ids if seen_item_ids is not None else set()
+        handled_elicitations: set[tuple[str, str]] = set()
+        last_status: dict[str, str] = {}
+        quiet_since: float | None = None
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        while True:
+            activity = False
+            pending_elicitation = False
+            snapshots: dict[str, Session] = {}
+            child_summaries: dict[str, Any] = {}
+
+            for current_id, depth in list(known_depths.items()):
+                snapshot = await self._namespace.retrieve(current_id)
+                snapshots[current_id] = snapshot
+                if last_status.get(current_id) != snapshot.status:
+                    last_status[current_id] = snapshot.status
+                    activity = True
+
+                items_page = await self._namespace.items.list(
+                    current_id,
+                    limit=100,
+                    order="asc",
+                )
+                async for item in _all_page_items(items_page):
+                    if item.id in observed_ids:
+                        continue
+                    observed_ids.add(item.id)
+                    activity = True
+                    if on_item is not None:
+                        await _call_hook(on_item, current_id, item)
+
+                for raw_event in snapshot.pending_elicitations:
+                    event = ElicitationRequestEvent.model_validate(raw_event)
+                    key = (current_id, event.elicitation_id)
+                    if key not in handled_elicitations:
+                        state = _StreamHookState(
+                            current_response_id=snapshot.active_response_id or ""
+                        )
+                        await self._handle_elicitation_request(
+                            event,
+                            state,
+                            default_session_id=current_id,
+                        )
+                        handled_elicitations.add(key)
+                        activity = True
+                    pending_elicitation = True
+
+                if depth >= max_depth:
+                    continue
+                children_page = await self._namespace.subagents.list(
+                    current_id,
+                    limit=100,
+                    order="asc",
+                )
+                async for child in _all_page_items(children_page):
+                    child_summaries[child.id] = child
+                    if child.id not in known_depths:
+                        known_depths[child.id] = depth + 1
+                        activity = True
+
+            root = snapshots[root_session_id]
+            self._session = root
+            if root.status == "failed":
+                detail = root.last_task_error or {}
+                raise OmnigentError(
+                    detail.get("message") or f"Session {root_session_id!r} failed",
+                    code=detail.get("code"),
+                )
+
+            session_busy = any(
+                snapshot.status in {"running", "waiting"} for snapshot in snapshots.values()
+            )
+            descendants_busy = any(
+                child_summary_busy(child.model_dump(mode="python"))
+                for child in child_summaries.values()
+            )
+            now = time.monotonic()
+            tree_quiet = not session_busy and not descendants_busy and not pending_elicitation
+            if tree_quiet and not activity:
+                quiet_since = quiet_since or now
+                if now - quiet_since >= quiet_period:
+                    return root
+            else:
+                quiet_since = None
+
+            if deadline is not None and now >= deadline:
+                raise TimeoutError(
+                    f"Session tree did not become quiet within {timeout:.0f} seconds: "
+                    f"{root_session_id}"
+                )
+            await asyncio.sleep(poll_interval)
 
     async def send(
         self,
@@ -1058,6 +1313,8 @@ class SessionsChat:
         self,
         event: ElicitationRequestEvent,
         state: _StreamHookState,
+        *,
+        default_session_id: str | None = None,
     ) -> None:
         """
         Route a sessions elicitation through ``on_elicitation_request``.
@@ -1079,9 +1336,10 @@ class SessionsChat:
                 content_preview=params.content_preview or "",
                 response_id=state.current_response_id,
                 url=params.url,
+                target_session_id=params.target_session_id,
             ),
         )
-        target_session_id = params.target_session_id or self._session.id
+        target_session_id = params.target_session_id or default_session_id or self._session.id
         await self._namespace.resolve_elicitation(
             target_session_id,
             event.elicitation_id,
@@ -1448,14 +1706,24 @@ def _response_from_server_object(server_response: Any) -> Response:
     return Response.from_dict(data)
 
 
-async def _call_hook(hook: Any, ctx: Any) -> Any:
-    """Call a hook (sync or async) and return its result."""
+async def _call_hook(hook: Any, *args: Any) -> Any:
+    """Call a callback (sync or async) and return its result."""
     if hook is None:
         return None
-    result = hook(ctx)
+    result = hook(*args)
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+async def _all_page_items(page: AsyncCursorPage[_T]) -> AsyncIterator[_T]:
+    """Yield every item by following the SDK page's existing cursor."""
+    while True:
+        for item in page:
+            yield item
+        if not page.has_more:
+            return
+        page = await page.get_next_page()
 
 
 async def _invoke_elicitation_hook(

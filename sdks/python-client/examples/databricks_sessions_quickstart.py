@@ -3,12 +3,12 @@
 # MAGIC %md
 # MAGIC # Run an OmniGent agent
 # MAGIC
-# MAGIC Start by connecting to one OmniGent Databricks App and running one agent
+# MAGIC Start by connecting directly to an OmniGent server and running one agent
 # MAGIC turn. The later sections are optional examples for continuing and
 # MAGIC inspecting the same durable session. No notebook widgets are required.
 # MAGIC
 # MAGIC Requires Databricks compute with Python 3.12 or newer and access to the
-# MAGIC OmniGent Databricks App.
+# MAGIC target OmniGent server.
 
 # COMMAND ----------
 
@@ -26,22 +26,27 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+from urllib.parse import urlsplit
+
 from databricks.sdk import WorkspaceClient
 from omnigent_client import Omnigent, SessionMessage
 
 from omnigent.protocol import OutputTextDeltaEvent
 
-APP_NAME = "<omnigent-app-name>"
-
 workspace = WorkspaceClient()
-app = workspace.apps.get(name=APP_NAME)
-if not app.url or not app.url.startswith("https://"):
-    raise RuntimeError(f"Databricks App {APP_NAME!r} has no secure URL.")
+workspace_url = urlsplit(workspace.config.host)
+if workspace_url.scheme != "https" or not workspace_url.netloc:
+    raise RuntimeError("The current Databricks workspace has no secure URL.")
 
+# The browser UI is <workspace>/omnigent. Its REST API base is this path.
+OMNIGENT_BASE_URL = f"{workspace_url.scheme}://{workspace_url.netloc}/api/2.0/omnigent"
 client = Omnigent(
-    base_url=app.url,
+    base_url=OMNIGENT_BASE_URL,
     headers=workspace.config.authenticate(),
 )
+
+# For another OmniGent server, use that server's own authentication instead:
+# client = Omnigent(base_url="https://omnigent.example.com")
 
 # COMMAND ----------
 

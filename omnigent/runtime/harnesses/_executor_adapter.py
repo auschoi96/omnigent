@@ -311,6 +311,7 @@ class ExecutorAdapter(HarnessApp):
                         clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
+                        clean_exit = event.preserve_session
                         if tctx is not None and agent_span is not None:
                             tctx.end_agent_span(
                                 agent_span,

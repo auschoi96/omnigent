@@ -1074,7 +1074,7 @@ export function ChatPage() {
     composerSessionModelSeeded,
     activeConversationId,
   ]);
-  const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  const modelPickerKind = modelPickerKindForConv(capabilitySource, codexModelOptions);
   // Effort ladders key on the model the session is actually on — the reported
   // `llmModel` — then the session's pinned `model_override`, and only then the
   // sticky preference. The override matters for a harness that never reports a
@@ -4277,7 +4277,8 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin";
+type NativeModelPickerKind =
+  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4408,6 +4409,7 @@ export function modelPickerKindForConv(
       }
     | null
     | undefined,
+  modelOptions: readonly NativeModelOption[] = [],
 ): NativeModelPickerKind | null {
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
@@ -4437,6 +4439,9 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
+      // Generic ACP sessions carry no wrapper label; the server canonicalizes
+      // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
+      if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
       return null;
   }
 }
@@ -4444,8 +4449,9 @@ export function modelPickerKindForConv(
 export function shouldShowModelPicker(
   conv:
     { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+  modelOptions: readonly NativeModelOption[] = [],
 ): boolean {
-  return modelPickerKindForConv(conv) !== null;
+  return modelPickerKindForConv(conv, modelOptions) !== null;
 }
 
 /**
@@ -5027,7 +5033,8 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
-    modelPickerKind === "devin";
+    modelPickerKind === "devin" ||
+    modelPickerKind === "acp";
   const modelOptions: readonly {
     id: string;
     model?: string;

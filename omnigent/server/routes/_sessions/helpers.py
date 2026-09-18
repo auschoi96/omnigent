@@ -1882,10 +1882,9 @@ def _resolve_harness_impl(
         # (a gpt head runs codex, not the claude-sdk brain). Falls back to the
         # brain harness when the head declares none or can't be matched.
         if conv.sub_agent_name:
-            sub = next(
-                (s for s in loaded.spec.sub_agents if s.name == conv.sub_agent_name),
-                None,
-            )
+            from omnigent.runtime.workflow import _find_spec_by_name
+
+            sub = _find_spec_by_name(loaded.spec, conv.sub_agent_name)
             if sub is not None:
                 executor = sub.executor
         harness = (

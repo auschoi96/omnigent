@@ -26,14 +26,18 @@ Each test names the production behavior it pins:
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import threading
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal, cast
 
+import httpx
 import pytest
+from omnigent_client._client import OmnigentClient
 from omnigent_client._errors import OmnigentError
+from omnigent_client._pagination import AsyncCursorPage
 from omnigent_client._query import QueryResult, QueryStream
 from omnigent_client._sessions import Session, SessionsNamespace
 from omnigent_client._sessions_chat import (
@@ -42,7 +46,9 @@ from omnigent_client._sessions_chat import (
 )
 from omnigent_client._tool_handler import StreamHooks
 from omnigent_client._types import File
+from pydantic import TypeAdapter
 
+from omnigent.protocol import ChildSessionSummary, SessionItem
 from omnigent.server.schemas import (
     CompletedEvent,
     CreatedEvent,
@@ -146,20 +152,38 @@ class _FakeNamespace(SessionsNamespace):
         self.resolve_elicitation_calls: list[_ResolveElicitationCall] = []
         self.interrupt_calls: list[str] = []
         self.create_calls: list[tuple[bytes, str]] = []
+        self.registered_create_calls: list[dict[str, Any]] = []
         self.get_calls: list[str] = []
         self.subtree_busy_calls: list[tuple[str, int]] = []
         self._subtree_busy_result: bool = False
 
     async def create(  # type: ignore[override]
         self,
-        bundle: bytes,
+        bundle: bytes | None = None,
         *,
+        agent_id: str | None = None,
         filename: str = "agent.tar.gz",
         title: str | None = None,
         labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: str = "external",
+        sandbox_provider: str | None = None,
     ) -> Session:
-        del title, labels
-        self.create_calls.append((bundle, filename))
+        if bundle is not None:
+            self.create_calls.append((bundle, filename))
+        else:
+            self.registered_create_calls.append(
+                {
+                    "agent_id": agent_id,
+                    "title": title,
+                    "labels": labels,
+                    "reasoning_effort": reasoning_effort,
+                    "workspace": workspace,
+                    "host_type": host_type,
+                    "sandbox_provider": sandbox_provider,
+                }
+            )
         return self._session_obj
 
     async def get(self, session_id: str) -> Session:  # type: ignore[override]
@@ -426,7 +450,7 @@ class _FakeGetter:
 def _make_session(
     session_id: str = "conv_abc",
     agent_id: str = "ag_abc",
-    status: str = "running",
+    status: Literal["idle", "running", "waiting", "failed"] = "running",
 ) -> Session:
     """
     Build a :class:`Session` snapshot for use as the fake namespace's
@@ -1338,6 +1362,45 @@ async def test_create_factory_creates_session_and_wires_helpers() -> None:
     assert chat._hooks is hooks
 
 
+@pytest.mark.asyncio
+async def test_client_sessions_chat_creates_from_registered_agent() -> None:
+    """The public factory reuses JSON session creation for registered agents."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "id": "conv_registered",
+                "agent_id": "ag_registered",
+                "status": "idle",
+                "created_at": 1700000000,
+            },
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OmnigentClient("https://omnigent.example.com", http_client=http)
+    try:
+        chat = await client.sessions_chat(
+            agent_id="ag_registered",
+            host_type="managed",
+            sandbox_provider="lakebox",
+        )
+    finally:
+        await client.close()
+        await http.aclose()
+
+    assert chat.session_id == "conv_registered"
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v1/sessions"
+    assert json.loads(requests[0].read()) == {
+        "agent_id": "ag_registered",
+        "host_type": "managed",
+        "sandbox_provider": "lakebox",
+    }
+
+
 # ── tool_callables validation + dispatch ──────────────────────────────
 
 
@@ -1938,6 +2001,241 @@ async def test_tree_busy_forwards_max_depth_and_false_verdict() -> None:
 
     assert await chat.tree_busy(max_depth=5) is False
     assert ns.subtree_busy_calls == [("conv_parent", 5)]
+
+
+_SESSION_ITEM_ADAPTER: TypeAdapter[SessionItem] = TypeAdapter(SessionItem)
+
+
+def _message_item(item_id: str, *, role: str, text: str) -> SessionItem:
+    """Build one canonical flat session item for follower tests."""
+    return _SESSION_ITEM_ADAPTER.validate_python(
+        {
+            "id": item_id,
+            "response_id": f"resp_{item_id}",
+            "type": "message",
+            "status": "completed",
+            "created_at": 1700000000,
+            "role": role,
+            "content": [{"type": "output_text", "text": text}],
+        }
+    )
+
+
+class _FollowItemsResource:
+    """Typed paginated item resource used by the run composition test."""
+
+    def __init__(self, items_by_session: dict[str, list[SessionItem]]) -> None:
+        self._items_by_session = items_by_session
+        self.next_page_calls = 0
+
+    async def list(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        order: str,
+    ) -> AsyncCursorPage[SessionItem]:
+        del limit, order
+        items = self._items_by_session.get(session_id, [])
+        if len(items) < 2:
+            return AsyncCursorPage(items)
+
+        async def next_page(cursor: str) -> AsyncCursorPage[SessionItem]:
+            assert cursor == items[0].id
+            self.next_page_calls += 1
+            return AsyncCursorPage(items[1:])
+
+        return AsyncCursorPage(
+            items[:1],
+            last_id=items[0].id,
+            has_more=True,
+            fetch_next_page=next_page,
+        )
+
+
+class _FollowSubagentsResource:
+    """Typed paginated child resource whose child settles after one poll."""
+
+    def __init__(self, child_id: str) -> None:
+        self._child_id = child_id
+        self.root_calls = 0
+        self.next_page_calls = 0
+
+    async def list(
+        self,
+        session_id: str,
+        *,
+        limit: int,
+        order: str,
+    ) -> AsyncCursorPage[ChildSessionSummary]:
+        del limit, order
+        if session_id != "conv_root":
+            return AsyncCursorPage()
+        self.root_calls += 1
+        busy = self.root_calls == 1
+        child = ChildSessionSummary(
+            id=self._child_id,
+            parent_session_id="conv_root",
+            created_at=1700000000,
+            updated_at=1700000000,
+            current_task_status="in_progress" if busy else "completed",
+            busy=busy,
+        )
+
+        async def next_page(cursor: str) -> AsyncCursorPage[ChildSessionSummary]:
+            assert cursor == "child-page"
+            self.next_page_calls += 1
+            return AsyncCursorPage([child])
+
+        return AsyncCursorPage(
+            [],
+            last_id="child-page",
+            has_more=True,
+            fetch_next_page=next_page,
+        )
+
+
+class _FollowNamespace(_FakeNamespace):
+    """Namespace fake for a root turn, paginated child, and child approval."""
+
+    def __init__(self, *, request: ElicitationRequestEvent) -> None:
+        root = _make_session(session_id="conv_root", status="idle")
+        live_item = _message_item("msg_live", role="assistant", text="live")
+        super().__init__(
+            stream_scripts=[
+                _StreamScript(
+                    events=[
+                        OutputItemDoneEvent(
+                            type="response.output_item.done",
+                            item=live_item.model_dump(mode="python"),
+                        ),
+                        _completed_event(),
+                    ],
+                    session_id="conv_root",
+                )
+            ],
+            session_obj=root,
+        )
+        self._request = request
+        self._resolved = False
+        self.follow_items = _FollowItemsResource(
+            {
+                "conv_root": [
+                    live_item,
+                    _message_item("msg_user", role="user", text="do work"),
+                ],
+                "conv_child": [_message_item("msg_child", role="assistant", text="child work")],
+            }
+        )
+        self.follow_subagents = _FollowSubagentsResource("conv_child")
+        self.items = cast(Any, self.follow_items)
+        self.subagents = cast(Any, self.follow_subagents)
+
+    async def retrieve(self, session_id: str) -> Session:  # type: ignore[override]
+        if session_id == "conv_root":
+            return _make_session(session_id="conv_root", status="idle")
+        if session_id != "conv_child":
+            raise AssertionError(f"unexpected session id: {session_id}")
+        snapshot = _make_session(
+            session_id="conv_child",
+            agent_id="ag_child",
+            status="idle" if self._resolved else "waiting",
+        )
+        if self._resolved:
+            return snapshot
+        return snapshot.model_copy(
+            update={
+                "active_response_id": "resp_child",
+                "pending_elicitations": [self._request.model_dump(mode="json")],
+            }
+        )
+
+    async def resolve_elicitation(  # type: ignore[override]
+        self,
+        session_id: str,
+        elicitation_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await super().resolve_elicitation(session_id, elicitation_id, result)
+        self._resolved = True
+        return response
+
+
+@pytest.mark.asyncio
+async def test_run_follows_typed_paginated_tree_and_resolves_child_elicitation() -> None:
+    """run composes existing events, pages, items, hooks, and child status."""
+    request = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id="elicit_child",
+        params=ElicitationRequestParams(message="Approve child work?"),
+    )
+    namespace = _FollowNamespace(request=request)
+    approvals: list[tuple[str, str]] = []
+    events: list[str] = []
+    items: list[tuple[str, str]] = []
+
+    def approve(ctx: Any) -> bool:
+        approvals.append((ctx.elicitation_id, ctx.response_id))
+        return True
+
+    chat = SessionsChat(
+        namespace=namespace,
+        files_uploader=None,
+        files_getter=None,
+        session=namespace._session_obj,
+        hooks=StreamHooks(on_elicitation_request=approve),
+    )
+    final = await chat.run(
+        "do work",
+        on_event=lambda event: events.append(event.type),
+        on_item=lambda session_id, item: items.append((session_id, item.id)),
+        timeout=2.0,
+        poll_interval=0.0,
+        quiet_period=0.0,
+    )
+
+    assert final.status == "idle"
+    assert events == ["response.output_item.done", "response.completed"]
+    assert items == [("conv_root", "msg_user"), ("conv_child", "msg_child")]
+    assert approvals == [("elicit_child", "resp_child")]
+    assert namespace.resolve_elicitation_calls == [
+        _ResolveElicitationCall(
+            session_id="conv_child",
+            elicitation_id="elicit_child",
+            result={"action": "accept"},
+        )
+    ]
+    assert namespace.follow_items.next_page_calls >= 1
+    assert namespace.follow_subagents.next_page_calls >= 1
+
+    replayed_items: list[tuple[str, str]] = []
+    await chat.wait_until_quiet(
+        on_item=lambda session_id, item: replayed_items.append((session_id, item.id)),
+        timeout=2.0,
+        poll_interval=0.0,
+        quiet_period=0.0,
+    )
+    assert replayed_items == []
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_covers_stream_readiness_without_submitting_input() -> None:
+    """The run deadline starts before the stream-ready handshake."""
+    namespace = _GatedReadyNamespace(
+        session_obj=_make_session(session_id="conv_timeout"),
+        visible_events=[],
+    )
+    chat = SessionsChat(
+        namespace=namespace,
+        files_uploader=None,
+        files_getter=None,
+        session=namespace._session_obj,
+    )
+
+    with pytest.raises(TimeoutError, match="Session run did not settle within"):
+        await chat.run("do work", timeout=0.01)
+
+    assert namespace.post_event_calls == []
 
 
 # ── sub-agent lifecycle hooks ─────────────────────────────────────────

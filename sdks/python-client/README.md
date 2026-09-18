@@ -208,9 +208,10 @@ session = raw.parse()
 
 ## `SessionsChat`
 
-`SessionsChat` remains an async-only, opt-in convenience for uploaded agent
-bundles. It can dispatch client tools and handle elicitation hooks, so the
-low-level resource API never calls it implicitly:
+`SessionsChat` remains an async-only, opt-in convenience over the existing
+session resources. It supports uploaded bundles and agents already registered
+on the server. It can dispatch client tools and handle elicitation hooks, so
+the low-level resource API never calls it implicitly:
 
 ```text
 chat = await client.sessions_chat(bundle_bytes)
@@ -218,7 +219,29 @@ async for event in chat.send("Summarize this repository."):
     print(event.type)
 ```
 
-Client tools must already be declared by the uploaded agent spec. Supply a
+For a complete registered-agent task, `run()` composes that same live stream
+with typed durable items, child-session pages, and elicitation hooks. It waits
+until the known session tree has remained quiet for 60 seconds by default:
+
+```text
+chat = await client.sessions_chat(
+    agent_id="ag_123",
+    host_type="managed",
+    hooks=hooks,
+)
+session = await chat.run(
+    "Create tree.py and run it.",
+    on_event=show_event,
+    on_item=show_item,
+)
+```
+
+`run()` is a transparent client-side composition of existing REST resources;
+it does not add a server task or completion resource. Ordinary assistant text
+is never interpreted as an approval request. Only a typed server elicitation
+invokes `StreamHooks.on_elicitation_request`.
+
+Client tools must already be declared by the bound agent spec. Supply a
 matching name-to-callable map; it is validated when streaming starts:
 
 ```text
@@ -248,7 +271,7 @@ chat = await client.sessions_chat(
 | `sessions.stream(id)` | `sessions.events.stream(id)` |
 | `sessions.post_event(id, event)` | `sessions.events.create(id, events=event)` |
 | `sessions.interrupt(id)` | `sessions.events.cancel(id)` |
-| Direct `SessionsChat` construction | `await client.sessions_chat(bundle)` |
+| Direct `SessionsChat` construction | `await client.sessions_chat(bundle)` or `await client.sessions_chat(agent_id=id)` |
 | `client.files.for_session(id)` | `sessions.files` methods with `id` |
 
 Compatibility imports remain available, but new session-first code should not

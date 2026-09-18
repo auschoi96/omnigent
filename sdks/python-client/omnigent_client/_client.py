@@ -342,11 +342,43 @@ class OmnigentClient:
             return await session.query(input, files=files, stream=True)
         return await session.query(input, files=files)
 
+    @overload
     async def sessions_chat(
         self,
         bundle: bytes,
         *,
         filename: str = "agent.tar.gz",
+        tool_callables: dict[str, ToolCallable] | None = None,
+        hooks: StreamHooks | None = None,
+    ) -> SessionsChat: ...
+
+    @overload
+    async def sessions_chat(
+        self,
+        *,
+        agent_id: str,
+        title: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
+        tool_callables: dict[str, ToolCallable] | None = None,
+        hooks: StreamHooks | None = None,
+    ) -> SessionsChat: ...
+
+    async def sessions_chat(
+        self,
+        bundle: bytes | None = None,
+        *,
+        agent_id: str | None = None,
+        filename: str = "agent.tar.gz",
+        title: str | None = None,
+        labels: Mapping[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: Literal["external", "managed"] = "external",
+        sandbox_provider: str | None = None,
         tool_callables: dict[str, ToolCallable] | None = None,
         hooks: StreamHooks | None = None,
     ) -> SessionsChat:
@@ -358,6 +390,8 @@ class OmnigentClient:
 
         :param bundle: Gzipped agent tarball bytes uploaded through
             multipart ``POST /v1/sessions``.
+        :param agent_id: Durable id of an agent already registered on the
+            server. Pass either ``bundle`` or ``agent_id``, never both.
         :param filename: Filename for the multipart upload, e.g.
             ``"agent.tar.gz"``.
         :param tool_callables: Optional mapping from tool name to
@@ -372,6 +406,41 @@ class OmnigentClient:
         :returns: A :class:`SessionsChat` ready for use.
         :raises OmnigentError: If session creation fails.
         """
+        if bundle is not None and agent_id is not None:
+            raise ValueError("bundle and agent_id are mutually exclusive")
+        if bundle is None and agent_id is None:
+            raise ValueError("Pass bundle or agent_id")
+        if agent_id is not None:
+            if filename != "agent.tar.gz":
+                raise ValueError("filename is only valid with bundle")
+            return await SessionsChat.create_for_agent(
+                namespace=self.sessions,
+                agent_id=agent_id,
+                title=title,
+                labels=labels,
+                reasoning_effort=reasoning_effort,
+                workspace=workspace,
+                host_type=host_type,
+                sandbox_provider=sandbox_provider,
+                files_namespace=self.files,
+                tool_callables=tool_callables,
+                agent_tools_getter=self._fetch_agent_tools,
+                hooks=hooks,
+            )
+
+        registered_options = {
+            "title": title,
+            "labels": labels,
+            "reasoning_effort": reasoning_effort,
+            "workspace": workspace,
+            "sandbox_provider": sandbox_provider,
+        }
+        invalid = [name for name, value in registered_options.items() if value is not None]
+        if host_type != "external":
+            invalid.append("host_type")
+        if invalid:
+            raise ValueError("bundle sessions_chat does not support: " + ", ".join(invalid))
+        assert bundle is not None
         return await SessionsChat.create(
             namespace=self.sessions,
             bundle=bundle,
@@ -389,21 +458,10 @@ class OmnigentClient:
         Fetch the spec-declared tool entries for an agent.
 
         Used as the ``agent_tools_getter`` injection for
-        :class:`SessionsChat`. Reads the tool list off the
-        :class:`Agent` returned by ``GET /api/agents/{agent_id}``.
-
-        The server's :class:`AgentObject`
-        carries a ``tools`` list where each entry has a ``name``
-        and a ``runtime`` discriminator
-        (``"server"`` or ``"client"``). When that field is not yet
-        present, the SDK's :class:`Agent` dataclass simply lacks
-        the field and this returns ``[]`` — which means
-        validation succeeds for any caller that doesn't pass
-        ``tool_callables``, and fails loud (with a clear "extra
-        callable" message) for any caller that does. That is the
-        correct degraded behavior: in F1's absence we cannot
-        verify the spec, but we will never silently accept a
-        broken setup.
+        :class:`SessionsChat`. It reuses the typed session-agent resource
+        instead of duplicating its route or HTTP error handling. ``tools`` is
+        currently an additive server field retained by
+        :class:`~omnigent.protocol.AgentObject`.
 
         :param agent_id: The agent's durable identifier, e.g.
             ``"ag_abc123"``.
@@ -411,16 +469,14 @@ class OmnigentClient:
             and (post-F1) ``runtime`` keys. Empty if the agent
             declares no tools or the server response shape
             predates F1.
-        :raises OmnigentError: If the agents endpoint returns
+        :raises OmnigentError: If the session-agent endpoint returns
             a non-2xx (e.g. 404).
         """
+        del agent_id  # The session-bound agent is authoritative.
         if session_id is None:
             return []  # No session context — cannot resolve agent tools
-        path = f"{self._base_url}/v1/sessions/{session_id}/agent"
-        resp = await self._http.get(path)
-        if resp.status_code != 200:
-            return []
-        agent_data = resp.json()
+        agent = await self.sessions.agent.retrieve(session_id)
+        agent_data = agent.model_dump(mode="python")
         tools = agent_data.get("tools")
         if isinstance(tools, list):
             return [t for t in tools if isinstance(t, dict)]

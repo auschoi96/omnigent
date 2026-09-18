@@ -790,6 +790,46 @@ These are behavioral fixtures, not promises to copy OpenAI wire types.
 13. `with_raw_response` shares the same serializer, transport, and error path
     and exposes status and request ID without making a second request.
 
+## SessionsChat task-following composition
+
+`SessionsChat` may also bind to an agent already registered on the server. The
+factory uses the existing JSON `POST /v1/sessions`; it does not introduce an
+agent lookup, upload, or new server resource:
+
+```text
+OmnigentClient.sessions_chat(*, agent_id, title=None, labels=None,
+  reasoning_effort=None, workspace=None, host_type="external",
+  sandbox_provider=None, tool_callables=None, hooks=None) -> SessionsChat
+
+SessionsChat.create_for_agent(namespace, agent_id, *, title=None, labels=None,
+  reasoning_effort=None, workspace=None, host_type="external",
+  sandbox_provider=None, files_uploader=None, files_getter=None,
+  files_namespace=None, tool_callables=None, agent_tools_getter=None,
+  hooks=None) -> SessionsChat
+```
+
+The high-level task follower is a transparent composition of the existing
+session stream, retrieve, item-list, child-session-list, and elicitation
+resolution operations:
+
+```text
+SessionsChat.run(input, *, files=None, on_event=None, on_item=None,
+  timeout=1200.0, poll_interval=1.0, quiet_period=60.0,
+  max_depth=3) -> durable Session
+SessionsChat.wait_until_quiet(*, on_item=None, seen_item_ids=None,
+  timeout=1200.0, poll_interval=1.0, quiet_period=60.0,
+  max_depth=3) -> durable Session
+```
+
+The callbacks receive canonical `ServerStreamEvent | UnknownEvent` and
+`SessionItem` values from `omnigent.protocol`; cursor traversal reuses
+`AsyncCursorPage`, status rollup reuses `child_summary_busy`, and real
+elicitations reuse `StreamHooks` / `ElicitationRequestCtx`. A response-terminal
+event is only a turn boundary, so the follower requires a sustained 60-second
+quiet window by default. This is not a new atomic task-completion guarantee.
+Ordinary assistant messages never become elicitation requests, and a pending
+child elicitation is resolved against that child session.
+
 ## Compatibility inventory
 
 ### Existing root exports
@@ -910,6 +950,9 @@ OmnigentClient.query(*, model, input, tools=None, tool_handler=None, files=None,
   reasoning=None, model_override=None, stream=False) -> QueryResult | QueryStream
 OmnigentClient.sessions_chat(bundle, *, filename="agent.tar.gz",
   tool_callables=None, hooks=None) -> SessionsChat
+OmnigentClient.sessions_chat(*, agent_id, title=None, labels=None,
+  reasoning_effort=None, workspace=None, host_type="external",
+  sandbox_provider=None, tool_callables=None, hooks=None) -> SessionsChat
 OmnigentClient.close() -> None
 OmnigentClient.__aenter__() -> OmnigentClient
 OmnigentClient.__aexit__(*exc: object) -> None
@@ -949,6 +992,11 @@ SessionsNamespace.stream(session_id) -> AsyncIterator[ServerStreamEvent]
 SessionsChat.create(namespace, bundle, *, filename="agent.tar.gz",
   files_uploader=None, files_getter=None, files_namespace=None,
   tool_callables=None, agent_tools_getter=None, hooks=None) -> SessionsChat
+SessionsChat.create_for_agent(namespace, agent_id, *, title=None, labels=None,
+  reasoning_effort=None, workspace=None, host_type="external",
+  sandbox_provider=None, files_uploader=None, files_getter=None,
+  files_namespace=None, tool_callables=None, agent_tools_getter=None,
+  hooks=None) -> SessionsChat
 SessionsChat.session_id / agent_id / status -> properties
 SessionsChat.refresh() -> durable Session
 SessionsChat.tree_busy(*, max_depth=3) -> bool
@@ -958,6 +1006,12 @@ SessionsChat.post_event(event) -> None
 SessionsChat.stream() -> AsyncIterator[ServerStreamEvent]
 SessionsChat.query(input, *, files=None, stream=False) -> QueryResult | QueryStream
 SessionsChat.await_turn(*, timeout=1200.0) -> QueryResult
+SessionsChat.run(input, *, files=None, on_event=None, on_item=None,
+  timeout=1200.0, poll_interval=1.0, quiet_period=60.0,
+  max_depth=3) -> durable Session
+SessionsChat.wait_until_quiet(*, on_item=None, seen_item_ids=None,
+  timeout=1200.0, poll_interval=1.0, quiet_period=60.0,
+  max_depth=3) -> durable Session
 
 FilesNamespace.for_session(session_id) -> SessionFilesNamespace
 FilesNamespace.upload(path: str) -> File [raises RuntimeError compatibility stub]

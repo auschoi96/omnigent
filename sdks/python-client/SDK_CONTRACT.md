@@ -793,8 +793,9 @@ These are behavioral fixtures, not promises to copy OpenAI wire types.
 
 ### Existing root exports
 
-`omnigent_client.__all__` has exactly 52 names. The following imports are public
-today and remain available until an explicit migration release says otherwise:
+At the baseline, `omnigent_client.__all__` had exactly 52 names. The following
+imports remain available until an explicit migration release says otherwise;
+PR 1 adds the separately documented `NotGiven` and `NOT_GIVEN` values:
 
 `MCP_ELICITATION_METHOD`, `TERMINAL_TASK_STATUSES`, `AnyBlock`, `BlockContext`,
 `BlockStream`, `CompactionBlock`, `ElicitationRequest`,

@@ -175,8 +175,8 @@ async def test_session_stream_follows_relative_location_redirect() -> None:
 
 
 @pytest.mark.asyncio
-async def test_responses_stream_cross_origin_redirect_forwards_nothing() -> None:
-    """The POST path refuses a cross-origin hop before replaying the body.
+async def test_session_event_post_cross_origin_redirect_forwards_nothing() -> None:
+    """The session POST path refuses a cross-origin hop before replaying the body.
 
     A 307/308 replays the request body, so the no-forward guarantee matters
     most here: the transport must never see a request to the foreign host.
@@ -187,15 +187,22 @@ async def test_responses_stream_cross_origin_redirect_forwards_nothing() -> None
         seen_hosts.append(request.url.host)
         return httpx.Response(
             307,
-            headers={"location": "https://elsewhere.invalid/v1/responses"},
+            headers={"location": "https://elsewhere.invalid/v1/sessions/conv_1/events"},
         )
 
     async with OmnigentClient(base_url=_BASE) as client:
         client._http._transport = httpx.MockTransport(handler)
-        with pytest.warns(DeprecationWarning):
-            with pytest.raises(OmnigentError) as excinfo:
-                async for _event in client.responses.stream(model="agent", input="hi"):
-                    pass
+        with pytest.raises(OmnigentError) as excinfo:
+            await client.sessions.post_event(
+                "conv_1",
+                {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    },
+                },
+            )
 
     assert excinfo.value.status_code == 307
     assert seen_hosts == ["127.0.0.1"]

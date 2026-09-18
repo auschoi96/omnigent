@@ -22,9 +22,9 @@ What each test claims to prove (and what failure indicates):
   ``_INTERRUPT_TYPE`` matches. Failure means the cancel path is
   silently broken.
 * ``test_stream_*``: that the SSE parser yields typed
-  :data:`ServerStreamEvent` instances and that malformed/unknown
-  payloads are skipped without aborting iteration. Failure means a
-  schema drift between server and SDK silently drops events.
+  :data:`ServerStreamEvent` instances, preserves unknown event
+  discriminators, and skips malformed payloads without aborting
+  iteration. Failure means schema drift silently loses events.
 * ``test_*_404``: that the namespace propagates :class:`OmnigentError`
   for non-2xx responses; failure means errors are silently swallowed.
 """
@@ -43,6 +43,7 @@ from omnigent_client._sessions import (
     SessionsNamespace,
 )
 
+from omnigent.protocol import MessageData, UnknownEvent
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -115,6 +116,35 @@ def _session_response_body(
         "created_at": 1700000000,
         "updated_at": 1700000042,
         "items": items if items is not None else [],
+    }
+
+
+def _message_item(
+    item_id: str,
+    *,
+    role: str,
+    text: str,
+    response_id: str,
+) -> dict[str, Any]:
+    """Build the nested conversation-item shape returned in snapshots."""
+    data: dict[str, Any] = {
+        "role": role,
+        "content": [
+            {
+                "type": "input_text" if role == "user" else "output_text",
+                "text": text,
+            }
+        ],
+    }
+    if role == "assistant":
+        data["model"] = "test-agent"
+    return {
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "response_id": response_id,
+        "created_at": 1700000042,
+        "data": data,
     }
 
 
@@ -229,7 +259,14 @@ async def test_get_returns_typed_session() -> None:
         return httpx.Response(
             200,
             json=_session_response_body(
-                items=[{"id": "msg_1", "type": "message"}],
+                items=[
+                    _message_item(
+                        "msg_1",
+                        role="user",
+                        text="hello",
+                        response_id="resp_1",
+                    )
+                ],
             ),
         )
 
@@ -240,9 +277,9 @@ async def test_get_returns_typed_session() -> None:
         await client.aclose()
 
     assert isinstance(session, Session)
-    # items round-trip as raw dicts (heterogeneous, intentionally
-    # un-modeled per the namespace docstring).
-    assert session.items == [{"id": "msg_1", "type": "message"}]
+    assert session.items[0].id == "msg_1"
+    assert isinstance(session.items[0].data, MessageData)
+    assert session.items[0].data.content[0]["text"] == "hello"
     assert session.updated_at == 1700000042
 
 
@@ -547,7 +584,13 @@ async def test_post_event_404_raises() -> None:
     ns, client = _make_namespace(handler)
     try:
         with pytest.raises(OmnigentError):
-            await ns.post_event("conv_x", {"type": "message", "data": {}})
+            await ns.post_event(
+                "conv_x",
+                {
+                    "type": "message",
+                    "data": {"role": "user", "content": []},
+                },
+            )
     finally:
         await client.aclose()
 
@@ -638,9 +681,43 @@ async def test_stream_yields_typed_events_in_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_skips_malformed_and_unknown_events() -> None:
+async def test_open_stream_ready_establishes_get_and_consumes_heartbeat() -> None:
+    """The readiness primitive opens the route and hides only its first ack."""
+    requested_paths: list[str] = []
     payloads: list[tuple[str, dict[str, Any] | str]] = [
-        # Unknown discriminator — should be logged and skipped.
+        ("session.heartbeat", {"type": "session.heartbeat"}),
+        (
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "after ready"},
+        ),
+        ("done", "[DONE]"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            content=_format_sse_lines(payloads),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        stream = await ns._open_stream_ready("conv_abc")
+        events = [event async for event in stream]
+    finally:
+        await client.aclose()
+
+    assert requested_paths == ["/v1/sessions/conv_abc/stream"]
+    assert len(events) == 1
+    assert isinstance(events[0], OutputTextDeltaEvent)
+    assert events[0].delta == "after ready"
+
+
+@pytest.mark.asyncio
+async def test_stream_skips_malformed_and_preserves_unknown_events() -> None:
+    payloads: list[tuple[str, dict[str, Any] | str]] = [
+        # Unknown discriminator — preserved for forward compatibility.
         (
             "made.up.event",
             {"type": "made.up.event", "data": "ignored"},
@@ -669,14 +746,12 @@ async def test_stream_skips_malformed_and_unknown_events() -> None:
     finally:
         await client.aclose()
 
-    # Exactly one event survives — the well-formed
-    # OutputTextDeltaEvent. If 0, the adapter is too strict and a
-    # malformed event is killing the iteration. If 2+, an unknown
-    # event leaked through, indicating the discriminator validation
-    # was bypassed.
-    assert len(events) == 1
-    assert isinstance(events[0], OutputTextDeltaEvent)
-    assert events[0].delta == "ok"
+    assert len(events) == 2
+    assert isinstance(events[0], UnknownEvent)
+    assert events[0].type == "made.up.event"
+    assert events[0].raw == {"type": "made.up.event", "data": "ignored"}
+    assert isinstance(events[1], OutputTextDeltaEvent)
+    assert events[1].delta == "ok"
 
 
 @pytest.mark.asyncio
@@ -798,7 +873,14 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
             # GET sees it — matches the real server, which writes the
             # queued item before responding 202.
             if body.get("type") == "message":
-                history.append({"type": "message", "data": body["data"]})
+                history.append(
+                    _message_item(
+                        f"msg_user_{len(history)}",
+                        role="user",
+                        text=body["data"]["content"][0]["text"],
+                        response_id=f"resp_input_{len(history)}",
+                    )
+                )
             return httpx.Response(202, json={"queued": True})
         raise AssertionError(
             f"Unexpected request: {method} {url} (body={request.content!r})",
@@ -920,15 +1002,12 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
         # ``conv_store.append`` after the workflow's
         # response.completed fires — same observable result.
         history.append(
-            {
-                "type": "message",
-                "data": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": turn1_assistant_text},
-                    ],
-                },
-            },
+            _message_item(
+                "msg_assistant_1",
+                role="assistant",
+                text=turn1_assistant_text,
+                response_id="resp_t1",
+            )
         )
 
         # Turn 1 stream invariants. If any of these fail, the SDK
@@ -980,7 +1059,8 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
         # stream's delta concat — proves the live + durable views
         # are the same data.
         assistant_item = post_turn_1_items[1]
-        assert assistant_item["data"]["content"][0]["text"] == turn1_assistant_text, (
+        assert isinstance(assistant_item.data, MessageData)
+        assert assistant_item.data.content[0]["text"] == turn1_assistant_text, (
             "The assistant text returned by GET must match the live "
             "stream's delta concat. If they diverge, the SDK's view "
             "of history is inconsistent with what it just observed."
@@ -1003,15 +1083,12 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
             turn2_events.append(event)
 
         history.append(
-            {
-                "type": "message",
-                "data": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "output_text", "text": turn2_assistant_text},
-                    ],
-                },
-            },
+            _message_item(
+                "msg_assistant_2",
+                role="assistant",
+                text=turn2_assistant_text,
+                response_id="resp_t2",
+            )
         )
 
         turn2_text = "".join(e.delta for e in turn2_events if isinstance(e, OutputTextDeltaEvent))
@@ -1036,8 +1113,10 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
         # persistence invariant the spec promises: clients can
         # always reconstruct full session state via GET, even
         # across stream disconnects.
-        assert final_items[1]["data"]["content"][0]["text"] == turn1_assistant_text
-        assert final_items[3]["data"]["content"][0]["text"] == turn2_assistant_text
+        assert isinstance(final_items[1].data, MessageData)
+        assert final_items[1].data.content[0]["text"] == turn1_assistant_text
+        assert isinstance(final_items[3].data, MessageData)
+        assert final_items[3].data.content[0]["text"] == turn2_assistant_text
 
         # ── Cross-check: stream-1 view ⊆ final history ────────────
         # The user-facing invariant for step 4's final assertion:
@@ -1049,9 +1128,11 @@ async def test_sdk_full_session_lifecycle_with_reconnect() -> None:
             e.delta for e in turn1_events if isinstance(e, OutputTextDeltaEvent)
         )
         snapshot_texts = [
-            item["data"]["content"][0]["text"]
+            item.data.content[0]["text"]
             for item in final_items
-            if item.get("type") == "message" and item["data"].get("role") == "assistant"
+            if item.type == "message"
+            and isinstance(item.data, MessageData)
+            and item.data.role == "assistant"
         ]
         assert live_turn_1_text in snapshot_texts, (
             f"Turn 1 assistant text {live_turn_1_text!r} (observed "

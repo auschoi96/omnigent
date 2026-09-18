@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from omnigent_client._errors import OmnigentError
 from omnigent_client._query import QueryResult, QueryStream
 from omnigent_client._sessions import Session, SessionsNamespace
 from omnigent_client._sessions_chat import (
@@ -105,10 +106,15 @@ class _StreamScript:
 
     :param events: Events to yield, in order.
     :param session_id: Session id the call must target.
+    :param include_ready: Whether to emit the server's initial readiness
+        heartbeat before the scripted caller-visible events.
+    :param closed: Optional signal set when the scripted stream closes.
     """
 
     events: list[ServerStreamEvent]
     session_id: str | None = None
+    include_ready: bool = True
+    closed: asyncio.Event | None = None
 
 
 class _FakeNamespace(SessionsNamespace):
@@ -213,7 +219,11 @@ class _FakeNamespace(SessionsNamespace):
                 f"stream() targeted {session_id!r} but the next "
                 f"scripted reply expected {script.session_id!r}"
             )
-        return _replay(script.events)
+        return _replay(
+            script.events,
+            include_ready=script.include_ready,
+            closed=script.closed,
+        )
 
 
 class _GatedReadyNamespace(_FakeNamespace):
@@ -305,15 +315,28 @@ class _GatedReadyNamespace(_FakeNamespace):
         return _stream()
 
 
-async def _replay(events: list[ServerStreamEvent]) -> AsyncIterator[ServerStreamEvent]:
+async def _replay(
+    events: list[ServerStreamEvent],
+    *,
+    include_ready: bool,
+    closed: asyncio.Event | None,
+) -> AsyncIterator[ServerStreamEvent]:
     """
     Yield each pre-built event in order.
 
     :param events: Events to replay.
+    :param include_ready: Whether to emit the registration heartbeat first.
+    :param closed: Optional signal set when iteration closes.
     :yields: Each event in order.
     """
-    for event in events:
-        yield event
+    try:
+        if include_ready:
+            yield SessionHeartbeatEvent(type="session.heartbeat")
+        for event in events:
+            yield event
+    finally:
+        if closed is not None:
+            closed.set()
 
 
 @dataclass
@@ -949,6 +972,48 @@ async def test_query_opens_stream_before_posting_message() -> None:
 
     assert ns.stream_opened is True
     assert result.text == "fast reply"
+
+
+@pytest.mark.parametrize(
+    ("events", "message"),
+    [
+        ([], "closed before"),
+        (
+            [OutputTextDeltaEvent(type="response.output_text.delta", delta="too early")],
+            "did not begin",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_query_requires_readiness_heartbeat_before_posting(
+    events: list[ServerStreamEvent],
+    message: str,
+) -> None:
+    """EOF or another first event fails readiness without posting input."""
+    session = _make_session()
+    closed = asyncio.Event()
+    ns = _FakeNamespace(
+        stream_scripts=[
+            _StreamScript(
+                events=events,
+                include_ready=False,
+                closed=closed,
+            )
+        ],
+        session_obj=session,
+    )
+    chat = SessionsChat(
+        namespace=ns,
+        files_uploader=None,
+        files_getter=None,
+        session=session,
+    )
+
+    with pytest.raises(OmnigentError, match=message):
+        await chat.query("must not be posted")
+
+    assert ns.post_event_calls == []
+    assert closed.is_set()
 
 
 @pytest.mark.asyncio

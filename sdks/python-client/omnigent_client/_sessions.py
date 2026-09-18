@@ -8,8 +8,8 @@ bundle, optionally
 ``get()`` a snapshot to reconcile on reconnect. There is no replay —
 the server intentionally does not buffer past events.
 
-The SDK-side ``Session`` dataclass in this module mirrors
-:class:`omnigent.server.schemas.SessionResponse`. Note that the
+The SDK-side ``Session`` name aliases the canonical
+:class:`omnigent.protocol.SessionResponse`. Note that the
 ``Session`` class exported from :mod:`omnigent_client._session` is
 an unrelated higher-level ``/v1/responses`` chat helper; the two
 concepts share a name because the server route is ``/v1/sessions``
@@ -25,13 +25,23 @@ import builtins
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 from pydantic import TypeAdapter
 
-from omnigent.server.schemas import ServerStreamEvent
+from omnigent.protocol import (
+    SERVER_STREAM_EVENT_TYPES,
+    PublicSessionEventInput,
+    ServerStreamEvent,
+    SessionList,
+    SessionResponse,
+    UnknownEvent,
+)
+from omnigent.protocol import (
+    SessionListItem as ProtocolSessionListItem,
+)
 
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
@@ -47,8 +57,11 @@ _DEFAULT_SUBTREE_DEPTH = 3
 # caches the validator. ``ServerStreamEvent`` is a Pydantic-discriminated
 # union, so the result of ``validate_python`` is one of the concrete
 # event subclasses (CreatedEvent, OutputTextDeltaEvent, …) — see
-# :mod:`omnigent.server.schemas`.
+# :mod:`omnigent.protocol`.
 _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
+_PUBLIC_SESSION_EVENT_ADAPTER: TypeAdapter[PublicSessionEventInput] = TypeAdapter(
+    PublicSessionEventInput
+)
 
 # ── Module-level constants (rule 34) ─────────────────────────────────
 
@@ -60,266 +73,16 @@ _log = logging.getLogger("omnigent_client.sessions")
 # matches a single named symbol rather than an inline string.
 _INTERRUPT_TYPE: str = "interrupt"
 
-
-@dataclass(frozen=True)
-class SessionEventInput:
-    """
-    Client-side mirror of :class:`omnigent.server.schemas.SessionEventInput`.
-
-    Used as the body of ``POST /v1/sessions/{id}/events``. Frozen
-    because the dataclass is
-    a value object — callers should construct a new instance to model
-    a new event rather than mutate an existing one.
-
-    :param type: Discriminator for the event/input kind, e.g.
-        ``"message"``, ``"function_call_output"``, ``"interrupt"``.
-    :param data: Type-specific payload. Shape varies by ``type``; for
-        ``"message"`` this looks like
-        ``{"role": "user", "content": [{"type": "input_text",
-        "text": "Hello"}]}``. For ``"interrupt"`` this is typically
-        ``{}``.
-    """
-
-    type: str
-    data: dict[str, Any]
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> SessionEventInput:
-        """
-        Parse a :class:`SessionEventInput` from a JSON dict.
-
-        :param raw: Raw JSON dict from the server. Must contain
-            both ``type`` and ``data`` fields — the server schema
-            (``server.schemas.SessionEventInput``) requires both.
-        :returns: A typed :class:`SessionEventInput`.
-        :raises KeyError: If ``type`` or ``data`` is missing from
-            ``raw``. Failing loud on missing fields surfaces
-            server/client schema drift instead of silently
-            substituting an empty dict.
-        :raises TypeError: If ``data`` is not a dict.
-        """
-        data = raw["data"]
-        if not isinstance(data, dict):
-            raise TypeError(
-                f"SessionEventInput.data must be a dict, got {type(data).__name__}: {data!r}"
-            )
-        return cls(type=str(raw["type"]), data=data)
+# The server emits this event immediately after registering the live-tail
+# subscriber. Consuming it is the only stream-readiness acknowledgement.
+_STREAM_READY_EVENT_TYPE: str = "session.heartbeat"
 
 
-@dataclass(frozen=True)
-class Session:
-    """
-    Client-side mirror of :class:`omnigent.server.schemas.SessionResponse`.
-
-    Returned by :meth:`SessionsNamespace.create` and
-    :meth:`SessionsNamespace.get`. Frozen because the dataclass models
-    a single point-in-time snapshot — to observe state changes the
-    caller fetches a new snapshot via :meth:`SessionsNamespace.get`.
-
-    Note: distinct from :class:`omnigent_client._session.Session`
-    (re-exported as ``omnigent_client.Session``), which is a
-    higher-level chat helper over ``/v1/responses``. See this module's
-    docstring for the rationale on why we do NOT re-export this class
-    publicly.
-
-    :param id: Unique session identifier (also the underlying
-        conversation id), e.g. ``"conv_abc123"``.
-    :param agent_id: Durable identifier of the bound agent, e.g.
-        ``"ag_abc123"``. Stable across renames of the agent.
-    :param agent_name: Human-readable name of the bound agent, e.g.
-        ``"polly"``. Changes when the session is switched to a
-        different agent in place (``POST .../switch-agent``), so
-        attached clients can refresh their displayed agent label.
-        ``None`` when the server couldn't resolve the agent row.
-    :param status: Session lifecycle status. One of ``"idle"``,
-        ``"running"``, or ``"failed"``.
-    :param created_at: Unix epoch seconds of creation.
-    :param updated_at: Unix epoch seconds of the last persisted session
-        activity. Advances when conversation items are appended and on session
-        metadata edits (rename, agent switch, archive), so a mid-stall rename
-        resets the clock — treat it as a session-write heartbeat, not a pure
-        item-append signal. ``None`` when connected to an older server that
-        does not return the field.
-    :param title: Optional human-readable title, e.g.
-        ``"debugging auth flow"``. ``None`` when unset.
-    :param labels: Session-scoped guardrails labels. Empty dict
-        when no labels have been written.
-    :param runner_id: Runner currently bound to this session, e.g.
-        ``"runner_abc123"``. ``None`` until the client binds one.
-    :param reasoning_effort: Per-session reasoning-effort hint,
-        e.g. ``"high"``. ``None`` means use the agent default.
-    :param items: Committed conversation items in chronological
-        order as raw dicts. Empty for a freshly created session.
-    :param llm_model: The LLM model identifier from the bound
-        agent's spec, e.g. ``"anthropic/claude-sonnet-4-6"``.
-        ``None`` when the agent has no explicit ``llm:`` block.
-    :param harness: The bound agent's canonical harness, e.g.
-        ``"claude-sdk"`` or ``"openai-agents"``. Lets the REPL show
-        the active credential for the correct provider family
-        instead of guessing it from the model. ``None`` when
-        unavailable.
-    :param model_override: Per-session LLM model override, e.g.
-        ``"claude-opus-4-7"``. ``None`` when no override is active
-        and the agent's ``llm_model`` applies. Set via the REPL's
-        ``/model`` command or the web model picker; both write
-        the same column so the surfaces stay in sync.
-    :param context_window: Context window size in tokens looked up
-        server-side from litellm, e.g. ``200_000``. ``None`` when
-        the model is not in litellm's registry.
-    :param last_total_tokens: Provider-reported total tokens (input +
-        output) from the most recently completed task, e.g. ``45231``.
-        ``None`` when no task has completed yet. Used to seed the
-        context-ring on resume without waiting for the next response.
-    :param last_task_error: Error details from the most recently failed
-        task, e.g. ``{"code": "executor_error", "message": "..."}``
-        ``None`` when no task has failed.
-    :param external_session_id: Runtime-native session id this
-        conversation wraps (e.g. Claude Code's session uuid for
-        ``omnigent claude`` sessions). ``None`` for regular AP-only
-        conversations.
-    :param archived: Whether the session is archived. Archived
-        sessions are hidden from the default ``list`` listing and
-        returned only when ``include_archived=True``. ``False`` for
-        normal sessions.
-    """
-
-    id: str
-    agent_id: str
-    status: str
-    created_at: int
-    updated_at: int | None = None
-    agent_name: str | None = None
-    title: str | None = None
-    labels: dict[str, str] = field(default_factory=dict)
-    runner_id: str | None = None
-    reasoning_effort: str | None = None
-    items: list[dict[str, Any]] = field(default_factory=list)
-    llm_model: str | None = None
-    harness: str | None = None
-    model_override: str | None = None
-    context_window: int | None = None
-    last_total_tokens: int | None = None
-    last_task_error: dict[str, str] | None = None
-    external_session_id: str | None = None
-    archived: bool = False
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> Session:
-        """
-        Parse a :class:`Session` from a JSON dict.
-
-        :param raw: Raw JSON dict from the server. Must contain
-            ``id``, ``agent_id``, ``status``, and ``created_at``.
-        :returns: A typed :class:`Session`.
-        :raises KeyError: If a required field is missing.
-        """
-        items_raw = raw.get("items", [])
-        labels_raw = raw.get("labels", {})
-        raw_cw = raw.get("context_window")
-        raw_ltt = raw.get("last_total_tokens")
-        raw_updated_at = raw.get("updated_at")
-        return cls(
-            id=str(raw["id"]),
-            agent_id=str(raw["agent_id"]),
-            status=str(raw["status"]),
-            created_at=int(raw["created_at"]),
-            updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
-            agent_name=raw.get("agent_name"),
-            title=raw.get("title"),
-            labels=labels_raw if isinstance(labels_raw, dict) else {},
-            runner_id=raw.get("runner_id"),
-            reasoning_effort=raw.get("reasoning_effort"),
-            items=items_raw if isinstance(items_raw, list) else [],
-            llm_model=raw.get("llm_model"),
-            harness=raw.get("harness"),
-            model_override=raw.get("model_override"),
-            context_window=int(raw_cw) if raw_cw is not None else None,
-            last_total_tokens=int(raw_ltt) if raw_ltt is not None else None,
-            last_task_error=raw.get("last_task_error"),
-            external_session_id=raw.get("external_session_id"),
-            archived=bool(raw.get("archived", False)),
-        )
-
-
-@dataclass(frozen=True)
-class SessionListItem:
-    """
-    Lightweight session summary from ``GET /v1/sessions``.
-
-    Same shape as :class:`Session` minus ``items``. Used by the
-    REPL's ``/switch`` command and similar list views.
-
-    :param id: Session/conversation identifier,
-        e.g. ``"conv_abc123"``.
-    :param agent_id: Durable identifier of the bound agent.
-    :param status: Derived session lifecycle status.
-    :param created_at: Unix epoch seconds of creation.
-    :param updated_at: Unix epoch seconds of last update.
-    :param title: Optional human-readable title.
-    :param labels: Session-scoped guardrails labels.
-    :param runner_id: Runner currently bound to the session.
-    :param host_id: Host that launched the runner for this session,
-        or ``None`` for sessions without a host binding (e.g. a
-        caller-managed runner). Native resume pickers rely on it to
-        drop rows bound to other hosts, whose runtime state is not
-        reachable from the invoking machine.
-    :param reasoning_effort: Per-session reasoning-effort hint.
-    :param owner: User ID of the session owner.
-    :param external_session_id: Runtime-native session id this
-        conversation wraps (e.g. Claude Code's session uuid for
-        ``omnigent claude`` sessions). ``None`` for regular AP-only
-        conversations.
-    :param pending_elicitations_count: Number of approval prompts
-        currently waiting on this session. Powers the web sidebar's
-        "needs attention" badge so a user with several sessions
-        running can tell which ones are blocked on them. ``0`` when
-        the session has no outstanding prompts.
-    :param archived: Whether the session is archived. Returned by
-        ``list`` only when ``include_archived=True``. ``False`` for
-        normal sessions.
-    """
-
-    id: str
-    agent_id: str
-    status: str
-    created_at: int
-    updated_at: int
-    title: str | None = None
-    labels: dict[str, str] = field(default_factory=dict)
-    runner_id: str | None = None
-    host_id: str | None = None
-    reasoning_effort: str | None = None
-    owner: str | None = None
-    external_session_id: str | None = None
-    pending_elicitations_count: int = 0
-    archived: bool = False
-
-    @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
-        """
-        Parse a :class:`SessionListItem` from a JSON dict.
-
-        :param raw: Raw JSON dict from the server.
-        :returns: A typed :class:`SessionListItem`.
-        :raises KeyError: If a required field is missing.
-        """
-        labels_raw = raw.get("labels", {})
-        return cls(
-            id=str(raw["id"]),
-            agent_id=str(raw["agent_id"]),
-            status=str(raw["status"]),
-            created_at=int(raw["created_at"]),
-            updated_at=int(raw["updated_at"]),
-            title=raw.get("title"),
-            labels=labels_raw if isinstance(labels_raw, dict) else {},
-            runner_id=raw.get("runner_id"),
-            host_id=raw.get("host_id"),
-            reasoning_effort=raw.get("reasoning_effort"),
-            owner=raw.get("owner"),
-            external_session_id=raw.get("external_session_id"),
-            pending_elicitations_count=raw.get("pending_elicitations_count", 0),
-            archived=bool(raw.get("archived", False)),
-        )
+# Private compatibility aliases.  The public root `omnigent_client.Session`
+# remains the legacy Responses helper exported from `_session.py`.
+SessionEventInput = PublicSessionEventInput
+Session = SessionResponse
+SessionListItem = ProtocolSessionListItem
 
 
 @dataclass(frozen=True)
@@ -481,7 +244,7 @@ class SessionsNamespace:
         resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
-        return Session.from_dict(created)
+        return Session.model_validate(created)
 
     async def resolve_agent(self, agent_name: str) -> RegisteredAgent:
         """
@@ -652,8 +415,7 @@ class SessionsNamespace:
         )
         raise_for_status(resp.status_code, response_body(resp))
         body = require_json_object(resp, "GET /v1/sessions")
-        data = body.get("data", [])
-        return [SessionListItem.from_dict(d) for d in data]  # type: ignore[attr-defined]
+        return SessionList.model_validate(body).data
 
     async def bind_runner(
         self,
@@ -682,7 +444,7 @@ class SessionsNamespace:
             json={"runner_id": runner_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
+        return Session.model_validate(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -705,7 +467,7 @@ class SessionsNamespace:
             json={"runner_id": ""},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
+        return Session.model_validate(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -736,7 +498,7 @@ class SessionsNamespace:
             json={"reasoning_effort": wire_effort},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
+        return Session.model_validate(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -781,7 +543,7 @@ class SessionsNamespace:
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
+        return Session.model_validate(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -814,7 +576,7 @@ class SessionsNamespace:
             json={"archived": archived},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
+        return Session.model_validate(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -849,7 +611,7 @@ class SessionsNamespace:
             json={"external_session_id": external_session_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(
+        return Session.model_validate(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -1022,12 +784,12 @@ class SessionsNamespace:
             f"{self._base}/v1/sessions/{session_id}",
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.from_dict(require_json_object(resp, "GET /v1/sessions/{session_id}"))
+        return Session.model_validate(require_json_object(resp, "GET /v1/sessions/{session_id}"))
 
     async def post_event(
         self,
         session_id: str,
-        event: dict[str, Any],
+        event: PublicSessionEventInput | dict[str, Any],
     ) -> dict[str, Any]:
         """
         Post an event/input item to a running session.
@@ -1040,14 +802,25 @@ class SessionsNamespace:
 
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :param event: The event payload, e.g.
+        :param event: A public event model or raw payload, e.g.
             ``{"type": "message", "data": {"role": "user",
             "content": [{"type": "input_text",
-            "text": "Hello"}]}}``. Must contain a ``type`` key;
-            ``data`` shape is validated server-side per ``type``.
+            "text": "Hello"}]}}``. Raw dictionaries are validated
+            against the public ``message`` / ``function_call_output`` /
+            ``interrupt`` allowlist before network I/O.
         :raises OmnigentError: If the server returns a non-2xx
             status (404 when the session does not exist).
         """
+        validated = _PUBLIC_SESSION_EVENT_ADAPTER.validate_python(event)
+        payload = validated.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return await self._post_event_payload(session_id, payload)
+
+    async def _post_event_payload(
+        self,
+        session_id: str,
+        event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Post an already-validated public or SDK-composed control event."""
         resp = await self._http.post(
             f"{self._base}/v1/sessions/{session_id}/events",
             json=event,
@@ -1155,7 +928,7 @@ class SessionsNamespace:
             ``"conv_abc123"``.
         :raises OmnigentError: If the server returns a non-2xx status.
         """
-        await self.post_event(
+        await self._post_event_payload(
             session_id,
             {"type": "compact", "data": {}},
         )
@@ -1184,7 +957,7 @@ class SessionsNamespace:
     async def stream(
         self,
         session_id: str,
-    ) -> AsyncIterator[ServerStreamEvent]:
+    ) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
         """
         Live-tail the session's SSE event stream.
 
@@ -1200,10 +973,9 @@ class SessionsNamespace:
 
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :yields: :class:`ServerStreamEvent` envelopes whose ``type`` is a
-            :class:`omnigent.server.schemas.ServerStreamEvent`
-            member and whose ``data`` is the event-specific payload
-            dict.
+        :yields: Known :class:`omnigent.protocol.ServerStreamEvent`
+            values or :class:`omnigent.protocol.UnknownEvent` for a
+            newer discriminator.
         :raises OmnigentError: If the server returns a non-2xx
             status when opening the stream (404 when the session
             does not exist).
@@ -1215,6 +987,48 @@ class SessionsNamespace:
         ):
             yield event
 
+    async def _open_stream_ready(
+        self,
+        session_id: str,
+    ) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
+        """Open a session stream and consume its registration heartbeat.
+
+        Advancing :meth:`stream` establishes
+        ``GET /v1/sessions/{session_id}/stream``. The server registers the
+        subscriber before immediately emitting ``session.heartbeat``; only
+        after that event has been consumed is it safe for a caller to submit
+        input without racing the live tail. This helper performs no writes,
+        tool dispatch, hooks, or orchestration.
+
+        The returned iterator starts after the readiness heartbeat and remains
+        caller-owned. A stream that closes or yields another event first is a
+        protocol failure and is closed before the error is raised.
+
+        :param session_id: Session/conversation identifier.
+        :returns: The already-open event iterator, positioned after readiness.
+        :raises OmnigentError: If the stream closes or emits another event
+            before its registration heartbeat.
+        """
+        stream_aiter = self.stream(session_id).__aiter__()
+        try:
+            ready_event = await stream_aiter.__anext__()
+            if ready_event.type != _STREAM_READY_EVENT_TYPE:
+                raise OmnigentError(
+                    "session stream did not begin with the required "
+                    f"{_STREAM_READY_EVENT_TYPE!r} readiness event; "
+                    f"received {ready_event.type!r}"
+                )
+        except StopAsyncIteration as exc:
+            await _aclose_stream(stream_aiter)
+            raise OmnigentError(
+                "session stream closed before the required "
+                f"{_STREAM_READY_EVENT_TYPE!r} readiness event"
+            ) from exc
+        except BaseException:
+            await _aclose_stream(stream_aiter)
+            raise
+        return stream_aiter
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -1223,7 +1037,7 @@ async def _stream_session_events(
     http: httpx.AsyncClient,
     base_url: str,
     session_id: str,
-) -> AsyncIterator[ServerStreamEvent]:
+) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
     """
     Open a single SSE connection and yield parsed
     :class:`ServerStreamEvent` instances.
@@ -1270,7 +1084,7 @@ async def _stream_session_events(
 
 async def _parse_sse_lines(
     line_stream: AsyncIterator[str],
-) -> AsyncIterator[ServerStreamEvent]:
+) -> AsyncIterator[ServerStreamEvent | UnknownEvent]:
     """
     Parse raw SSE text lines into :class:`ServerStreamEvent` instances.
 
@@ -1282,9 +1096,10 @@ async def _parse_sse_lines(
     that the server publishes; we feed it into Pydantic to enforce
     the :class:`ServerStreamEvent` discriminator.
 
-    Malformed payloads (non-JSON, non-dict, unknown event type) are
-    logged and skipped so a single bad event does not poison the
-    stream — same forward-compatibility posture as ``_sse.py``.
+    Malformed payloads (non-JSON, non-dict, or invalid known-event
+    shapes) are logged and skipped so a single bad event does not poison
+    the stream. Unknown event discriminators are yielded as
+    :class:`UnknownEvent` values instead of being dropped.
 
     :param line_stream: Async iterator of text lines from
         ``httpx.Response.aiter_lines()``.
@@ -1309,26 +1124,24 @@ async def _parse_sse_lines(
             current_event = None
 
 
-def _try_parse_envelope(raw: str) -> ServerStreamEvent | None:
+def _try_parse_envelope(raw: str) -> ServerStreamEvent | UnknownEvent | None:
     """
     Parse a single SSE ``data:`` payload into a typed
     :data:`ServerStreamEvent`.
 
     The server emits each event with a flat shape carrying the
     fields documented on the matching subclass in
-    :mod:`omnigent.server.schemas` (e.g. ``{"type":
+    :mod:`omnigent.protocol` (e.g. ``{"type":
     "response.output_text.delta", "delta": "Hello",
     "sequence_number": 5}``). The
     :data:`_SERVER_STREAM_EVENT_ADAPTER` dispatches on ``type`` to
-    the right concrete model; unknown event names raise
-    ``ValueError`` from the validator and are logged + skipped here
-    for forward compatibility.
+    the right concrete model. Unknown event names become an
+    :class:`UnknownEvent` that retains the decoded payload.
 
     :param raw: Raw JSON string from an SSE ``data:`` field, e.g.
         ``'{"type": "response.output_text.delta", "delta": "Hi"}'``.
-    :returns: A typed :data:`ServerStreamEvent` (one of the
-        concrete event subclasses), or ``None`` if the payload is
-        malformed or names an unknown event type.
+    :returns: A typed known event, an :class:`UnknownEvent`, or
+        ``None`` when the payload is malformed.
     """
     try:
         decoded = json.loads(raw)
@@ -1338,13 +1151,28 @@ def _try_parse_envelope(raw: str) -> ServerStreamEvent | None:
     if not isinstance(decoded, dict):
         _log.warning("SSE data is not a JSON object: %s", raw[:200])
         return None
+    event_type = decoded.get("type")
+    if isinstance(event_type, str) and event_type not in SERVER_STREAM_EVENT_TYPES:
+        return UnknownEvent(type=event_type, raw=decoded)
     try:
         return _SERVER_STREAM_EVENT_ADAPTER.validate_python(decoded)
     except ValueError as exc:
         # ValueError covers Pydantic ValidationError (a subclass) for
-        # unknown discriminator values and missing required fields.
+        # missing discriminators and invalid or missing required fields.
         # Log + skip so a single bad event does not abort the
         # iteration; the caller still observes every well-formed
         # event in arrival order.
         _log.debug("Skipping unparseable session event: %s (%s)", raw[:200], exc)
         return None
+
+
+async def _aclose_stream(
+    iterator: AsyncIterator[ServerStreamEvent | UnknownEvent],
+) -> None:
+    """Close an iterator returned by :meth:`SessionsNamespace.stream`."""
+    aclose = getattr(iterator, "aclose", None)
+    assert aclose is not None, (
+        "SessionsNamespace.stream() must return an async generator "
+        "exposing aclose(); got an iterator without it"
+    )
+    await aclose()

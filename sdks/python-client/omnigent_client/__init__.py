@@ -59,6 +59,7 @@ from ._errors import (
     ToolCallDenied,
 )
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
+from ._not_given import NOT_GIVEN, NotGiven
 from ._query import QueryResult, QueryStream
 from ._server import LocalServer
 from ._session import Session
@@ -83,6 +84,7 @@ from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
     "MCP_ELICITATION_METHOD",
+    "NOT_GIVEN",
     "TERMINAL_TASK_STATUSES",
     "AnyBlock",
     "BlockContext",
@@ -95,6 +97,7 @@ __all__ = [
     "FileBlock",
     "LocalServer",
     "NativeToolBlock",
+    "NotGiven",
     "OmnigentClient",
     "OmnigentError",
     "QueryResult",

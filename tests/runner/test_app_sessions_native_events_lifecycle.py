@@ -250,6 +250,207 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_payload,config_key,expected_value",
+    [
+        (
+            {"type": "model_change", "model": "gpt-5.4-mini"},
+            "model",
+            "gpt-5.4-mini",
+        ),
+        (
+            {"type": "effort_change", "effort": "high"},
+            "model_reasoning_effort",
+            "high",
+        ),
+    ],
+    ids=["model_change", "effort_change"],
+)
+async def test_events_codex_native_settings_change_mirrors_config_toml(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_payload: dict[str, Any],
+    config_key: str,
+    expected_value: str,
+) -> None:
+    """
+    A web model / effort switch lands in the pane's durable ``config.toml``.
+
+    ``thread/settings/update`` changes only the live thread; the pane and the
+    forwarder treat ``config.toml`` as the durable store (what an in-TUI
+    ``/model`` writes and each turn boundary re-reads). Without the mirror
+    write the web pick never durably reaches the pane and the next config
+    re-read silently reverts it.
+    """
+    import tomllib
+
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
+
+    conv_id = "9a1b2c3d4e5f60718293a4b5c6d7e8f9"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text('model = "gpt-5.4"\n')
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+            active_turn_id=None,
+        ),
+    )
+
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str, *, client_name: str = "omnigent"
+    ) -> _RecordingCodexAppServerClient:
+        assert transport == fake_client.transport
+        assert client_name == fake_client.client_name
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", _fake_client_for_transport
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json=event_payload,
+        )
+
+    assert resp.status_code == 204, resp.text
+    assert fake_client.requests, "the live thread/settings/update must still be sent"
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config.get(config_key) == expected_value, (
+        f"codex-native {event_payload['type']} must mirror the applied value into "
+        f"config.toml so the switch survives the next config re-read; "
+        f"config.toml carries {config!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_codex_native_settings_update_failure_leaves_config_toml(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A rejected ``thread/settings/update`` must not touch ``config.toml``.
+
+    The mirror write records a switch the live thread ACCEPTED; writing it when
+    the RPC failed would durably claim a model the pane never moved onto.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
+
+    conv_id = "0f9e8d7c6b5a49382716059483726150"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = codex_home_for_bridge_dir(bridge_dir)
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text('model = "gpt-5.4"\n')
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(codex_home),
+            active_turn_id=None,
+        ),
+    )
+
+    class _RejectingCodexAppServerClient(_RecordingCodexAppServerClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            await super().request(method, params)
+            raise RuntimeError("settings update rejected")
+
+    fake_client = _RejectingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210",
+        client_name="omnigent-codex-native-runner",
+    )
+
+    def _fake_client_for_transport(
+        transport: str, *, client_name: str = "omnigent"
+    ) -> _RecordingCodexAppServerClient:
+        return fake_client
+
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", _fake_client_for_transport
+    )
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5.4"},
+        ),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "gpt-5.4-mini"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    assert 'model = "gpt-5.4"' in (codex_home / "config.toml").read_text(), (
+        "a failed thread/settings/update must leave the durable model untouched"
+    )
+
+
+@pytest.mark.asyncio
 async def test_events_codex_native_plan_mode_change_preserves_developer_instructions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

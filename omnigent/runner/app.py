@@ -5509,6 +5509,10 @@ def create_runner_app(
         settings: _JsonObject,
     ) -> Response:
         from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.bridge import (
+            write_codex_config_effort,
+            write_codex_config_model,
+        )
 
         if not settings:
             return Response(status_code=204)
@@ -5559,6 +5563,31 @@ def create_runner_app(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        # The RPC switches only the live thread; mirror the applied values into
+        # config.toml (the pane's durable store that in-TUI /model writes and
+        # the forwarder re-reads) or the switch silently reverts at the next
+        # re-read. Model first: its clamp may rewrite a stale effort.
+        bridge_dir = await _codex_native_bridge_dir_for_session(conv_id)
+        switched_model = settings.get("model")
+        if isinstance(switched_model, str) and switched_model:
+            if not write_codex_config_model(bridge_dir, switched_model):
+                _logger.warning(
+                    "Failed to mirror codex-native model switch into config.toml: "
+                    "session=%s model=%s",
+                    conv_id,
+                    switched_model,
+                    extra={"session_id": conv_id},
+                )
+        switched_effort = settings.get("effort")
+        if isinstance(switched_effort, str) and switched_effort:
+            if not write_codex_config_effort(bridge_dir, switched_effort):
+                _logger.warning(
+                    "Failed to mirror codex-native effort switch into config.toml: "
+                    "session=%s effort=%s",
+                    conv_id,
+                    switched_effort,
+                    extra={"session_id": conv_id},
+                )
         return Response(status_code=204)
 
     async def _codex_native_model_and_effort_for_settings_update(

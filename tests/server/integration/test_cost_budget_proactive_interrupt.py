@@ -236,7 +236,7 @@ async def _set_up_over_budget_tree(
 @pytest.fixture()
 def interrupted_sessions(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record runner interrupt targets without requiring online runners."""
-    import omnigent.server.routes.sessions as sessions_facade
+    from omnigent.server.routes import sessions as sessions_facade
 
     interrupted: list[str] = []
 
@@ -302,7 +302,7 @@ async def test_budget_deny_at_parent_interrupts_running_child(
     # helpers-layer proxies resolve it at call time), the same mechanism the
     # human-decline path uses. Record every change dispatched and to which
     # session, without touching a runner (best-effort forward).
-    import omnigent.server.routes.sessions as sessions_facade
+    from omnigent.server.routes import sessions as sessions_facade
 
     dispatched: list[tuple[str, dict[str, Any]]] = []
     real_forward = sessions_facade._forward_session_change_to_runner
@@ -363,7 +363,7 @@ async def test_budget_deny_at_web_prompt_interrupts_running_child(
     store = SqlAlchemyConversationStore(db_uri)
     parent_id, child_id = await _set_up_over_budget_tree(client, store)
 
-    import omnigent.server.routes.sessions as sessions_facade
+    from omnigent.server.routes import sessions as sessions_facade
 
     dispatched: list[tuple[str, dict[str, Any]]] = []
 

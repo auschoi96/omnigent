@@ -35,6 +35,12 @@ Pass the server URL explicitly. The clients also accept caller-supplied HTTPX
 authentication, headers, or an HTTP client; they do not discover credentials or
 select CLI profiles.
 
+For a Databricks notebook walkthrough—from installing the matching fork wheels
+through a streamed turn, follow-up input, durable history, and explicit
+cleanup—import
+[`examples/databricks_sessions_quickstart.py`](examples/databricks_sessions_quickstart.py)
+as a Databricks source notebook.
+
 ## Synchronous quickstart
 
 <!-- sdk-example: executable -->

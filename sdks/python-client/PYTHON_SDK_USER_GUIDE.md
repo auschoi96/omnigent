@@ -8,10 +8,17 @@ items, events, and acknowledgements use the canonical public models in
 `omnigent.protocol`. OpenAI Agents influenced some Python ergonomics, but
 OmniGent retains its own resources, event names, and lifecycle semantics.
 
-For exact route contracts and complete signatures, see
-[`SDK_CONTRACT.md`](SDK_CONTRACT.md). For a runnable Databricks walkthrough,
-see
-[`examples/databricks_sessions_quickstart.py`](examples/databricks_sessions_quickstart.py).
+Use this guide for normal SDK work, then refer to the authoritative sources
+when more detail is needed:
+
+- [`SDK_CONTRACT.md`](SDK_CONTRACT.md) for exact routes, signatures, and
+  stability classifications;
+- [the OmniGent server API](../../omnigent/server/API.md) for server-side
+  lifecycle and wire semantics;
+- [the protocol-boundary design](../../designs/PYTHON_SDK_PROTOCOL_BOUNDARY.md)
+  for type ownership and compatibility decisions; and
+- [`examples/databricks_sessions_quickstart.py`](examples/databricks_sessions_quickstart.py)
+  for a runnable Databricks walkthrough.
 
 ## What changed in the mature SDK
 

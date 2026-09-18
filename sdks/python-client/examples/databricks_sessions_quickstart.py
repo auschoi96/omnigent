@@ -68,8 +68,9 @@ agents = client.agents.list(limit=100, order="asc")
 # MAGIC
 # MAGIC `sessions.create(...)` is the high-level operation. It creates the durable
 # MAGIC session, opens its live stream, submits the input, and asks the server to
-# MAGIC provision its default managed sandbox. The loop only displays streamed
-# MAGIC text as it arrives.
+# MAGIC provision its default managed sandbox. The 300-second request timeout
+# MAGIC covers a managed sandbox cold start; it is not an agent-run deadline. The
+# MAGIC loop only displays streamed text as it arrives.
 
 # COMMAND ----------
 
@@ -80,6 +81,7 @@ with client.agents.sessions.create(
     input="Create tree.py, run it, and show me its output.",
     stream=True,
     host_type="managed",
+    timeout=300.0,
 ) as events:
     session_id = events.session_id
     print(f"Session: {session_id}\n")
@@ -110,6 +112,7 @@ with client.agents.sessions.events.stream(session_id) as events:
         events=SessionMessage.text(
             "Add a --max-depth option, run tree.py with --max-depth 2, and show me the output."
         ),
+        timeout=300.0,
     )
     for event in events:
         if isinstance(event, OutputTextDeltaEvent):

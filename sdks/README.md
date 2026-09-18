@@ -1,167 +1,48 @@
 # SDKs
 
-Python packages for integrating with omnigent.
+Python packages for integrating with OmniGent's existing REST APIs.
 
-## Structure
-
-```
+```text
 sdks/
-  python-client/           # Headless HTTP/SSE client
-    pyproject.toml
-    omnigent_client/    # import omnigent_client
-  ui/                      # Terminal UI layer (Rich + prompt_toolkit)
-    pyproject.toml
-    omnigent_ui_sdk/    # import omnigent_ui_sdk
-      terminal/
+  python-client/              # HTTP/SSE client; import omnigent_client
+  ui/                         # Terminal UI; import omnigent_ui_sdk
 ```
 
-Claude Code skills for SDK development live under `.claude/skills/`.
+All packages require Python 3.12 or newer and are released with the same version
+number. Mixed versions of `omnigent`, `omnigent-client`, and
+`omnigent-ui-sdk` are unsupported; see the
+[client compatibility table](python-client/README.md#installation-and-compatibility).
 
-## `omnigent_client` — the headless client
+## `omnigent-client`
 
-Pure HTTP/SSE client. No Rich, no prompt_toolkit, no terminal
-dependencies. Use this for:
+Use the client package for scripts, services, bots, tests, and custom
+frontends. Its primary API is the typed `client.agents.sessions` resource tree.
 
-- Scripts that invoke an agent and collect output.
-- Web frontends, Slack bots, test harnesses — anything non-terminal.
-- As the foundation layer for `omnigent_ui_sdk` below.
+The async equivalent is `AsyncOmnigent`. Both use native HTTPX I/O and share
+the same session operations, canonical `omnigent.protocol` models, pagination,
+errors, and stream semantics. See the
+[complete client guide](python-client/README.md) for follow-up input, durable
+recovery, session files, subagents, preview elicitations, migration guidance,
+and executable sync and async examples.
 
-Three levels of abstraction are available:
+`client.responses` and the root `Session` remain compatibility surfaces over
+the removed `/v1/responses` route. Global file methods remain runtime-error
+stubs because `/v1/files` was removed. `BlockStream` and its transforms are
+optional presentation conveniences, but are not the foundation of the
+session-native HTTP/SSE transport.
 
-1. **Raw events** — `session.send()` yields typed wire events
-   (`ResponseCreated`, `TextDelta`, `ToolCallDone`, etc.). 1:1 with SSE.
-2. **Semantic blocks** — `BlockStream` folds events into higher-level
-   units (`TextChunk`, `ToolGroup`, `ReasoningBlock`, …). Frameworks
-   consuming these don't need to reimplement the stream state machine.
-3. **Composable transforms** — `pipe`, `skip_blocks`,
-   `skip_intermediate_ends`, `merge_text_across_iterations`, `only_agent`.
+## `omnigent-ui-sdk`
 
-### Install
+The UI package contains the Rich and prompt_toolkit components used by the
+OmniGent terminal frontend, including `RichBlockFormatter` and `TerminalHost`.
+It layers on `omnigent-client` and retains the existing block presentation
+types required by that UI; it does not define a second REST client.
+
+Install the package matching the rest of the environment:
 
 ```bash
-pip install -e sdks/python-client
+pip install omnigent-ui-sdk
 ```
 
-### Minimal invocation
-
-```python
-import asyncio
-from omnigent_client import OmnigentClient
-
-async def main():
-    async with OmnigentClient(base_url="http://localhost:8080") as client:
-        session = client.session(model="archer")
-        async for event in session.send("hello"):
-            print(event)
-
-asyncio.run(main())
-```
-
-### Using semantic blocks (web, Slack, or any custom UI)
-
-```python
-from omnigent_client import (
-    BlockStream, TextChunk, ToolGroup, ResponseEndBlock,
-    pipe, skip_intermediate_ends,
-)
-
-async def handle(websocket, session, text):
-    block_stream = BlockStream()
-    async for block in pipe(
-        block_stream.stream(session, text),
-        skip_intermediate_ends(),
-    ):
-        match block:
-            case TextChunk(text=t):
-                await websocket.send_json({"type": "text", "chunk": t})
-            case ToolGroup(executions=execs):
-                await websocket.send_json({"type": "tools", "data": [
-                    {"name": e.name, "output": e.output} for e in execs
-                ]})
-            case ResponseEndBlock(status=s):
-                await websocket.send_json({"type": "done", "status": s})
-```
-
-## `omnigent_ui_sdk` — the terminal frontend
-
-Thin layer on top of `omnigent_client` for building terminal REPLs.
-Provides:
-
-- **RichBlockFormatter** — converts `StreamBlock` values to Rich
-  renderables. Subclass and override one method to customize.
-- **TerminalHost** — manages prompt_toolkit: pinned input bar,
-  background streaming, Escape to cancel, persistent history.
-
-### Install
-
-```bash
-pip install -e sdks/ui
-```
-
-(Pulls in `omnigent-client` as a dependency.)
-
-### Minimal REPL
-
-```python
-import asyncio
-from omnigent_client import (
-    OmnigentClient, LocalServer, BlockStream,
-    pipe, skip_intermediate_ends,
-)
-from omnigent_ui_sdk import RichBlockFormatter, TerminalHost
-
-async def main():
-    async with LocalServer(agent_path="./my-agent/") as server:
-        client = server.client
-        session = client.session(model="my-agent")
-        block_stream = BlockStream()
-        fmt = RichBlockFormatter()
-        host = TerminalHost(model_name="my agent")
-
-        async def on_input(text):
-            host.output(fmt.user_message(text))
-            async for block in pipe(
-                block_stream.stream(session, text),
-                skip_intermediate_ends(),
-            ):
-                for item in fmt.format(block):
-                    host.output(item)
-                await asyncio.sleep(0)
-
-        async with host:
-            host.output(fmt.welcome("my agent"))
-            await host.run(on_input)
-
-asyncio.run(main())
-```
-
-### Customization
-
-Override one formatter method:
-
-```python
-class MyFormatter(RichBlockFormatter):
-    def format_tool_group(self, block):
-        from rich.tree import Tree
-        tree = Tree("Tools")
-        for ex in block.executions:
-            tree.add(f"{ex.name} → {(ex.output or '')[:50]}")
-        return [tree]
-```
-
-Use transforms to reshape the block stream:
-
-```python
-from omnigent_client import pipe, skip_blocks, ReasoningBlock
-
-stream = pipe(
-    block_stream.stream(session, text),
-    skip_blocks(ReasoningBlock),  # Hide thinking
-)
-```
-
-## Reference Implementation
-
-The built-in REPL at `omnigent/repl/` demonstrates all features:
-streaming, tool calls, reasoning, slash commands, conversation
-switching, elapsed timer. See `omnigent/repl/_repl.py`.
+The built-in REPL under `omnigent/repl/` remains the reference implementation
+for terminal rendering, input handling, cancellation, and history.

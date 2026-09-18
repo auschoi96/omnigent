@@ -40,6 +40,14 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release-omnigent.yml"
+      - "README.md"
+      - "pyproject.toml"
+      - "omnigent/protocol/**"
+      - "omnigent/trusted_origin.py"
+      - "scripts/build_subpackages.py"
+      - "scripts/sdk_distribution_smoke.py"
+      - "sdks/python-client/**"
+      - "sdks/ui/**"
 
 permissions:
   contents: read
@@ -156,15 +164,32 @@ jobs:
           sys.exit(0 if (ui and has_index) else "WEB-UI BUNDLE MISSING FROM WHEEL")
           PY
 
-      # 6. GATE: the wheels install together and the CLI entry point imports,
-      #    resolving deps from public PyPI (catches proxy-only deps).
+      # 6. GATE: install the lockstep wheel triple in isolation, then execute
+      #    the documented sync and async flows through the public imports.
+      #    `-I` prevents the checkout from masking a broken wheel.
       - name: Smoke-install the built wheels
         run: |
-          uv venv --python 3.12 /tmp/omnigent-smoke
-          uv pip install --python /tmp/omnigent-smoke/bin/python dist/*.whl
-          /tmp/omnigent-smoke/bin/omnigent --version
+          uv venv --python 3.12 /tmp/omnigent-wheel-smoke
+          uv pip install --python /tmp/omnigent-wheel-smoke/bin/python \
+            dist/omnigent-[0-9]*.whl \
+            dist/omnigent_client-*.whl \
+            dist/omnigent_ui_sdk-*.whl
+          /tmp/omnigent-wheel-smoke/bin/omnigent --version
+          /tmp/omnigent-wheel-smoke/bin/python -I scripts/sdk_distribution_smoke.py
 
-      # 7. Persist the built artifacts for inspection.
+      # 7. GATE: repeat the public-import and executable-documentation smoke
+      #    from the three sdists. This catches incomplete source distributions
+      #    and build-isolation failures that wheel-only checks cannot detect.
+      - name: Smoke-install the built sdists
+        run: |
+          uv venv --python 3.12 /tmp/omnigent-sdist-smoke
+          uv pip install --python /tmp/omnigent-sdist-smoke/bin/python \
+            dist/omnigent-*.tar.gz \
+            dist/omnigent_client-*.tar.gz \
+            dist/omnigent_ui_sdk-*.tar.gz
+          /tmp/omnigent-sdist-smoke/bin/python -I scripts/sdk_distribution_smoke.py
+
+      # 8. Persist the built artifacts for inspection.
       - name: Upload built distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

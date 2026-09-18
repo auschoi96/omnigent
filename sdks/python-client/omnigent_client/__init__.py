@@ -1,29 +1,10 @@
-"""omnigent client SDK — Python client for the omnigent server API.
+"""Typed sync and async clients for the OmniGent HTTP and SSE APIs.
 
-Headless HTTP/SSE client for invoking agents, tracking conversation
-state, and consuming the response stream as either raw events or
-semantic blocks. No UI or terminal dependencies — frontends layer
-on top of this.
-
-Usage::
-
-    from omnigent_client import OmnigentClient
-
-    async with OmnigentClient(base_url="http://localhost:8080") as client:
-        session = client.session(model="archer")
-        async for event in session.send("hello"):
-            ...
-
-Or consume semantic blocks via :class:`BlockStream`::
-
-    from omnigent_client import BlockStream, pipe, skip_intermediate_ends
-
-    stream = BlockStream()
-    async for block in pipe(
-        stream.stream(session, "hello"),
-        skip_intermediate_ends(),
-    ):
-        ...
+The primary interface is the ``client.agents.sessions`` resource tree.
+``AsyncOmnigent`` provides the same session resources with native async I/O.
+Legacy Responses and root ``Session`` exports remain available for
+compatibility. Block-stream transforms remain optional presentation helpers,
+not foundations for the session-native transport.
 """
 
 from omnigent.protocol import FunctionCallOutput, Interrupt, SessionMessage

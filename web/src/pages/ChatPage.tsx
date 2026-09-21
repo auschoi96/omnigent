@@ -28,9 +28,10 @@ import {
   FolderIcon,
   Loader2Icon,
   MessagesSquareIcon,
+  TriangleAlertIcon,
   XIcon,
 } from "lucide-react";
-import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
   KeyboardShortcutTooltipContent,
@@ -45,6 +46,7 @@ import {
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
+import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -225,6 +227,7 @@ import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import {
+  compactModelTriggerLabel,
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
@@ -729,11 +732,9 @@ export function ChatPage() {
   // Hoisted above the early-return guards so the title-update effect can read them.
   const activeConv = sessionConvId ? conversations?.find((c) => c.id === sessionConvId) : null;
 
-  // `isWorking` gates the parent's OWN turn (Stop/Interrupt) and must NOT
-  // include child-session activity. `showsWorking` is display-only (tab title
-  // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
-  // when the runner is known offline.
-  const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
+  // Keep the parent's Stop action live while its turn waits on an elicitation.
+  // Child activity and display suppression belong to `showsWorking` below.
+  const isWorking = computeIsWorking(sessionStatus);
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -872,7 +873,6 @@ export function ChatPage() {
   }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
   const sessionModelOverrideForEffort = useChatStore((s) => s.sessionModelOverride);
   // Pre-catalog fallback: a fresh native session's own catalog only arrives
@@ -898,14 +898,19 @@ export function ChatPage() {
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
-    hostProbeHarness !== null && sessionModelOptions.length === 0,
+    !activeSession?.inferenceConfigured &&
+      hostProbeHarness !== null &&
+      sessionModelOptions.length === 0,
   );
   // Identity-stable on purpose: substitute only when the host rows actually
   // exist, else keep the store's own array reference — a fresh [] here would
   // re-render every options consumer (composer, gear, agent-info popover) on
   // each streaming/liveness tick.
   const codexModelOptions =
-    sessionModelOptions.length === 0 && hostProbeOptions != null && hostProbeOptions.length > 0
+    !activeSession?.inferenceConfigured &&
+    sessionModelOptions.length === 0 &&
+    hostProbeOptions != null &&
+    hostProbeOptions.length > 0
       ? hostProbeOptions
       : sessionModelOptions;
 
@@ -1047,6 +1052,7 @@ export function ChatPage() {
       return {
         labels: activeSession.labels ?? {},
         harness: activeSession.harness,
+        inferenceConfigured: activeSession.inferenceConfigured,
         parentSessionId: activeSession.parentSessionId ?? null,
       };
     // Keep the seeded native identity through the temp-to-real ID handoff,
@@ -1076,8 +1082,7 @@ export function ChatPage() {
   ]);
   const modelPickerKind = modelPickerKindForConv(capabilitySource, codexModelOptions);
   // Effort ladders key on the model the session is actually on — the reported
-  // `llmModel` — then the session's pinned `model_override`, and only then the
-  // sticky preference. The override matters for a harness that never reports a
+  // `llmModel` — then the session's pinned `model_override`. The override matters for a harness that never reports a
   // concrete model (devin pins the family there): without it the lookup finds no
   // catalog row and a per-model ladder comes back empty, hiding the picker.
   // Memoized because codex-native resolves via codexEffortLevelsForModel, which
@@ -1089,9 +1094,9 @@ export function ChatPage() {
       effortLevelsForConv(
         capabilitySource,
         codexModelOptions,
-        llmModel ?? sessionModelOverrideForEffort ?? selectedModel,
+        llmModel ?? sessionModelOverrideForEffort,
       ),
-    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, selectedModel],
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -1126,7 +1131,12 @@ export function ChatPage() {
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
   if (urlConvId) {
-    if (loadingConversation || activeConversationId !== urlConvId) return <HydratingPlaceholder />;
+    const promotingTempConversation =
+      isTempConvId(urlConvId) &&
+      activeConversationId !== null &&
+      !isTempConvId(activeConversationId);
+    if (loadingConversation || (activeConversationId !== urlConvId && !promotingTempConversation))
+      return <HydratingPlaceholder />;
     if (conversationLoadError) {
       return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
     }
@@ -1158,6 +1168,8 @@ export function ChatPage() {
       showModels={modelPickerKind !== null}
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
+      inferenceConfigured={activeSession?.inferenceConfigured}
+      inferenceError={activeSession?.inferenceError}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
@@ -1436,6 +1448,8 @@ interface MainAgentSurfaceProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -1585,6 +1599,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   showModels,
   modelPickerKind,
   codexModelOptions,
+  inferenceConfigured,
+  inferenceError,
   modelLabelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
@@ -1890,6 +1906,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showModels={showModels}
             modelPickerKind={modelPickerKind}
             codexModelOptions={codexModelOptions}
+            inferenceConfigured={inferenceConfigured}
+            inferenceError={inferenceError}
             modelLabelOptions={modelLabelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
@@ -2015,6 +2033,8 @@ interface ComposerProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -2111,6 +2131,7 @@ export function buildSlashCommandMap(
   showBtw = false,
   showSide = false,
   skillPrefix: "/" | "$" = "/",
+  supportsModelReset = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2121,7 +2142,7 @@ export function buildSlashCommandMap(
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
     if (name === "/side" && !showSide) continue;
-    m[name] = description;
+    m[name] = name === "/model" && supportsModelReset ? `${description} | default` : description;
   }
   for (const skill of skills) {
     m[`${skillPrefix}${skill.name}`] = skill.description;
@@ -2358,6 +2379,8 @@ function ComposerImpl(
     showModels,
     modelPickerKind,
     codexModelOptions,
+    inferenceConfigured,
+    inferenceError,
     modelLabelOptions = codexModelOptions,
     showCodexPlanMode,
     showClaudePermissionMode = false,
@@ -2367,12 +2390,10 @@ function ComposerImpl(
     runnerStarting = false,
     showClaudeGoalControl = false,
     showPollyCodexGoalControl = false,
-    isTerminalFirst = false,
     isNativeWrapper = false,
     unreachable = false,
     onShowReconnectHelp,
     costRoutingEligible = false,
-    subagentRoutingEligible = false,
     subAgentLabel = null,
     wrapperLabel = null,
     onViewportShrinkPinScroll,
@@ -2528,6 +2549,7 @@ function ComposerImpl(
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
   const dequeueMessage = useChatStore((s) => s.dequeueMessage);
   const steerMessage = useChatStore((s) => s.steerMessage);
+  const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
@@ -2719,6 +2741,13 @@ function ComposerImpl(
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
+  // Configured sessions reset through their saved policy; native resets
+  // otherwise require a harness that can clear its live model override.
+  const supportsModelReset =
+    !!inferenceConfigured ||
+    (modelPickerKind
+      ? ["opencode", "acp", "configured"].includes(modelPickerKind)
+      : !isNativeWrapper);
   // /compact is functional for native wrappers (claude-native,
   // codex-native), which inject the slash command into the terminal, and
   // for claude-sdk, whose runner sends /compact to the live SDK client to
@@ -2743,8 +2772,18 @@ function ComposerImpl(
         showBtw,
         showSide,
         skillPrefix,
+        supportsModelReset,
       ),
-    [skills, showEffort, showModel, showCompact, showBtw, showSide, skillPrefix],
+    [
+      skills,
+      showEffort,
+      showModel,
+      showCompact,
+      showBtw,
+      showSide,
+      skillPrefix,
+      supportsModelReset,
+    ],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
@@ -2871,7 +2910,7 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
-  const showInterruptButton = isWorking && !hasDraft;
+  const showInterruptButton = isWorking && (!hasDraft || hasPendingElicitation);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
@@ -2991,12 +3030,18 @@ function ComposerImpl(
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
-          setCommandError(`Model: ${current}\nUsage: /model <name> · /model default to reset`);
+          setCommandError(
+            `Model: ${current}\nUsage: /model <name>${supportsModelReset ? " | default" : ""}`,
+          );
           return true;
         }
-        // ``default | off | reset`` clear the override (REPL clear aliases);
-        // ``setModel(null)`` sends the server's "default" clear sentinel.
-        const clear = ["default", "off", "reset"].includes(target.toLowerCase());
+        const reset = ["default", "off", "reset"].includes(target.toLowerCase());
+        if (reset && !supportsModelReset) {
+          setCommandError(
+            "This session does not support resetting the model. Choose a model with /model <name>.",
+          );
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3008,7 +3053,7 @@ function ComposerImpl(
         const harness = useChatStore.getState().sessionHarness;
         void useChatStore
           .getState()
-          .setModel(clear ? null : target, {
+          .setModel(reset ? null : target, {
             expectConfirmation: harness === "claude-native" || harness === "codex-native",
           })
           .catch((err: unknown) => {
@@ -3381,8 +3426,22 @@ function ComposerImpl(
 
   const handleKeyDown = (
     e: KeyboardEvent<HTMLTextAreaElement>,
-    { shouldSubmitFromKeyboard, shouldPreferSendOverCompletion }: ComposerKeyIntent,
+    {
+      shouldSubmitFromKeyboard,
+      shouldPreferSendOverCompletion,
+      shouldSteerAllFromKeyboard,
+    }: ComposerKeyIntent,
   ) => {
+    // Mod+Enter (Mod+Shift+Enter when Mod+Enter is already the send chord)
+    // steers everything: the draft, if any, is submitted first so it joins the
+    // queue tail (or sends directly when idle), then every queued message is
+    // sent into the running turn in FIFO order instead of draining one per idle.
+    if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
+      e.preventDefault();
+      if (!mentionListingPending) submit();
+      steerAllQueuedMessages(conversationId);
+      return;
+    }
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
@@ -3544,10 +3603,7 @@ function ComposerImpl(
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn(
-        "chat-composer-form relative px-4 md:px-6",
-        isTerminalFirst ? "pb-1.5" : "pb-3",
-      )}
+      className="chat-composer-form relative px-4 pb-[max(20px,env(safe-area-inset-bottom))] md:px-6"
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -3605,6 +3661,12 @@ function ComposerImpl(
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
         <ComposerWorkspaceBar data-testid="composer-workspace-controls">
+          <ComposerPrLink
+            state={composerGit.githubState}
+            prCount={composerGit.prCount}
+            prNumber={composerGit.prNumber}
+            onOpen={openComposerGithubTab}
+          />
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
             worktreePath={composerGit.worktreePath}
@@ -3612,24 +3674,17 @@ function ComposerImpl(
             branch={composerGit.branch}
             branchState={composerGit.branchState}
             creationBranch={composerGit.creationBranch}
-            onRefreshBranch={composerGit.refresh}
-            refreshing={composerGit.refreshing}
+            showWorktree={
+              composerGit.githubState === "ready" && composerGit.repoNameWithOwner !== null
+            }
           />
-          {/* Reserve two workspace triggers' icon-safe minima and two gaps;
-              only PR text truncates when the remaining status space runs out. */}
-          <div className="ml-auto flex min-w-0 max-w-[calc(100%-5.25rem)] shrink-0 items-center gap-1 md:max-w-[calc(100%-6.5rem)]">
-            <div className="flex min-w-0 items-center gap-2 empty:hidden">
-              <ComposerPrLink
-                prCount={composerGit.prCount}
-                prNumber={composerGit.prNumber}
-                onOpen={openComposerGithubTab}
-              />
-              <ComposerContextRing
-                contextWindow={composerContextWindow}
-                tokensUsed={composerTokensUsed}
-              />
-            </div>
+          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+            <ComposerContextRing
+              contextWindow={composerContextWindow}
+              tokensUsed={composerTokensUsed}
+            />
             <BackgroundTaskIndicator />
+            <SubagentTaskIndicator conversationId={conversationId} />
           </div>
         </ComposerWorkspaceBar>
       </div>
@@ -3923,6 +3978,10 @@ function ComposerImpl(
                 <ComposerPermissionPicker
                   label="Permission mode"
                   value={permissionLabel || "Permission mode"}
+                  harness={sessionHarness}
+                  selectedValue={
+                    showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
+                  }
                   options={permissionOptions}
                   disabled={isReadOnly || unreachable || configBusy}
                   onSelect={(mode) => void changePermission(mode)}
@@ -3946,15 +4005,15 @@ function ComposerImpl(
                   harnessLabel={harnessLabel}
                   showModels={showModels}
                   showEffort={showEffort}
-                  showClaudePermissionMode={showClaudePermissionMode}
-                  showCodexApprovalMode={showCodexApprovalMode}
                   effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
+                  supportsModelReset={supportsModelReset}
                   codexModelOptions={codexModelOptions}
+                  inferenceConfigured={inferenceConfigured}
+                  inferenceError={inferenceError}
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
-                  subagentRoutingEligible={subagentRoutingEligible}
                   // Config changes persist server-side and apply on the next
                   // wake/turn (the runner forward is best-effort), so the gear
                   // stays live wherever a message could be sent — including
@@ -4278,7 +4337,7 @@ const PI_NATIVE_EFFORT_LEVELS = [
 ] as const;
 
 type NativeModelPickerKind =
-  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp";
+  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4406,6 +4465,7 @@ export function modelPickerKindForConv(
         labels?: Record<string, string | null> | null;
         harness?: string | null;
         parentSessionId?: string | null;
+        inferenceConfigured?: boolean;
       }
     | null
     | undefined,
@@ -4439,6 +4499,7 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
+      if (conv?.inferenceConfigured) return "configured";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes
       // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
       if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
@@ -4448,7 +4509,13 @@ export function modelPickerKindForConv(
 
 export function shouldShowModelPicker(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+      }
+    | null
+    | undefined,
   modelOptions: readonly NativeModelOption[] = [],
 ): boolean {
   return modelPickerKindForConv(conv, modelOptions) !== null;
@@ -4552,16 +4619,11 @@ export function shouldShowPollyCodexGoalControl(
 function hasSessionConfig({
   showModels,
   showEffort,
-  costRoutingEligible,
 }: {
   showModels: boolean;
   showEffort: boolean;
-  costRoutingEligible: boolean;
-  subagentRoutingEligible: boolean;
-  showClaudePermissionMode: boolean;
-  showCodexApprovalMode: boolean;
 }): boolean {
-  return showModels || showEffort || costRoutingEligible;
+  return showModels || showEffort;
 }
 
 function SessionHarnessPicker({
@@ -4572,15 +4634,15 @@ function SessionHarnessPicker({
   harnessLabel,
   showModels,
   showEffort,
-  showClaudePermissionMode = false,
-  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
+  supportsModelReset,
   codexModelOptions,
+  inferenceConfigured,
+  inferenceError,
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
-  subagentRoutingEligible,
   disabled,
   openNonce = 0,
 }: {
@@ -4591,15 +4653,15 @@ function SessionHarnessPicker({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
-  showClaudePermissionMode?: boolean;
-  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
+  supportsModelReset: boolean;
   codexModelOptions: readonly NativeModelOption[];
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
-  subagentRoutingEligible: boolean;
   disabled: boolean;
   openNonce?: number;
 }) {
@@ -4653,17 +4715,15 @@ function SessionHarnessPicker({
   const configurable = hasSessionConfig({
     showModels,
     showEffort,
-    costRoutingEligible,
-    subagentRoutingEligible,
-    showClaudePermissionMode,
-    showCodexApprovalMode,
   });
   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
     : modelLabelLoading
       ? ""
-      : (modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
+      : compactModelTriggerLabel(
+          modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
+        );
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
@@ -4757,14 +4817,22 @@ function SessionHarnessPicker({
             ? {
                 testId: "composer-agent-models",
                 header: "Models",
+                leading:
+                  (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
+                    <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
+                      {inferenceError ?? "No usable models are available for this session."}
+                    </div>
+                  ) : undefined,
                 choices: [
-                  ...(!modelOptions.some((model) => model.isDefault)
+                  ...(supportsModelReset &&
+                  !inferenceConfigured &&
+                  !modelOptions.some((model) => model.isDefault)
                     ? [
                         {
                           key: "__default__",
                           label: "Default",
                           checked: !routingOn && pickerSelectedModel === null,
-                          disabled: busy || pendingModelChange !== null,
+                          disabled: busy || pendingModelChange !== null || !!inferenceError,
                           onSelect: () => selectModel(null),
                           testId: "composer-agent-model-default",
                         },
@@ -4777,13 +4845,12 @@ function SessionHarnessPicker({
                       !routingOn &&
                       (composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? isFusionModelUid(pickerSelectedModel)
-                        : model.id === pickerSelectedModel ||
-                          (pickerSelectedModel === null && model.isDefault === true)),
-                    disabled: busy || pendingModelChange !== null,
+                        : model.id === pickerSelectedModel),
+                    disabled: busy || pendingModelChange !== null || !!inferenceError,
                     onSelect: () =>
                       composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? selectFusionModel(composerFusion.default)
-                        : selectModel(model.isDefault ? null : model.id),
+                        : selectModel(supportsModelReset && model.isDefault ? null : model.id),
                     testId: `composer-agent-model-${model.id}`,
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
@@ -4924,9 +4991,30 @@ function SessionHarnessPicker({
         )}
       </HarnessPicker>
       {error && (
-        <span role="alert" className="max-w-40 text-xs text-destructive">
-          {error}
-        </span>
+        <TooltipProvider delayDuration={0}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label={`Couldn't update configuration: ${error}`}
+                className="flex size-7 shrink-0 items-center justify-center rounded-lg text-destructive hover:bg-destructive/10"
+                data-testid="composer-config-error"
+              >
+                <TriangleAlertIcon className="size-4" aria-hidden="true" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent
+              side="top"
+              className="w-72 max-w-[calc(100vw-2rem)] flex-col items-start gap-1 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-menu"
+              data-testid="composer-config-error-tooltip"
+            >
+              <strong className="font-medium">Couldn’t update configuration</strong>
+              <span className="text-xs leading-5 text-muted-foreground">
+                {error} Try again, or reconnect the session if the problem continues.
+              </span>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       )}
     </>
   );
@@ -4985,19 +5073,10 @@ function useSessionConfigSummary({
  * The effort this conversation is actually at.
  *
  * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
- * different efforts each read their own; `selectedEffort` is the single
- * app-global sticky pick, used only as the pre-hydration fallback. Reading the
- * sticky pick alone would show a warm-switched conversation the last effort
- * picked anywhere.
+ * different efforts each read their own.
  */
 function useSessionEffort(): string | null {
-  const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
-  const seeded = useChatStore((s) => s.sessionEffortSeeded);
-  const stickyEffort = useChatStore((s) => s.selectedEffort);
-  // A seeded conversation's effort is authoritative even when null (an
-  // intentional "no effort" from the create), so it never borrows the
-  // app-global sticky pick; only an unhydrated conversation falls back.
-  return seeded ? sessionReasoningEffort : (sessionReasoningEffort ?? stickyEffort);
+  return useChatStore((s) => s.sessionReasoningEffort);
 }
 
 /**
@@ -5034,7 +5113,8 @@ function useResolvedComposerModel(
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "devin" ||
-    modelPickerKind === "acp";
+    modelPickerKind === "acp" ||
+    modelPickerKind === "configured";
   const modelOptions: readonly {
     id: string;
     model?: string;
@@ -5048,9 +5128,8 @@ function useResolvedComposerModel(
   // native sessions: `llmModel` carries the verbatim reported model (the
   // launch's own report, or an in-pane switch), and the chip, the gear
   // highlight, and the hover summary all resolve from it alone. The user's
-  // request (`sessionModelOverride`) and the cross-session sticky
-  // (`selectedModel`) are inputs, never display state — rendering a request
-  // as if it were truth is exactly how a record/pane divergence hides.
+  // request (`sessionModelOverride`) is input, never display state — rendering
+  // a request as if it were truth is exactly how a record/pane divergence hides.
   const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
   // The row the reported model maps to: its catalog row when one matches
   // exactly (by id or wire model), else the raw reported value itself — the
@@ -5075,10 +5154,10 @@ function useResolvedComposerModel(
   // mirror both ways into ``model_override``. Those wrappers keep their
   // override-derived surface until they adopt reported-model semantics.
   // SDK/bundle agents (no native picker) resolve the session override or the
-  // bound default — never the cross-session sticky.
+  // bound default.
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
-    : sessionModelOverride;
+    : (sessionModelOverride ?? (modelPickerKind === "configured" ? llmModel : null));
   const effectiveModel = sessionModelSeeded
     ? (sessionModelOverride ?? llmModel)
     : nativeVendorOwnsModel

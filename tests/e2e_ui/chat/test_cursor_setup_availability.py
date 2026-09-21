@@ -112,4 +112,7 @@ def test_cursor_missing_cli_shows_install_and_login_guidance(
     badge = page.get_by_test_id(f"new-chat-landing-agent-warning-{_AGENT_ID}")
     expect(badge).to_be_visible()
     expect(badge).to_have_accessible_name("binary missing")
-    expect(badge).to_have_attribute("title", "binary missing")
+    badge.hover()
+    tooltip = page.get_by_role("tooltip")
+    expect(tooltip).to_be_visible()
+    expect(tooltip).to_contain_text("binary missing")

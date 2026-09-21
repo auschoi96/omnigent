@@ -325,7 +325,7 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
             return httpx.Response(200, json=session_json, request=httpx.Request("GET", url))
 
     assert (
@@ -632,6 +632,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -645,6 +646,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "loaded the resume thread"
         )
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
+        assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
         return retained_client if retain_client else None
 
@@ -856,7 +858,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     class _ForkSnapshotClient:
         """Server client returning a forked clone snapshot (no thread id)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
             """
             Return the clone's snapshot carrying fork labels but no thread id.
 
@@ -986,6 +988,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1261,6 +1264,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -1389,7 +1393,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     class _WorktreeSnapshotClient:
         """Server client whose session snapshot carries a worktree workspace."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
             """
             Return the session snapshot with a worktree ``workspace``.
 
@@ -1668,7 +1672,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
             """:returns: HTTP 200 fresh-session snapshot."""
             del timeout, url
             return httpx.Response(
@@ -3201,7 +3205,7 @@ async def test_codex_subagent_always_needs_runner_terminal(
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
             """
             Return child then parent session snapshots.
 
@@ -3766,6 +3770,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -4004,6 +4009,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

@@ -224,9 +224,12 @@ async def _serve_one_launch(
     # Bounded so a routing bug can't hang the test: stat + launch are
     # 2 frames, the rest of the budget absorbs interleaved pings. One deadline
     # for the whole exchange — a per-receive budget would multiply by 40.
-    deadline = Deadline(20.0)
+    deadline = Deadline(30.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
+        # Allow server work between stat and launch under CI load: a
+        # receive_output timeout cancels the mock host tunnel and makes
+        # a slow session create fail with a spurious "host is offline" 409.
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])
@@ -2461,6 +2464,21 @@ async def test_concurrent_relaunches_are_single_flight(
 
     set_runner_client(None)
 
+    launch_runner = sessions_module._launch_runner_on_host
+    both_callers_ready = asyncio.Event()
+    observed_bindings: list[str | None] = []
+
+    async def _race_launch(*args: Any, **kwargs: Any) -> Any:
+        observed_bindings.append(args[0].runner_id)
+        if len(observed_bindings) == 2:
+            both_callers_ready.set()
+        await both_callers_ready.wait()
+        return await launch_runner(*args, **kwargs)
+
+    # Both requests must snapshot the offline binding before either rotates it.
+    # With startup grace disabled, a later snapshot would request another launch.
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
+
     def _post() -> Any:
         return client.post(
             f"/v1/sessions/{session_id}/events",
@@ -2476,6 +2494,8 @@ async def test_concurrent_relaunches_are_single_flight(
     tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
     launches: list[HostLaunchRunnerFrame] = []
     try:
+        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
+        assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.

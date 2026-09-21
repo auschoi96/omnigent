@@ -35,17 +35,13 @@ Pass the server URL explicitly. The clients also accept caller-supplied HTTPX
 authentication, headers, or an HTTP client; they do not discover credentials or
 select CLI profiles.
 
-For an interactive Databricks-hosted session using this checkout of the SDK,
-run [`examples/databricks_sessions_quickstart.py`](examples/databricks_sessions_quickstart.py)
-from the repository root. It requires an explicit Databricks CLI profile, lets
-you choose a registered agent, keeps one durable session across prompts, and
-supports approval requests, attachments, and resource inspection:
-
-```bash
-uv run --frozen --extra all \
-  python sdks/python-client/examples/databricks_sessions_quickstart.py \
-  --profile <PROFILE>
-```
+[`examples/databricks_sessions_quickstart.py`](examples/databricks_sessions_quickstart.py)
+is an exported Databricks notebook source file. Import it into a Databricks
+workspace and run its cells from top to bottom. It starts with one managed
+agent task, then progressively demonstrates published events, explicit
+approvals, delegated-task following, follow-up input, durable history,
+subagents, session files, and cleanup. It uses the current notebook's workspace
+authentication and requires no widgets or Databricks App lookup.
 
 ## Synchronous quickstart
 

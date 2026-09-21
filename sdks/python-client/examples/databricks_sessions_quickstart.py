@@ -1,219 +1,481 @@
-# Databricks notebook source
-# ruff: noqa: E402, E501, F704, I001
-# pyrefly: ignore-errors
-# MAGIC %md
-# MAGIC # Run an OmniGent agent from Databricks
-# MAGIC
-# MAGIC This quickstart connects directly to an OmniGent REST server, starts a
-# MAGIC durable session, shows its public events and durable items, prompts for
-# MAGIC real server-published approvals, and waits for delegated work to settle.
-# MAGIC The first run uses one high-level `SessionsChat.run(...)` call; later
-# MAGIC cells show how to continue and inspect the same session.
-# MAGIC
-# MAGIC The notebook displays reasoning and tool activity included in the
-# MAGIC server's public events.
+#!/usr/bin/env python3
+"""Chat interactively with a Databricks-hosted OmniGent server.
 
-# COMMAND ----------
+Run this from the repository root so ``uv`` installs the SDK from the current
+checkout instead of PyPI::
 
-# MAGIC %pip install --upgrade \
-# MAGIC   "omnigent @ git+https://github.com/auschoi96/omnigent.git@sdk-v2-base" \
-# MAGIC   "omnigent-client @ git+https://github.com/auschoi96/omnigent.git@sdk-v2-base#subdirectory=sdks/python-client" \
-# MAGIC   "omnigent-ui-sdk @ git+https://github.com/auschoi96/omnigent.git@sdk-v2-base#subdirectory=sdks/ui" \
-# MAGIC   "databricks-sdk>=0.56,<1"
+    uv run --frozen --extra all \
+      python sdks/python-client/examples/databricks_sessions_quickstart.py \
+      --profile <PROFILE>
 
-# COMMAND ----------
+The script never chooses a Databricks profile for you. If ``--agent-id`` is
+omitted, it displays the registered agents and asks which one to use.
+"""
 
-from databricks.sdk.runtime import dbutils
+from __future__ import annotations
 
-dbutils.library.restartPython()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 1. Connect to the OmniGent server
-# MAGIC
-# MAGIC This example uses the managed OmniGent endpoint in the current
-# MAGIC Databricks workspace. `WorkspaceClient` supplies only the workspace URL
-# MAGIC and authentication; all agent operations go directly to OmniGent.
-
-# COMMAND ----------
-
+import argparse
+import asyncio
+import json
+import shlex
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import urlsplit
 
+import httpx
 from databricks.sdk import WorkspaceClient
-from omnigent_client import AsyncOmnigent
-
-workspace = WorkspaceClient()
-workspace_url = urlsplit(workspace.config.host)
-if workspace_url.scheme != "https" or not workspace_url.netloc:
-    raise RuntimeError("The current Databricks workspace has no secure URL.")
-
-OMNIGENT_BASE_URL = f"{workspace_url.scheme}://{workspace_url.netloc}/api/2.0/omnigent"
-client = AsyncOmnigent(
-    base_url=OMNIGENT_BASE_URL,
-    headers=workspace.config.authenticate(),
-    timeout=300.0,  # allows managed-sandbox cold starts on ordinary requests
+from omnigent_client import (
+    AgentObject,
+    AsyncCursorPage,
+    AsyncOmnigent,
+    ElicitationRequestCtx,
+    OmnigentError,
+    OutputItemDoneEvent,
+    OutputTextDeltaEvent,
+    ServerStreamEvent,
+    SessionItem,
+    StreamHooks,
+    UnknownEvent,
 )
 
-# The same SDK works with an OmniGent server hosted anywhere:
-# client = AsyncOmnigent(
-#     base_url="https://omnigent.example.com",
-#     headers={"Authorization": "Bearer <token>"},
-#     timeout=300.0,
-# )
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 2. Choose an agent
-# MAGIC
-# MAGIC Sessions use agents already registered on the connected server. Copy an
-# MAGIC `id` from this result into `AGENT_ID`.
-
-# COMMAND ----------
-
-agents = await client.agents.list(limit=100, order="asc")
-[(agent.id, agent.name) for agent in agents]
-
-# COMMAND ----------
-
-AGENT_ID = "<registered-agent-id>"
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 3. Choose what the notebook displays
-# MAGIC
-# MAGIC `show_event` receives canonical typed stream events. `show_item`
-# MAGIC receives canonical durable `SessionItem` values from the root or a
-# MAGIC descendant session. The approval callback runs only for a real
-# MAGIC `ElicitationRequestEvent`; ordinary assistant text never triggers it.
-
-# COMMAND ----------
-
-from omnigent.protocol import ServerStreamEvent, SessionItem, UnknownEvent
-from omnigent_client import ElicitationRequestCtx, StreamHooks
+@dataclass(frozen=True)
+class Options:
+    profile: str
+    agent_id: str | None
+    base_url: str | None
+    host_type: Literal["external", "managed"]
+    sandbox_provider: str | None
+    workspace: str | None
+    timeout: float
+    poll_interval: float
+    quiet_period: float
+    max_depth: int
+    verbose_events: bool
 
 
-def show_event(event: ServerStreamEvent | UnknownEvent) -> None:
-    """Print every public event from the initial live response."""
-    print(f"\n[live · {event.type}]")
-    print(event.to_json(indent=2))
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
 
 
-def show_item(session_id: str, item: SessionItem) -> None:
-    """Print each newly observed durable item across the known session tree."""
-    print(f"\n[{session_id} · {item.type}]")
-    print(item.to_json(indent=2))
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
 
 
-def approve_or_decline(ctx: ElicitationRequestCtx) -> bool:
-    """Require an explicit decision for a server-published elicitation."""
+def parse_args(argv: Sequence[str] | None = None) -> Options:
+    parser = argparse.ArgumentParser(
+        description="Chat with a Databricks-hosted OmniGent server using this checkout."
+    )
+    parser.add_argument(
+        "--profile",
+        required=True,
+        help="Databricks CLI profile to use (never selected automatically).",
+    )
+    parser.add_argument(
+        "--agent-id",
+        help="Registered agent id. Omit it to choose interactively.",
+    )
+    parser.add_argument(
+        "--base-url",
+        help=("OmniGent API base URL. Defaults to https://<workspace-host>/api/2.0/omnigent."),
+    )
+    parser.add_argument(
+        "--host-type",
+        choices=("external", "managed"),
+        default="managed",
+        help="Session host type (default: managed).",
+    )
+    parser.add_argument(
+        "--sandbox-provider",
+        help="Optional managed-sandbox provider configured on the server.",
+    )
+    parser.add_argument(
+        "--workspace",
+        help="Optional workspace path or repository URL passed to session creation.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=_non_negative_float,
+        default=1200.0,
+        help="Maximum seconds for each prompt and follow operation (default: 1200).",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=_non_negative_float,
+        default=1.0,
+        help="Seconds between durable session-tree checks (default: 1).",
+    )
+    parser.add_argument(
+        "--quiet-period",
+        type=_non_negative_float,
+        default=5.0,
+        help=(
+            "Seconds the known session tree must stay idle before the next prompt "
+            "(default: 5; use 60 for conservative delegated-task following)."
+        ),
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=_non_negative_int,
+        default=3,
+        help="Maximum descendant-session depth to follow (default: 3).",
+    )
+    parser.add_argument(
+        "--verbose-events",
+        action="store_true",
+        help="Print every canonical stream event as JSON.",
+    )
+    values = parser.parse_args(argv)
+    return Options(
+        profile=values.profile,
+        agent_id=values.agent_id,
+        base_url=values.base_url,
+        host_type=values.host_type,
+        sandbox_provider=values.sandbox_provider,
+        workspace=values.workspace,
+        timeout=values.timeout,
+        poll_interval=values.poll_interval,
+        quiet_period=values.quiet_period,
+        max_depth=values.max_depth,
+        verbose_events=values.verbose_events,
+    )
+
+
+def _omnigent_base_url(workspace: WorkspaceClient, override: str | None) -> str:
+    if override is not None:
+        parsed = urlsplit(override)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError("--base-url must be an absolute HTTPS URL")
+        return override.rstrip("/")
+
+    workspace_url = urlsplit(workspace.config.host)
+    if workspace_url.scheme != "https" or not workspace_url.netloc:
+        raise RuntimeError("The selected Databricks profile has no secure workspace URL.")
+    return f"{workspace_url.scheme}://{workspace_url.netloc}/api/2.0/omnigent"
+
+
+async def _all_agents(client: AsyncOmnigent) -> list[AgentObject]:
+    agents: list[AgentObject] = []
+    page = await client.agents.list(limit=100, order="asc")
+    while True:
+        agents.extend(page)
+        if not page.has_more:
+            return agents
+        page = await page.get_next_page()
+
+
+def _print_agents(agents: Sequence[AgentObject]) -> None:
+    print("\nRegistered agents:")
+    for index, agent in enumerate(agents, start=1):
+        print(f"  {index:>2}. {agent.name or '(unnamed)'}  [{agent.id}]")
+
+
+async def _choose_agent(client: AsyncOmnigent, requested_id: str | None) -> str:
+    if requested_id is not None:
+        return requested_id
+
+    agents = await _all_agents(client)
+    if not agents:
+        raise RuntimeError("The selected workspace has no registered agents.")
+    _print_agents(agents)
+
+    while True:
+        answer = input("Choose an agent by number or id: ").strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(agents):
+            return agents[int(answer) - 1].id
+        for agent in agents:
+            if answer == agent.id:
+                return agent.id
+        print("Enter one of the displayed numbers or agent ids.")
+
+
+def _block_text(blocks: object) -> str:
+    if not isinstance(blocks, list):
+        return ""
+    text: list[str] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        value = block.get("text")
+        if isinstance(value, str) and block.get("type") in {
+            "input_text",
+            "output_text",
+            "text",
+        }:
+            text.append(value)
+    return "".join(text)
+
+
+class Renderer:
+    def __init__(self, *, verbose_events: bool) -> None:
+        self._verbose_events = verbose_events
+        self._assistant_open = False
+
+    def finish_line(self) -> None:
+        if self._assistant_open:
+            print()
+            self._assistant_open = False
+
+    def _assistant_text(self, text: str) -> None:
+        if not text:
+            return
+        if not self._assistant_open:
+            print("assistant> ", end="", flush=True)
+            self._assistant_open = True
+        print(text, end="", flush=True)
+
+    def _item(self, source: str, item: dict[str, object], *, live: bool) -> None:
+        item_type = item.get("type")
+        if item_type == "message" and item.get("role") == "assistant":
+            if not live or not self._assistant_open:
+                self._assistant_text(_block_text(item.get("content")))
+            self.finish_line()
+            return
+
+        if item_type == "function_call":
+            self.finish_line()
+            print(f"[{source} · tool] {item.get('name')}({item.get('arguments', '{}')})")
+        elif item_type == "function_call_output":
+            self.finish_line()
+            print(f"[{source} · tool result] {item.get('output', '')}")
+        elif item_type == "error":
+            self.finish_line()
+            print(f"[{source} · error] {item.get('message', '')}")
+
+    def on_event(self, event: ServerStreamEvent | UnknownEvent) -> None:
+        if self._verbose_events:
+            self.finish_line()
+            print(f"\n[event · {event.type}]\n{event.model_dump_json(indent=2)}")
+            return
+
+        if isinstance(event, OutputTextDeltaEvent):
+            self._assistant_text(event.delta)
+        elif isinstance(event, OutputItemDoneEvent):
+            self._item("root", event.item, live=True)
+        elif event.type == "session.created":
+            self.finish_line()
+            print("[subagent created]")
+        elif event.type in {"response.failed", "response.cancelled", "response.incomplete"}:
+            self.finish_line()
+            print(f"[{event.type}]")
+
+    def on_item(self, session_id: str, item: SessionItem) -> None:
+        if self._verbose_events:
+            self.finish_line()
+            print(f"\n[item · {session_id} · {item.type}]\n{item.model_dump_json(indent=2)}")
+            return
+        self._item(session_id, item.model_dump(mode="python"), live=False)
+
+
+def _approve_or_decline(
+    renderer: Renderer,
+    ctx: ElicitationRequestCtx,
+) -> bool:
+    renderer.finish_line()
     print(f"\n[approval requested] {ctx.message}")
     if ctx.content_preview:
         print(f"Preview: {ctx.content_preview}")
     if ctx.url:
         print(f"Open: {ctx.url}")
-    return input("Approve? [y/N]: ").strip().lower() in {"y", "yes"}
+    if ctx.requested_schema:
+        print("Requested schema:")
+        print(json.dumps(ctx.requested_schema, indent=2))
+    answer = input("Approve? [y/N]: ")
+    return answer.strip().lower() in {"y", "yes"}
 
 
-hooks = StreamHooks(on_elicitation_request=approve_or_decline)
+def _print_help() -> None:
+    print(
+        """
+Commands:
+  /help                 Show this help.
+  /session              Show the current durable session snapshot.
+  /items                List durable items in the root session.
+  /subagents            List direct child sessions.
+  /files                List uploaded session files.
+  /attach <path> [...]  Attach local files to the next prompt.
+  /clear                Clear files queued for the next prompt.
+  /delete               Delete the remote session after confirmation, then exit.
+  /quit                 Exit without deleting the durable remote session.
 
-# COMMAND ----------
+Any other input, including an unrecognized slash command, is sent to the agent.
+""".strip()
+    )
 
-# MAGIC %md
-# MAGIC ## 4. Run the task
-# MAGIC
-# MAGIC `sessions_chat(...)` creates one durable registered-agent session.
-# MAGIC `run(...)` then opens the stream before submitting input, displays the
-# MAGIC live response, resolves typed elicitations through the hook, follows
-# MAGIC typed items and child sessions, and returns after the known session tree
-# MAGIC has remained quiet for 60 seconds. Its overall default deadline is 20
-# MAGIC minutes. `host_type="managed"` asks this OmniGent server to provision its
-# MAGIC configured default managed sandbox; the notebook does not create or
-# MAGIC connect to that sandbox itself.
 
-# COMMAND ----------
+class _JsonPrintable(Protocol):
+    def to_json(self, **kwargs: Any) -> str: ...
 
-chat = await client.sessions_chat(
-    agent_id=AGENT_ID,
-    host_type="managed",
-    hooks=hooks,
-)
-print(f"Session: {chat.session_id}\n")
 
-session = await chat.run(
-    "Before changing files, request my approval. If I approve, create tree.py, "
-    "run it, and show me its output.",
-    on_event=show_event,
-    on_item=show_item,
-)
-print(f"\nSession tree settled; root status: {session.status}")
+_JsonPrintableT = TypeVar("_JsonPrintableT", bound=_JsonPrintable)
 
-# If this server exposes several managed providers and you must select one,
-# pass sandbox_provider="lakebox" to client.sessions_chat(...).
 
-# COMMAND ----------
+async def _print_page(page: AsyncCursorPage[_JsonPrintableT]) -> None:
+    current = page
+    while True:
+        for item in current:
+            print(item.model_dump_json(indent=2))
+        if not current.has_more:
+            return
+        current = await current.get_next_page()
 
-# MAGIC %md
-# MAGIC ## 5. Continue the same session
-# MAGIC
-# MAGIC Reuse `chat` to preserve the conversation and managed sandbox. The same
-# MAGIC approval, event, item, timeout, and quiet-window behavior applies.
 
-# COMMAND ----------
+async def _command(
+    text: str,
+    *,
+    client: AsyncOmnigent,
+    session_id: str,
+    pending_files: list[str],
+) -> bool:
+    if text == "/help":
+        _print_help()
+    elif text == "/session":
+        snapshot = await client.agents.sessions.retrieve(session_id)
+        print(snapshot.model_dump_json(indent=2))
+    elif text == "/items":
+        page = await client.agents.sessions.items.list(session_id, limit=100, order="asc")
+        await _print_page(page)
+    elif text == "/subagents":
+        page = await client.agents.sessions.subagents.list(session_id, limit=100, order="asc")
+        await _print_page(page)
+    elif text == "/files":
+        page = await client.agents.sessions.files.list(session_id, limit=100, order="asc")
+        await _print_page(page)
+    elif text == "/clear":
+        pending_files.clear()
+        print("Cleared pending attachments.")
+    elif text == "/delete":
+        answer = input(f"Delete remote session {session_id}? [y/N]: ")
+        if answer.strip().lower() in {"y", "yes"}:
+            await client.agents.sessions.delete(session_id)
+            print(f"Deleted {session_id}.")
+            return True
+    elif text == "/quit":
+        print(f"Remote session retained: {session_id}")
+        return True
+    else:
+        return False
+    return False
 
-session = await chat.run(
-    "Add a --max-depth option, run tree.py with --max-depth 2, and show me the output.",
-    on_event=show_event,
-    on_item=show_item,
-)
-print(f"\nSession tree settled; root status: {session.status}")
 
-# COMMAND ----------
+def _queue_attachments(text: str, pending_files: list[str]) -> bool:
+    if text != "/attach" and not text.startswith("/attach "):
+        return False
+    try:
+        paths = shlex.split(text)[1:]
+    except ValueError as exc:
+        print(f"Could not parse paths: {exc}")
+        return True
+    if not paths:
+        print("Usage: /attach <path> [...]")
+        return True
 
-# MAGIC %md
-# MAGIC ## 6. Inspect durable REST resources
-# MAGIC
-# MAGIC The stream is a live tail. Sessions, items, child sessions, agents, and
-# MAGIC files are ordinary typed REST resources that remain available later.
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve()
+        if not path.is_file():
+            print(f"Not a file: {path}")
+            continue
+        value = str(path)
+        if value not in pending_files:
+            pending_files.append(value)
+            print(f"Queued for the next prompt: {path}")
+    return True
 
-# COMMAND ----------
 
-snapshot = await client.agents.sessions.retrieve(chat.session_id)
-items = await client.agents.sessions.items.list(
-    chat.session_id,
-    limit=100,
-    order="asc",
-)
-children = await client.agents.sessions.subagents.list(chat.session_id)
-session_agent = await client.agents.sessions.agent.retrieve(chat.session_id)
+async def run(options: Options) -> None:
+    workspace = WorkspaceClient(profile=options.profile)
+    base_url = _omnigent_base_url(workspace, options.base_url)
+    headers = workspace.config.authenticate()
 
-print(
-    {
-        "session_id": snapshot.id,
-        "status": snapshot.status,
-        "agent": session_agent.name,
-        "loaded_items": len(items),
-        "loaded_children": len(children),
-    }
-)
+    renderer = Renderer(verbose_events=options.verbose_events)
+    hooks = StreamHooks(on_elicitation_request=lambda ctx: _approve_or_decline(renderer, ctx))
 
-# Other existing operations include:
-# await client.agents.sessions.files.list(chat.session_id)
-# await client.agents.sessions.files.upload(chat.session_id, "/path/to/file")
-# await client.agents.sessions.events.cancel(chat.session_id)
-# await client.agents.sessions.fork(chat.session_id)
+    async with AsyncOmnigent(
+        base_url=base_url,
+        headers=headers,
+        timeout=300.0,
+    ) as client:
+        agent_id = await _choose_agent(client, options.agent_id)
+        chat = await client.sessions_chat(
+            agent_id=agent_id,
+            host_type=options.host_type,
+            sandbox_provider=options.sandbox_provider,
+            workspace=options.workspace,
+            hooks=hooks,
+        )
+        print(f"\nConnected to {base_url}")
+        print(f"Session: {chat.session_id}")
+        _print_help()
 
-# COMMAND ----------
+        pending_files: list[str] = []
+        while True:
+            try:
+                text = input("\nyou> ").strip()
+            except EOFError:
+                break
+            if not text:
+                continue
+            if _queue_attachments(text, pending_files):
+                continue
+            if text in {
+                "/help",
+                "/session",
+                "/items",
+                "/subagents",
+                "/files",
+                "/clear",
+                "/delete",
+                "/quit",
+            }:
+                if await _command(
+                    text,
+                    client=client,
+                    session_id=chat.session_id,
+                    pending_files=pending_files,
+                ):
+                    return
+                continue
 
-# MAGIC %md
-# MAGIC ## 7. Close local resources
-# MAGIC
-# MAGIC Closing the client keeps the durable remote session. Delete it only when
-# MAGIC you intentionally want to remove the session and its managed sandbox.
+            files = pending_files.copy()
+            pending_files.clear()
+            renderer.finish_line()
+            try:
+                session = await chat.run(
+                    text,
+                    files=files or None,
+                    on_event=renderer.on_event,
+                    on_item=renderer.on_item,
+                    timeout=options.timeout,
+                    poll_interval=options.poll_interval,
+                    quiet_period=options.quiet_period,
+                    max_depth=options.max_depth,
+                )
+            except (OmnigentError, TimeoutError, httpx.HTTPError) as exc:
+                renderer.finish_line()
+                print(f"[request failed] {exc}")
+                continue
+            renderer.finish_line()
+            print(f"[session tree settled · {session.status}]")
 
-# COMMAND ----------
+        renderer.finish_line()
+        print(f"\nRemote session retained: {chat.session_id}")
 
-# await client.agents.sessions.delete(chat.session_id)
-await client.close()
+
+def main() -> None:
+    options = parse_args()
+    try:
+        asyncio.run(run(options))
+    except KeyboardInterrupt:
+        print("\nInterrupted. The remote session was not deleted.")
+
+
+if __name__ == "__main__":
+    main()

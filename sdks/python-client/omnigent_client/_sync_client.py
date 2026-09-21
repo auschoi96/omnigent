@@ -7,7 +7,7 @@ from typing import Any, Literal, cast
 
 import httpx
 
-from omnigent.protocol import AgentObject, PaginatedList
+from omnigent.server.schemas import AgentObject, PaginatedList
 from omnigent.trusted_origin import OMNIGENT_INTERNAL_WS_ORIGIN
 
 from ._errors import raise_for_status, require_json_object, response_body

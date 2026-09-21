@@ -4,12 +4,13 @@ Each event model wraps a wire shape that the legacy raw-dict emit
 sites in workflow.py / approval.py / responses.py produce today.
 The tests below verify (a) the typed model constructs and dumps to
 the same shape the legacy emits use, (b) the discriminated union
-dispatches by ``type``, (c) additive-field retention for forward
-compatibility, and (d) MCP-style ``extra="allow"`` on the elicitation
-params block.
+dispatches by ``type``, (c) loose-by-default ``extra="ignore"``
+forward compatibility, and (d) MCP-style ``extra="allow"`` on the
+elicitation params block.
 
-The event models live in :mod:`omnigent.protocol` and remain compatibility-
-reexported from :mod:`omnigent.server.schemas`.
+The event models live in :mod:`omnigent.server.schemas`;
+this module only references the request/response schemas in
+:mod:`omnigent.server.schemas` for the embedded ``ResponseObject``.
 """
 
 from __future__ import annotations
@@ -526,7 +527,7 @@ def test_elicitation_request_params_requires_message() -> None:
         ElicitationRequestParams()  # type: ignore[call-arg]
 
 
-# ── Additive-field forward compatibility ────────────────────
+# ── Loose-by-default forward compatibility ────────────────────
 
 
 @pytest.mark.parametrize(
@@ -543,15 +544,20 @@ def test_elicitation_request_params_requires_message() -> None:
         ),
     ],
 )
-def test_event_preserves_unknown_fields(event_class: type, base_kwargs: dict[str, Any]) -> None:
-    """Forward-compat: unknown top-level fields survive parsing.
+def test_event_silently_drops_unknown_fields(
+    event_class: type, base_kwargs: dict[str, Any]
+) -> None:
+    """Forward-compat: unknown top-level fields are silently dropped.
 
-    Newer producers can add fields without breaking older parsers or
-    silently losing data that callers may need during version skew.
+    This is the v1 validation discipline (extra="ignore" on event
+    models) — newer producers can add fields without breaking older
+    parsers. Required for the contract's "version skew doesn't
+    break harnesses" guarantee.
     """
     parsed = event_class(**base_kwargs, future_field="surprise")
     dumped = parsed.model_dump(exclude_none=True)
-    assert dumped["future_field"] == "surprise"
+    # The unknown field is dropped — not preserved, not raised.
+    assert "future_field" not in dumped
 
 
 def test_elicitation_request_params_preserves_unknown_fields() -> None:

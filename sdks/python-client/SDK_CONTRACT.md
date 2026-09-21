@@ -821,8 +821,8 @@ SessionsChat.wait_until_quiet(*, on_item=None, seen_item_ids=None,
   max_depth=3) -> durable Session
 ```
 
-The callbacks receive canonical `ServerStreamEvent | UnknownEvent` and
-`SessionItem` values from `omnigent.protocol`; cursor traversal reuses
+The callbacks receive upstream `ServerStreamEvent` values plus SDK-owned
+`UnknownEvent` and `SessionItem` output models; cursor traversal reuses
 `AsyncCursorPage`, status rollup reuses `child_summary_busy`, and real
 elicitations reuse `StreamHooks` / `ElicitationRequestCtx`. A response-terminal
 event is only a turn boundary, so the follower requires a sustained 60-second
@@ -1141,8 +1141,8 @@ For each newly stable REST feature:
 
 1. Classify the route stable, preview, or internal and make OpenAPI accurate
    when it is intended for external use.
-2. Add or extend only the portable canonical type family in
-   `omnigent.protocol`.
+2. Reuse the upstream server schema. Add or extend a small SDK-only type only
+   when the route's output is not typed upstream.
 3. Add the explicit method to the matching handwritten resource namespace.
    Create a module or nested namespace only for the first real route that needs
    it.

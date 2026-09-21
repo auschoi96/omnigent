@@ -16,7 +16,7 @@ matching the server-side conversation lifecycle defined in
 ``omnigent/server/API.md`` ("Sessions API"). Per the same spec
 there is no event replay; this helper opens a fresh SSE subscription
 per :meth:`send` call, posts the input event, and yields the typed
-:data:`omnigent.protocol.ServerStreamEvent` envelopes
+:data:`omnigent.server.schemas.ServerStreamEvent` envelopes
 until the turn's terminal ``response.*`` event arrives.
 
 The helper does NOT re-export under the existing public name
@@ -39,7 +39,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, TypeVar, overload
 
-from omnigent.protocol import (
+from omnigent.server.schemas import (
     CompletedEvent,
     CreatedEvent,
     ElicitationRequestEvent,
@@ -54,14 +54,13 @@ from omnigent.protocol import (
     ServerStreamEvent,
     SessionChildSessionUpdatedEvent,
     SessionCreatedEvent,
-    SessionItem,
     SessionStatusEvent,
-    UnknownEvent,
 )
 
 from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
 from ._files import FilesNamespace
+from ._models import SessionItem, UnknownEvent
 from ._pagination import AsyncCursorPage
 from ._query import QueryResult, QueryStream
 from ._sessions import (
@@ -94,14 +93,14 @@ _OUTPUT_TEXT_BLOCK_TYPES: frozenset[str] = frozenset({"output_text", "text"})
 
 # Wire ``type`` literal that the input-message wire format uses for
 # user-text events. Mirrors the ``"message"`` arm of
-# :class:`omnigent.protocol.PublicSessionEventInput`. Kept as a
+# public session-event input. Kept as a
 # named constant so a single grep finds every emit/match site.
 _MESSAGE_INPUT_TYPE: str = "message"
 
 # Wire ``type`` literal for the function_call_output event posted back
 # to the session after a client-side tool callable finishes. Mirrors
 # the ``"function_call_output"`` arm of
-# :class:`omnigent.protocol.PublicSessionEventInput`. Kept as a
+# public session-event input. Kept as a
 # named constant so a single grep finds every emit site.
 _FUNCTION_CALL_OUTPUT_TYPE: str = "function_call_output"
 
@@ -651,7 +650,7 @@ class SessionsChat:
         This is a transparent composition of ``retrieve``, ``items.list`` and
         ``subagents.list``. Cursor pages are exhausted through
         :class:`AsyncCursorPage`; items and events keep their canonical
-        ``omnigent.protocol`` types. There is no atomic whole-tree completion
+        typed upstream events and SDK item models. There is no atomic whole-tree completion
         signal, so this method returns only after all sessions known within
         ``max_depth`` remain non-busy for ``quiet_period`` seconds.
 

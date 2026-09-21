@@ -12,9 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import omnigent_ui_sdk
-from omnigent_client import AsyncOmnigent, Omnigent, OmnigentClient, SessionMessage
-
-from omnigent.protocol import SessionResponse
+from omnigent_client import (
+    AsyncOmnigent,
+    Omnigent,
+    OmnigentClient,
+    SessionMessage,
+    SessionResponse,
+)
 
 _EXECUTABLE_FENCE = re.compile(
     r"<!-- sdk-example: executable -->\s*```python\n(.*?)\n```", re.DOTALL

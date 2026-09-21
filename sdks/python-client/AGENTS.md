@@ -61,28 +61,25 @@ Before each implementation PR, compare with current main and repeat the
 deprecation/removal search for each reused route or module. Stop and revise the
 design if a foundation is newly deprecated.
 
-## Protocol ownership
+## Schema ownership
 
-Known portable request, response, item, event, and acknowledgement models have
-one canonical definition in `omnigent.protocol`. The SDK imports that public
-facade; `omnigent.server.schemas` compatibility-reexports moved names.
+The current upstream server routes and `omnigent.server.schemas` are the source
+of truth for server-owned request, response, and stream-event models. Reuse
+those definitions directly and re-export selected user-facing names from
+`omnigent_client`; do not create a parallel `omnigent.protocol` schema tree.
 
-Protocol code depends only on the standard library and Pydantic. It contains no
-HTTP calls, FastAPI routes, stores, runners, or orchestration. Request models
-reject unknown fields. Response models retain additive fields. One output-only
-`UnknownEvent` preserves a newer server discriminator and raw payload; it is
-never valid input.
-
-Do not copy the known schema tree into the SDK, generate a competing model
-tree, or create a protocol distribution merely to hide the current package
-cycle.
+SDK-local models are limited to client-only conveniences or route outputs that
+upstream currently exposes as untyped dictionaries. They must remain small,
+preserve additive output fields, and validate against the upstream schema when
+one exists. `UnknownEvent` is output-only and is never valid input.
 
 ## Extension workflow
 
 For a new REST feature:
 
 1. Classify and document the real route contract.
-2. Add canonical protocol types only if needed.
+2. Reuse the upstream schema and add a minimal SDK-only model only when the
+   route has no typed upstream output.
 3. Add an explicit method to the matching handwritten namespace.
 4. Share paths, serializers, models, pagination, and errors between native
    sync and async I/O; do not run sync calls through an event-loop bridge.

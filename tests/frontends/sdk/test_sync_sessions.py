@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import sys
 from collections.abc import AsyncIterator, Iterable
 from typing import Any
 
@@ -17,6 +14,7 @@ from omnigent_client import (
     AsyncOmnigent,
     Omnigent,
     OmnigentClient,
+    OutputTextDeltaEvent,
     Session,
     SessionCompositionError,
     SessionEventStream,
@@ -28,6 +26,8 @@ from omnigent_client._errors import OmnigentError
 from omnigent_client._session import Session as LegacySession
 from omnigent_client._sessions import _parse_sse_lines
 from omnigent_client._sessions_shared import SessionSSEDecoder
+
+from omnigent.server.schemas import OutputTextDeltaEvent as UpstreamOutputTextDeltaEvent
 
 
 def _session(session_id: str = "conv_1", status: str = "idle") -> dict[str, Any]:
@@ -212,27 +212,9 @@ async def test_injected_policy_rolls_back_when_resource_construction_fails(
     await async_http.aclose()
 
 
-def test_public_sdk_import_does_not_load_server_or_runner_modules() -> None:
-    """The mature SDK boundary must not initialize private runtime layers."""
-    probe = """
-import json
-import sys
-import omnigent_client
-forbidden = ("omnigent.runner", "omnigent.server")
-loaded = sorted(
-    name for name in sys.modules
-    if any(name == prefix or name.startswith(prefix + ".") for prefix in forbidden)
-)
-print(json.dumps(loaded))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", probe],
-        cwd=os.getcwd(),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert json.loads(result.stdout) == []
+def test_public_sdk_reexports_upstream_event_model() -> None:
+    """The public convenience import keeps upstream schemas single-source."""
+    assert OutputTextDeltaEvent is UpstreamOutputTextDeltaEvent
 
 
 def test_sync_typed_event_request_and_raw_response_share_one_execution() -> None:

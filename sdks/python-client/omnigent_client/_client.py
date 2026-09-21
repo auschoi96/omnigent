@@ -7,7 +7,7 @@ from typing import Any, Literal, cast, overload
 
 import httpx
 
-from omnigent.protocol import AgentObject, PaginatedList
+from omnigent.server.schemas import AgentObject, PaginatedList
 from omnigent.trusted_origin import OMNIGENT_INTERNAL_WS_ORIGIN
 
 from ._files import FilesNamespace
@@ -461,7 +461,7 @@ class OmnigentClient:
         :class:`SessionsChat`. It reuses the typed session-agent resource
         instead of duplicating its route or HTTP error handling. ``tools`` is
         currently an additive server field retained by
-        :class:`~omnigent.protocol.AgentObject`.
+        :class:`~omnigent.server.schemas.AgentObject`.
 
         :param agent_id: The agent's durable identifier, e.g.
             ``"ag_abc123"``.

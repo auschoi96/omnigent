@@ -14,24 +14,17 @@ from urllib.parse import quote
 import httpx
 from pydantic import TypeAdapter
 
-from omnigent.protocol import (
+from omnigent.server.schemas import (
     AgentObject,
     ChildSessionList,
     ChildSessionSummary,
     ConversationDeleted,
     CopyFilesRequest,
     CopyFilesResponse,
-    ElicitationResolutionAcknowledgement,
-    ElicitationState,
-    EventAcknowledgement,
     PaginatedList,
-    PublicSessionEventInput,
     SessionGitOptions,
-    SessionItem,
     SessionList,
     SessionListItem,
-    SessionMessage,
-    SessionResourceDeleted,
     SessionResourceObject,
     SessionResourcePaginatedList,
     SessionResponse,
@@ -44,6 +37,15 @@ from ._errors import (
     raise_for_status,
     require_json_object,
     response_body,
+)
+from ._models import (
+    ElicitationResolutionAcknowledgement,
+    ElicitationState,
+    EventAcknowledgement,
+    PublicSessionEventInput,
+    SessionItem,
+    SessionMessage,
+    SessionResourceDeleted,
 )
 from ._not_given import NOT_GIVEN, NotGiven
 from ._pagination import SyncCursorPage
@@ -58,6 +60,7 @@ from ._sessions_shared import (
     Timeout,
     elicitation_url,
     normalize_create_input,
+    parse_session_response,
     present,
     query_params,
     request_options,
@@ -818,9 +821,7 @@ class SyncSessionsResource:
                 **request_options(timeout, extra_headers),
             )
             raise_for_status(response.status_code, response_body(response))
-            created = SessionResponse.model_validate(
-                require_json_object(response, "POST /v1/sessions")
-            )
+            created = parse_session_response(require_json_object(response, "POST /v1/sessions"))
             return self._complete_create(
                 created.id,
                 created_session=created,
@@ -1037,9 +1038,7 @@ class SyncSessionsResource:
     @staticmethod
     def _parse_retrieve(response: httpx.Response) -> SessionResponse:
         raise_for_status(response.status_code, response_body(response))
-        return SessionResponse.model_validate(
-            require_json_object(response, "GET /v1/sessions/{id}")
-        )
+        return parse_session_response(require_json_object(response, "GET /v1/sessions/{id}"))
 
     def retrieve(
         self,

@@ -10,9 +10,8 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
-    # Sibling package — provides the canonical omnigent.protocol models
-    # that the SDK uses for session requests, responses, and SSE events.
-    # Resolved via
+    # Sibling package — provides the upstream server schemas that the SDK uses
+    # for session requests, responses, and SSE events. Resolved via
     # the relative path below so the SDK can be installed
     # editable alongside the root ``omnigent`` package. Version-locked
     # (==) so a published SDK always pairs with the server release it

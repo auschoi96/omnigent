@@ -11,25 +11,25 @@ from urllib.parse import quote
 import httpx
 from pydantic import TypeAdapter
 
-from omnigent.protocol import (
-    SERVER_STREAM_EVENT_TYPES,
+from omnigent.server.schemas import (
     CancelledEvent,
     CompletedEvent,
     ElicitationResult,
     FailedEvent,
     IncompleteEvent,
     ProjectSessionCreateRequest,
-    PublicSessionEventInput,
     ServerStreamEvent,
     SessionCreateMetadata,
     SessionCreateRequest,
+    SessionEventInput,
     SessionForkRequest,
-    SessionMessage,
+    SessionResponse,
     SessionStatusEvent,
-    UnknownEvent,
     UpdateSessionRequest,
+    is_known_event,
 )
 
+from ._models import PublicSessionEventInput, SessionMessage, UnknownEvent
 from ._not_given import NotGiven
 
 Timeout = float | httpx.Timeout | None
@@ -112,6 +112,13 @@ def normalize_create_input(
 def serialize_registered_create(fields: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and serialize the full registered/project create shape."""
     body = {key: value for key, value in fields.items() if not isinstance(value, NotGiven)}
+    if "initial_items" in body:
+        body["initial_items"] = [
+            _INPUT_ADAPTER.validate_python(event).model_dump(
+                mode="json", by_alias=True, exclude_none=True
+            )
+            for event in body["initial_items"]
+        ]
     request_type = (
         ProjectSessionCreateRequest if body.get("project_id") is not None else SessionCreateRequest
     )
@@ -123,6 +130,27 @@ def serialize_registered_create(fields: Mapping[str, Any]) -> dict[str, Any]:
             for event in validated.initial_items
         ]
     return wire
+
+
+def parse_session_response(payload: Mapping[str, Any]) -> SessionResponse:
+    """Parse a session snapshot while accepting its serialized message alias."""
+    body = dict(payload)
+    items = body.get("items")
+    if isinstance(items, list):
+        normalized_items: list[Any] = []
+        for item in items:
+            if not isinstance(item, Mapping) or item.get("type") != "message":
+                normalized_items.append(item)
+                continue
+            normalized_item = dict(item)
+            data = normalized_item.get("data")
+            if isinstance(data, Mapping) and "agent" not in data and "model" in data:
+                normalized_data = dict(data)
+                normalized_data["agent"] = normalized_data["model"]
+                normalized_item["data"] = normalized_data
+            normalized_items.append(normalized_item)
+        body["items"] = normalized_items
+    return SessionResponse.model_validate(body)
 
 
 def serialize_bundle_metadata(fields: Mapping[str, Any]) -> dict[str, Any]:
@@ -159,12 +187,12 @@ def serialize_public_events(
     if batch is not None and not 1 <= len(batch) <= 100:
         raise ValueError("events must contain between 1 and 100 entries")
     source = batch if batch is not None else [events]
-    payloads = [
-        _INPUT_ADAPTER.validate_python(event).model_dump(
-            mode="json", by_alias=True, exclude_none=True
-        )
-        for event in source
-    ]
+    payloads: list[dict[str, Any]] = []
+    for event in source:
+        public_event = _INPUT_ADAPTER.validate_python(event)
+        payload = public_event.model_dump(mode="json", by_alias=True, exclude_none=True)
+        upstream_event = SessionEventInput.model_validate(payload)
+        payloads.append(upstream_event.model_dump(mode="json", by_alias=True, exclude_none=True))
     return (payloads if batch is not None else payloads[0]), batch is not None
 
 
@@ -209,7 +237,7 @@ def try_parse_envelope(raw: str) -> SessionStreamEvent | None:
         _log.warning("SSE data is not a JSON object: %s", raw[:200])
         return None
     event_type = decoded.get("type")
-    if isinstance(event_type, str) and event_type not in SERVER_STREAM_EVENT_TYPES:
+    if isinstance(event_type, str) and not is_known_event(event_type):
         return UnknownEvent(type=event_type, raw=decoded)
     try:
         return _EVENT_ADAPTER.validate_python(decoded)

@@ -35,6 +35,7 @@ from typing import Any, Literal, cast
 
 import httpx
 import pytest
+from omnigent_client import SessionItem
 from omnigent_client._client import OmnigentClient
 from omnigent_client._errors import OmnigentError
 from omnigent_client._pagination import AsyncCursorPage
@@ -48,8 +49,8 @@ from omnigent_client._tool_handler import StreamHooks
 from omnigent_client._types import File
 from pydantic import TypeAdapter
 
-from omnigent.protocol import ChildSessionSummary, SessionItem
 from omnigent.server.schemas import (
+    ChildSessionSummary,
     CompletedEvent,
     CreatedEvent,
     ElicitationRequestEvent,

@@ -8,8 +8,8 @@ bundle, optionally
 ``get()`` a snapshot to reconcile on reconnect. There is no replay —
 the server intentionally does not buffer past events.
 
-The SDK-side ``Session`` name aliases the canonical
-:class:`omnigent.protocol.SessionResponse`. Note that the
+The SDK-side ``Session`` name aliases the upstream
+:class:`omnigent.server.schemas.SessionResponse`. Note that the
 ``Session`` class exported from :mod:`omnigent_client._session` is
 an unrelated higher-level ``/v1/responses`` chat helper; the two
 concepts share a name because the server route is ``/v1/sessions``
@@ -30,25 +30,18 @@ from typing import Any, Literal, TypeVar, overload
 import httpx
 from pydantic import TypeAdapter
 
-from omnigent.protocol import (
+from omnigent.server.schemas import (
     AgentObject,
     ChildSessionList,
     ChildSessionSummary,
     ConversationDeleted,
-    ElicitationResolutionAcknowledgement,
-    ElicitationState,
-    EventAcknowledgement,
     PaginatedList,
-    PublicSessionEventInput,
     ServerStreamEvent,
     SessionGitOptions,
-    SessionItem,
     SessionList,
-    SessionMessage,
     SessionResponse,
-    UnknownEvent,
 )
-from omnigent.protocol import (
+from omnigent.server.schemas import (
     SessionListItem as ProtocolSessionListItem,
 )
 
@@ -60,6 +53,15 @@ from ._errors import (
     raise_for_status,
     require_json_object,
     response_body,
+)
+from ._models import (
+    ElicitationResolutionAcknowledgement,
+    ElicitationState,
+    EventAcknowledgement,
+    PublicSessionEventInput,
+    SessionItem,
+    SessionMessage,
+    UnknownEvent,
 )
 from ._not_given import NOT_GIVEN, NotGiven
 from ._pagination import AsyncCursorPage
@@ -86,6 +88,7 @@ from ._sessions_shared import (
 from ._sessions_shared import (
     normalize_create_input as _normalize_create_input,
 )
+from ._sessions_shared import parse_session_response as _parse_session_response
 from ._sessions_shared import (
     present as _present,
 )
@@ -107,7 +110,7 @@ _DEFAULT_SUBTREE_DEPTH = 3
 # caches the validator. ``ServerStreamEvent`` is a Pydantic-discriminated
 # union, so the result of ``validate_python`` is one of the concrete
 # event subclasses (CreatedEvent, OutputTextDeltaEvent, …) — see
-# :mod:`omnigent.protocol`.
+# :mod:`omnigent.server.schemas`.
 # Wire literal for the interrupt event ``type`` discriminator. Mirrors
 # ``_INTERRUPT_TYPE`` in ``omnigent/server/routes/sessions.py``;
 # kept as a module-level constant so :meth:`SessionsNamespace.interrupt`
@@ -844,7 +847,7 @@ class SessionsNamespace:
                 **_options(timeout, extra_headers),
             )
             raise_for_status(response.status_code, response_body(response))
-            created_session = Session.model_validate(
+            created_session = _parse_session_response(
                 require_json_object(response, "POST /v1/sessions")
             )
             return await self._complete_create(
@@ -1300,7 +1303,7 @@ class SessionsNamespace:
             json={"runner_id": runner_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -1323,7 +1326,7 @@ class SessionsNamespace:
             json={"runner_id": ""},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -1354,7 +1357,7 @@ class SessionsNamespace:
             json={"reasoning_effort": wire_effort},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -1399,7 +1402,7 @@ class SessionsNamespace:
             json=body,
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -1432,7 +1435,7 @@ class SessionsNamespace:
             json={"archived": archived},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -1467,7 +1470,7 @@ class SessionsNamespace:
             json={"external_session_id": external_session_id},
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(resp, "PATCH /v1/sessions/{session_id}"),
         )
 
@@ -1654,7 +1657,7 @@ class SessionsNamespace:
     @staticmethod
     def _parse_retrieve(response: httpx.Response) -> Session:
         raise_for_status(response.status_code, response_body(response))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(response, "GET /v1/sessions/{session_id}")
         )
 
@@ -1736,7 +1739,7 @@ class SessionsNamespace:
             **_options(timeout, extra_headers),
         )
         raise_for_status(response.status_code, response_body(response))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(response, "PATCH /v1/sessions/{session_id}")
         )
 
@@ -1912,7 +1915,7 @@ class SessionsNamespace:
             **_options(timeout, extra_headers),
         )
         raise_for_status(resp.status_code, response_body(resp))
-        return Session.model_validate(
+        return _parse_session_response(
             require_json_object(resp, f"POST /v1/sessions/{source_session_id}/fork")
         )
 
@@ -1992,8 +1995,8 @@ class SessionsNamespace:
 
         :param session_id: Session/conversation identifier, e.g.
             ``"conv_abc123"``.
-        :yields: Known :class:`omnigent.protocol.ServerStreamEvent`
-            values or :class:`omnigent.protocol.UnknownEvent` for a
+        :yields: Known :class:`omnigent.server.schemas.ServerStreamEvent`
+            values or :class:`omnigent_client.UnknownEvent` for a
             newer discriminator.
         :raises OmnigentError: If the server returns a non-2xx
             status when opening the stream (404 when the session

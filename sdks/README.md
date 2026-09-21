@@ -19,8 +19,8 @@ Use the client package for scripts, services, bots, tests, and custom
 frontends. Its primary API is the typed `client.agents.sessions` resource tree.
 
 The async equivalent is `AsyncOmnigent`. Both use native HTTPX I/O and share
-the same session operations, canonical `omnigent.protocol` models, pagination,
-errors, and stream semantics. See the
+the same session operations, upstream server schemas re-exported by
+`omnigent_client`, pagination, errors, and stream semantics. See the
 [complete client guide](python-client/README.md) for follow-up input, durable
 recovery, session files, subagents, preview elicitations, migration guidance,
 and executable sync and async examples.

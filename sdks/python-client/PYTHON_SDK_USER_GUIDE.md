@@ -3,10 +3,11 @@
 This is the practical manual for the mature `omnigent-client` SDK. It covers
 the supported Python interface to OmniGent's existing REST and SSE APIs.
 
-The SDK does not create a second runtime or protocol. Requests, responses,
-items, events, and acknowledgements use the canonical public models in
-`omnigent.protocol`. OpenAI Agents influenced some Python ergonomics, but
-OmniGent retains its own resources, event names, and lifecycle semantics.
+The SDK does not create a second runtime or protocol. It reuses upstream
+OmniGent request, response, and event schemas, adding only small SDK models for
+public input conveniences and currently untyped route outputs. OpenAI Agents
+influenced some Python ergonomics, but OmniGent retains its own resources,
+event names, and lifecycle semantics.
 
 Use this guide for normal SDK work, then refer to the authoritative sources
 when more detail is needed:
@@ -28,7 +29,8 @@ add server capabilities. The main changes are:
 - matching native sync and async clients;
 - the `client.agents.sessions` resource hierarchy, with `client.sessions` as
   the same-object compatibility alias;
-- canonical request, response, item, and event types from `omnigent.protocol`;
+- upstream request, response, and event types re-exported through
+  `omnigent_client`, plus focused SDK-only item and acknowledgement models;
 - typed pagination, streams, errors, per-request options, and raw responses;
 - complete session subresources for events, items, subagents, files, the bound
   agent, and elicitations; and
@@ -321,7 +323,7 @@ outcome = events.terminal_event
 if outcome is None:
     raise RuntimeError("The stream closed without a terminal event.")
 if outcome.type != "response.completed":
-    raise RuntimeError(outcome.to_json(indent=None))
+    raise RuntimeError(outcome.model_dump_json(indent=None))
 ```
 
 Async:
@@ -346,9 +348,9 @@ outcome = events.terminal_event
 The composition opens the stream and consumes its readiness heartbeat before
 submitting input. That prevents early output from being lost.
 
-The stream yields canonical `ServerStreamEvent` models from
-`omnigent.protocol`. A newer unknown event discriminator is preserved as an
-output-only `UnknownEvent`; it is never valid input.
+The stream yields upstream `ServerStreamEvent` models. A newer unknown event
+discriminator is preserved as an output-only `UnknownEvent`; it is never valid
+input.
 
 `response.completed` is a successful response boundary. `response.failed`,
 `response.cancelled`, and `response.incomplete` are terminal outcomes but are
@@ -522,7 +524,7 @@ items = client.agents.sessions.items.list(
 )
 
 for item in items:
-    print(item.type, item.to_json(indent=2))
+    print(item.type, item.model_dump_json(indent=2))
 ```
 
 `SessionItem` is the canonical discriminated union for durable flat items. It
@@ -712,18 +714,23 @@ chat = await client.sessions_chat(
 ### Display typed activity and request approval
 
 ```python
-from omnigent.protocol import ServerStreamEvent, SessionItem, UnknownEvent
-from omnigent_client import ElicitationRequestCtx, StreamHooks
+from omnigent_client import (
+    ElicitationRequestCtx,
+    ServerStreamEvent,
+    SessionItem,
+    StreamHooks,
+    UnknownEvent,
+)
 
 
 def show_event(event: ServerStreamEvent | UnknownEvent) -> None:
     print(f"\n[live · {event.type}]")
-    print(event.to_json(indent=2))
+    print(event.model_dump_json(indent=2))
 
 
 def show_item(session_id: str, item: SessionItem) -> None:
     print(f"\n[{session_id} · {item.type}]")
-    print(item.to_json(indent=2))
+    print(item.model_dump_json(indent=2))
 
 
 def approve_or_decline(ctx: ElicitationRequestCtx) -> bool:
@@ -963,8 +970,8 @@ API and should not be foundations for new work:
 - response-specific stream/block machinery as session transport;
 - global file methods.
 
-Use `client.agents.sessions`, session-scoped files, canonical
-`omnigent.protocol` types, and async `SessionsChat` instead. `SessionsChat.query`
+Use `client.agents.sessions`, session-scoped files, types exported from
+`omnigent_client`, and async `SessionsChat` instead. `SessionsChat.query`
 is session-native and is not the deprecated top-level `client.query()`.
 
 ## Current boundaries
@@ -987,7 +994,7 @@ Stable and preview classifications are recorded in
 ## Adding future REST features
 
 Add each new server capability as a small typed sync/async resource change; do
-not pre-create unused resources or duplicate `omnigent.protocol`. Maintainers
+not pre-create unused resources or duplicate upstream server schemas. Maintainers
 should follow [`SDK_CONTRACT.md`](SDK_CONTRACT.md) and [`AGENTS.md`](AGENTS.md)
 for the route, compatibility, and test checklist.
 

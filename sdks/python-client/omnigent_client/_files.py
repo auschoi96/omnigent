@@ -11,15 +11,15 @@ from urllib.parse import quote
 
 import httpx
 
-from omnigent.protocol import (
+from omnigent.server.schemas import (
     CopyFilesRequest,
     CopyFilesResponse,
-    SessionResourceDeleted,
     SessionResourceObject,
     SessionResourcePaginatedList,
 )
 
 from ._errors import raise_for_status, require_json_object, response_body
+from ._models import SessionResourceDeleted
 from ._pagination import AsyncCursorPage
 from ._sessions_shared import session_files_url
 from ._types import File

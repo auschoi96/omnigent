@@ -1316,7 +1316,6 @@
         "type": "object"
       },
       "CopyFilesRequest": {
-        "additionalProperties": false,
         "description": "Request to copy files from a lineage ancestor into a session.\n\nThe destination session is the path parameter; `source_session_id`\nmust be a STRICT ancestor of the destination up its\n`parent_conversation_id` chain (spawn lineage) \u2014 the destination may\nnot name itself as the source. The copy creates new child-scoped rows \u2014\nit does not grant cross-session read access.",
         "properties": {
           "file_ids": {
@@ -5456,7 +5455,6 @@
         "type": "object"
       },
       "SessionGitOptions": {
-        "additionalProperties": false,
         "description": "Git worktree options for `POST /v1/sessions`.\n\nRequires `host_id` to be set (and therefore `workspace`, which\nis interpreted as the source repository directory). Two modes,\nselected by `existing_worktree`:\n\n- **create** (default): the server creates a git worktree on the\n  host for a new branch and starts the runner in that worktree\n  instead of the picked directory.\n- **bind** (`existing_worktree=True`): `workspace` already IS a\n  pre-existing worktree; no worktree is created. `branch_name` is\n  recorded as the session's `git_branch` for display and opt-in\n  cleanup, and `base_branch` must not be set.\n\nSee designs/SESSION_GIT_WORKTREE.md.",
         "properties": {
           "base_branch": {
@@ -6420,6 +6418,7 @@
         "type": "object"
       },
       "SessionResourceObject": {
+        "additionalProperties": false,
         "description": "API representation of a session-scoped resource handle.",
         "properties": {
           "environment": {
@@ -6696,6 +6695,22 @@
             "description": "Unique session identifier (also the underlying conversation ID), e.g. `\"conv_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "inference_configured": {
+            "default": false,
+            "title": "Inference Configured",
+            "type": "boolean"
+          },
+          "inference_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inference Error"
           },
           "items": {
             "description": "Committed conversation items in chronological order. Empty for a freshly created session.",
@@ -9970,7 +9985,7 @@
     },
     "/v1/hosts/{host_id}/worktrees": {
       "get": {
-        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
+        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached, updated_at?}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
         "operationId": "list_host_worktrees_v1_hosts__host_id__worktrees_get",
         "parameters": [
           {
@@ -10834,6 +10849,75 @@
         "summary": "Mint Runner Owner Token",
         "tags": [
           "runners"
+        ]
+      }
+    },
+    "/v1/sandbox-providers/{provider}/harnesses/{harness}/model-options": {
+      "get": {
+        "operationId": "model_options_v1_sandbox_providers__provider__harnesses__harness__model_options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Model Options V1 Sandbox Providers  Provider  Harnesses  Harness  Model Options Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Model Options",
+        "tags": [
+          "sandbox inference"
         ]
       }
     },

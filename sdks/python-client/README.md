@@ -1,9 +1,9 @@
-# omnigent-client
+   # omnigent-client
 
 Typed sync and async Python clients for the existing
 [OmniGent](https://github.com/omnigent-ai/omnigent) HTTP and SSE APIs.
-Session requests and streamed events use the canonical public models in
-`omnigent.protocol`.
+The SDK reuses the request, response, and stream-event models maintained by the
+upstream OmniGent server and re-exports common user-facing types.
 
 The resource layout and context-managed streaming take directional inspiration
 from the [OpenAI Agents API quickstart](https://developers.openai.com/api/docs/guides/agents-api/quickstart).
@@ -35,11 +35,17 @@ Pass the server URL explicitly. The clients also accept caller-supplied HTTPX
 authentication, headers, or an HTTP client; they do not discover credentials or
 select CLI profiles.
 
-For a progressive Databricks notebook tutorial—starting with one managed turn,
-then optionally covering follow-up input, durable state, and related session
-resources—import
-[`examples/databricks_sessions_quickstart.py`](examples/databricks_sessions_quickstart.py)
-as a Databricks source notebook.
+For an interactive Databricks-hosted session using this checkout of the SDK,
+run [`examples/databricks_sessions_quickstart.py`](examples/databricks_sessions_quickstart.py)
+from the repository root. It requires an explicit Databricks CLI profile, lets
+you choose a registered agent, keeps one durable session across prompts, and
+supports approval requests, attachments, and resource inspection:
+
+```bash
+uv run --frozen --extra all \
+  python sdks/python-client/examples/databricks_sessions_quickstart.py \
+  --profile <PROFILE>
+```
 
 ## Synchronous quickstart
 
@@ -61,7 +67,7 @@ with Omnigent(base_url=server_url) as client:
     ) as events:
         session_id = events.session_id
         for event in events:
-            print(event.to_json(indent=None), flush=True)
+            print(event.model_dump_json(indent=None), flush=True)
 
     outcome = events.terminal_event
     if outcome is None:
@@ -105,7 +111,7 @@ async def main() -> None:
         session_id = events.session_id
         async with events:
             async for event in events:
-                print(event.to_json(indent=None), flush=True)
+                print(event.model_dump_json(indent=None), flush=True)
 
         outcome = events.terminal_event
         if outcome is None:

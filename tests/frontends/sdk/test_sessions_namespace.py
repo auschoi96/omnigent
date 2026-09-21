@@ -41,8 +41,10 @@ import pytest
 from omnigent_client import (
     NOT_GIVEN,
     AsyncSessionEventStream,
+    Interrupt,
     SessionCompositionError,
     SessionMessage,
+    UnknownEvent,
 )
 from omnigent_client._client import AsyncAgentsResource
 from omnigent_client._errors import OmnigentError
@@ -51,7 +53,7 @@ from omnigent_client._sessions import (
     SessionsNamespace,
 )
 
-from omnigent.protocol import Interrupt, MessageData, UnknownEvent
+from omnigent.entities.conversation import MessageData
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -201,7 +203,6 @@ async def test_create_posts_bundle_and_returns_typed_session() -> None:
             project_id="project_123",
             labels={"env": "test"},
             reasoning_effort="high",
-            host_id="host_123",
             workspace="https://example.com/repo.git",
             terminal_launch_args=["--flag"],
             parent_session_id="parent_123",
@@ -224,7 +225,7 @@ async def test_create_posts_bundle_and_returns_typed_session() -> None:
     assert b'"project_id": "project_123"' in body
     assert b'"labels": {"env": "test"}' in body
     assert b'"reasoning_effort": "high"' in body
-    assert b'"host_id": "host_123"' in body
+    assert b'"host_id"' not in body
     assert b'"workspace": "https://example.com/repo.git"' in body
     assert b'"terminal_launch_args": ["--flag"]' in body
     assert b'"parent_session_id": "parent_123"' in body
@@ -1408,11 +1409,8 @@ async def test_create_accepts_project_only_and_rejects_bundle_registered_fields(
             parent_session_id="parent_123",
             sub_agent_name="reviewer",
             host_type="managed",
-            host_id="host_123",
             sandbox_provider="sandbox_1",
-            workspace="https://example.com/one.git",
             workspaces=["https://example.com/two.git"],
-            git={"branch_name": "feature/sdk"},
             terminal_launch_args=["--flag"],
             model_override="model-1",
             reasoning_effort="high",
@@ -1429,11 +1427,8 @@ async def test_create_accepts_project_only_and_rejects_bundle_registered_fields(
             "parent_session_id": "parent_123",
             "sub_agent_name": "reviewer",
             "host_type": "managed",
-            "host_id": "host_123",
             "sandbox_provider": "sandbox_1",
-            "workspace": "https://example.com/one.git",
             "workspaces": ["https://example.com/two.git"],
-            "git": {"branch_name": "feature/sdk"},
             "terminal_launch_args": ["--flag"],
             "model_override": "model-1",
             "reasoning_effort": "high",
@@ -1442,6 +1437,19 @@ async def test_create_accepts_project_only_and_rejects_bundle_registered_fields(
             "harness_override": "harness-1",
             "smart_routing_message": "route this",
             "initial_items": [{"type": "interrupt", "data": {}}],
+        }
+        await ns.create(
+            agent_id="ag_123",
+            host_id="host_123",
+            workspace="/repo",
+            git={"branch_name": "feature/sdk"},
+        )
+        assert json.loads(requests[2].content) == {
+            "agent_id": "ag_123",
+            "host_type": "external",
+            "host_id": "host_123",
+            "workspace": "/repo",
+            "git": {"branch_name": "feature/sdk"},
         }
         for kwargs in ({"workspaces": ["repo"]}, {"initial_items": []}, {"git": {}}):
             with pytest.raises(ValueError, match="bundle create does not support"):
@@ -1456,7 +1464,7 @@ async def test_create_accepts_project_only_and_rejects_bundle_registered_fields(
                 input="start",
                 initial_items=[Interrupt()],
             )
-        assert len(requests) == 2
+        assert len(requests) == 3
     finally:
         await client.aclose()
 
@@ -1840,7 +1848,11 @@ async def test_bundle_create_forwards_options_to_create_and_retrieve() -> None:
         ("terminal_launch_args", ["--flag"], {"terminal_launch_args": ["--flag"]}),
         ("workspace", NOT_GIVEN, {}),
         ("workspace", None, {"workspace": None}),
-        ("workspace", "/repo", {"workspace": "/repo"}),
+        (
+            "workspace",
+            "https://example.com/repo.git",
+            {"host_type": "managed", "workspace": "https://example.com/repo.git"},
+        ),
     ],
 )
 async def test_fork_presence_sensitive_fields(
@@ -1854,7 +1866,10 @@ async def test_fork_presence_sensitive_fields(
 
     ns, client = _make_namespace(handler)
     try:
-        await cast(Any, ns.fork)("conv_abc", **{name: value})
+        kwargs = {name: value}
+        if name == "workspace" and isinstance(value, str):
+            kwargs["host_type"] = "managed"
+        await cast(Any, ns.fork)("conv_abc", **kwargs)
         assert body == expected
     finally:
         await client.aclose()

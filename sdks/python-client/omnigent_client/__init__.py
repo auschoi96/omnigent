@@ -7,7 +7,13 @@ compatibility. Block-stream transforms remain optional presentation helpers,
 not foundations for the session-native transport.
 """
 
-from omnigent.protocol import FunctionCallOutput, Interrupt, SessionMessage
+from omnigent.server.schemas import (
+    AgentObject,
+    OutputItemDoneEvent,
+    OutputTextDeltaEvent,
+    ServerStreamEvent,
+    SessionResponse,
+)
 
 from ._blocks import (
     AnyBlock,
@@ -44,6 +50,13 @@ from ._errors import (
     ToolCallDenied,
 )
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
+from ._models import (
+    FunctionCallOutput,
+    Interrupt,
+    SessionItem,
+    SessionMessage,
+    UnknownEvent,
+)
 from ._not_given import NOT_GIVEN, NotGiven
 from ._pagination import AsyncCursorPage, SyncCursorPage
 from ._query import QueryResult, QueryStream
@@ -83,6 +96,7 @@ __all__ = [
     "NOT_GIVEN",
     "TERMINAL_TASK_STATUSES",
     "APIResponse",
+    "AgentObject",
     "AnyBlock",
     "AsyncCursorPage",
     "AsyncOmnigent",
@@ -104,6 +118,8 @@ __all__ = [
     "Omnigent",
     "OmnigentClient",
     "OmnigentError",
+    "OutputItemDoneEvent",
+    "OutputTextDeltaEvent",
     "QueryResult",
     "QueryStream",
     "RateLimitedError",
@@ -114,10 +130,13 @@ __all__ = [
     "ResponseEndBlock",
     "ResponseStartBlock",
     "RetryBlock",
+    "ServerStreamEvent",
     "Session",
     "SessionCompositionError",
     "SessionEventStream",
+    "SessionItem",
     "SessionMessage",
+    "SessionResponse",
     "SessionToolCallInfo",
     "SessionsChat",
     "SessionsNamespace",
@@ -137,6 +156,7 @@ __all__ = [
     "ToolMetadata",
     "ToolResultBlock",
     "ToolState",
+    "UnknownEvent",
     "child_session_busy",
     "child_summary_busy",
     "format_tool_args_brief",

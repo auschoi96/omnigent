@@ -22,7 +22,7 @@ class OmnigentError(Exception):
 
 
 class StreamProtocolError(OmnigentError):
-    """A live session stream ended without its normal ``[DONE]`` marker."""
+    """A live session stream violated its event or termination contract."""
 
 
 class SessionCompositionError(OmnigentError):

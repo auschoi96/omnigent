@@ -29,6 +29,7 @@ from omnigent.server.schemas import (
     is_known_event,
 )
 
+from ._errors import StreamProtocolError
 from ._models import PublicSessionEventInput, SessionMessage, UnknownEvent
 from ._not_given import NotGiven
 
@@ -48,6 +49,9 @@ RESPONSE_TERMINAL_EVENT_TYPES = (
 
 _EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(ServerStreamEvent)
 _INPUT_ADAPTER: TypeAdapter[PublicSessionEventInput] = TypeAdapter(PublicSessionEventInput)
+_SERIALIZED_AGENT_ITEM_TYPES = frozenset(
+    {"message", "function_call", "reasoning", "slash_command"}
+)
 _log = logging.getLogger("omnigent_client.sessions")
 
 
@@ -133,13 +137,16 @@ def serialize_registered_create(fields: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def parse_session_response(payload: Mapping[str, Any]) -> SessionResponse:
-    """Parse a session snapshot while accepting its serialized message alias."""
+    """Parse a session snapshot while accepting serialized item aliases."""
     body = dict(payload)
     items = body.get("items")
     if isinstance(items, list):
         normalized_items: list[Any] = []
         for item in items:
-            if not isinstance(item, Mapping) or item.get("type") != "message":
+            if (
+                not isinstance(item, Mapping)
+                or item.get("type") not in _SERIALIZED_AGENT_ITEM_TYPES
+            ):
                 normalized_items.append(item)
                 continue
             normalized_item = dict(item)
@@ -242,8 +249,9 @@ def try_parse_envelope(raw: str) -> SessionStreamEvent | None:
     try:
         return _EVENT_ADAPTER.validate_python(decoded)
     except ValueError as exc:
-        _log.debug("Skipping unparseable session event: %s (%s)", raw[:200], exc)
-        return None
+        raise StreamProtocolError(
+            f"Known session event {event_type!r} does not match the upstream schema: {exc}"
+        ) from exc
 
 
 class SessionSSEDecoder:

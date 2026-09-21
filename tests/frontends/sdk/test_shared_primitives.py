@@ -5,7 +5,8 @@ from __future__ import annotations
 import httpx
 import omnigent_client
 import pytest
-from omnigent_client import APIResponse, AsyncCursorPage
+from omnigent_client import APIResponse, AsyncCursorPage, StreamProtocolError
+from omnigent_client._sessions_shared import SessionSSEDecoder, parse_session_response
 
 
 @pytest.mark.asyncio
@@ -69,3 +70,53 @@ def test_api_response_parses_one_existing_response_once() -> None:
     assert wrapped.parse() == {"id": "session_123"}
     assert wrapped.parse() == {"id": "session_123"}
     assert parse_count == 1
+
+
+def test_session_sse_decoder_rejects_malformed_known_event() -> None:
+    decoder = SessionSSEDecoder()
+    assert decoder.feed("event: response.output_text.delta") == (None, False)
+
+    with pytest.raises(StreamProtocolError, match="does not match the upstream schema"):
+        decoder.feed('data: {"type":"response.output_text.delta"}')
+
+
+@pytest.mark.parametrize(
+    ("item_type", "data"),
+    [
+        (
+            "function_call",
+            {"model": "agent", "name": "tool", "arguments": "{}", "call_id": "call_1"},
+        ),
+        (
+            "reasoning",
+            {"model": "agent", "summary": [{"type": "summary_text", "text": "thinking"}]},
+        ),
+        (
+            "slash_command",
+            {"model": "agent", "kind": "skill", "name": "review", "arguments": ""},
+        ),
+    ],
+)
+def test_session_snapshot_accepts_upstream_serialized_agent_aliases(
+    item_type: str, data: dict[str, object]
+) -> None:
+    session = parse_session_response(
+        {
+            "id": "session_1",
+            "agent_id": "agent_1",
+            "status": "idle",
+            "created_at": 1,
+            "items": [
+                {
+                    "id": "item_1",
+                    "type": item_type,
+                    "status": "completed",
+                    "response_id": "response_1",
+                    "created_at": 1,
+                    "data": data,
+                }
+            ],
+        }
+    )
+
+    assert session.items[0].data.model_dump()["agent"] == "agent"
